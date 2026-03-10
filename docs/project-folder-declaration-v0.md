@@ -21,13 +21,15 @@ Notes:
 ```text
 YuanClaw/
 ├── docs/
+│   ├── dev-onboarding-v0.md
 │   ├── project-folder-declaration-v0.md
 │   └── design-doc/
 │       ├── README.md
 │       ├── designdoc-v0-template.md
 │       └── optimize-designdoc-v0-template.md
 ├── scripts/
-│   └── bootstrap_dev_env.sh
+│   ├── bootstrap_dev_env.sh
+│   └── reference_repo.sh
 ├── src/
 ├── tests/
 ├── tools/
@@ -55,3 +57,12 @@ YuanClaw/
   - `bash scripts/bootstrap_dev_env.sh dev`
   - `bash scripts/bootstrap_dev_env.sh main`
   - `bash scripts/bootstrap_dev_env.sh UAT`
+
+## 7. Reference pull policy
+- Default: do not auto-clone reference repositories.
+- New developers should inspect the registry first:
+  - `bash scripts/reference_repo.sh list`
+- Pull only the needed project:
+  - Shallow: `bash scripts/reference_repo.sh pull <project>`
+  - Full: `bash scripts/reference_repo.sh pull-full <project>`
+- `pull` commands only run on `dev` branch by design.

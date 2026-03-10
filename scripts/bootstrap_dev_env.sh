@@ -16,13 +16,20 @@ mkdir -p docs/design-doc scripts src tests tools
 case "$BRANCH" in
   dev)
     mkdir -p _reference_repo
-    if [[ ! -f _reference_repo/README.md ]]; then
-      cat > _reference_repo/README.md <<'EOF'
+    cat > _reference_repo/README.md <<'EOF'
 # Local Reference Repositories
-This directory is for local reference repos during development.
-Everything here is local-only and must not be committed.
+This directory is for local reference repos during development and is local-only.
+Do not commit anything under this folder.
+
+Available pull commands:
+- List projects: bash scripts/reference_repo.sh list
+- Pull one project (shallow): bash scripts/reference_repo.sh pull <project>
+- Pull one project (full): bash scripts/reference_repo.sh pull-full <project>
 EOF
-    fi
+    echo "[INFO] Dev onboarding:"
+    echo "       1) bash scripts/bootstrap_dev_env.sh dev"
+    echo "       2) bash scripts/reference_repo.sh list"
+    echo "       3) bash scripts/reference_repo.sh pull-full <project>   # if full reference is required"
     ;;
   main|uat|UAT)
     if [[ -d _reference_repo ]]; then
