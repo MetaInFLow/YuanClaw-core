@@ -27,8 +27,24 @@ Provide a clean, first-time YuanClaw setup flow with no nanobot dependency.
 `setup.sh` does the following:
 1. Creates `~/.yuanclaw/` if missing
 2. Copies `config/config.json.template` to `~/.yuanclaw/config.json` on first run
-3. Validates JSON and fills default keys if missing
+3. Runs an interactive setup wizard and writes your answers into `config.json`
 4. Creates `~/.yuanclaw/workspace`
+
+## setup.sh interactive prompts
+`setup.sh` asks you to choose or input:
+1. Provider (menu: openrouter/openai/anthropic/moonshot/deepseek/custom)
+2. Model (supports default suggestion)
+3. Provider API key (hidden input)
+4. Workspace path
+5. Temperature
+6. Max tokens
+7. Max tool iterations
+8. Whether to restrict tools to workspace
+9. Exec timeout
+10. Gateway host and port
+11. Whether to enable Telegram
+12. Telegram token + allowFrom + groupPolicy (when enabled)
+13. Brave Search API key (optional)
 
 ## Standard setup flow
 1. Enter repo root:
@@ -36,10 +52,7 @@ Provide a clean, first-time YuanClaw setup flow with no nanobot dependency.
 2. Run setup:
    - `chmod +x setup.sh`
    - `bash setup.sh`
-3. Edit `~/.yuanclaw/config.json` with real values
-4. Re-run setup for validation/default-fill:
-   - `bash setup.sh`
-5. Start gateway:
+3. Start gateway:
    - `python3 -m yuanclaw gateway`
 
 ## Verification commands

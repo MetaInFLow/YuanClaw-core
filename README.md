@@ -17,5 +17,5 @@ MetaInFlow’s in-house built claw bot, designed with enterprise-grade security 
 Details: `docs/project/dev-onboarding-v0.md`.
 
 ## Deployment (V0)
-- First-time runtime setup: `bash setup.sh`
+- First-time runtime setup (interactive wizard): `bash setup.sh`
 - Deployment guide: `docs/deployment/deployment-v0.md`
