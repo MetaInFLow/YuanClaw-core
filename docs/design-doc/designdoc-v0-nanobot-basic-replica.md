@@ -18,8 +18,10 @@
 - 文案、logo、状态输出中的 nanobot 文本替换
 4. 配置/运行目录替换：
 - `~/.nanobot` -> `~/.yuanclaw`
-5. import 顺序 shuffle（全仓执行，含 `src` 与测试代码）。
-6. 保持功能行为等价（除命名替换与 import 顺序变化外）。
+5. 明确不提供 `nanobot` CLI 兼容别名，仅保留 `yuanclaw`。
+6. 明确不迁移历史配置，`yuanclaw` 首次运行时新建独立配置。
+7. import 顺序 shuffle（全仓执行，含 `tests/`）。
+8. 保持功能行为等价（除命名替换与 import 顺序变化外）。
 
 ### Out of Scope (V0)
 1. 新增业务能力或新架构。
@@ -110,6 +112,7 @@ C4Container
 - 明显依赖导入顺序的文件加入 skip-list（手工豁免）。
 3. 执行方式：
 - 用脚本对每个 Python 文件做“确定性 shuffle”（同一文件每次结果一致，便于复现）。
+- 覆盖范围包含业务代码与 `tests/` 目录。
 - shuffle 后执行 lint + tests + 启动冒烟，失败则自动回滚到该文件原排序。
 
 ## Milestones
@@ -127,7 +130,7 @@ C4Container
 
 4. M4 - 等价性验证（2 天）
 - 关键路径对照测试（CLI、agent loop、tool call、session/memory）
-- 验收：行为与 nanobot 对齐（允许品牌命名差异）
+- 验收：行为与 `nanobot main` 对齐（允许品牌命名差异）
 
 ## Risks and Mitigations
 1. 风险：全量替换遗漏导致运行时仍引用 `nanobot`。  
@@ -136,14 +139,14 @@ C4Container
 2. 风险：import shuffle 触发隐式顺序依赖。  
 缓解：`__future__` 保序、skip-list、失败自动回滚机制。
 
-3. 风险：路径替换导致用户历史配置不可用。  
-缓解：提供一次性迁移脚本（`~/.nanobot` -> `~/.yuanclaw`）并可回退。
+3. 风险：路径替换后，用户误以为会自动继承旧配置。  
+缓解：明确产品策略为“完全不迁移旧配置”，首次启动创建全新 `~/.yuanclaw`，并在 onboarding 文档中显式说明。
 
 4. 风险：复刻后可维护性下降。  
 缓解：先保证“可运行等价”，后续再通过 optimize design doc 做结构清理。
 
-## Open Questions
-1. CLI 命令是否保留 `nanobot` 兼容别名（过渡期）？
-2. `~/.nanobot` 到 `~/.yuanclaw` 是否要自动迁移，还是只给手动命令？
-3. import shuffle 是否对 `tests/` 目录同样强制执行？
-4. V0 验收时是否要求与 nanobot 指定版本（当前参考 `v0.1.4.post4`）逐项对齐？
+## Decisions (Locked for V0)
+1. CLI 不保留 `nanobot` 兼容别名，仅支持 `yuanclaw`。
+2. 配置目录不迁移：保留历史 `~/.nanobot`，`yuanclaw` 创建新的 `~/.yuanclaw`。
+3. import shuffle 强制覆盖 `tests/` 目录。
+4. 对齐基线为 `nanobot main`，不是历史发布版本 tag。
