@@ -119,13 +119,14 @@ ENABLE_TELEGRAM="${ENABLE_TELEGRAM:-N}"
 if [[ "$ENABLE_TELEGRAM" =~ ^[Yy]$ ]]; then
   TELEGRAM_ENABLED="true"
   TELEGRAM_TOKEN="$(read_secret "Telegram bot token (input hidden): ")"
-  read -r -p "Telegram allowFrom list (comma-separated user IDs, optional): " TELEGRAM_ALLOW_FROM_CSV
+  read -r -p "Telegram allowFrom list (comma-separated user IDs, default *): " TELEGRAM_ALLOW_FROM_CSV
+  TELEGRAM_ALLOW_FROM_CSV="${TELEGRAM_ALLOW_FROM_CSV:-*}"
   read -r -p "Telegram groupPolicy [mention/open, default mention]: " TELEGRAM_GROUP_POLICY
   TELEGRAM_GROUP_POLICY="${TELEGRAM_GROUP_POLICY:-mention}"
 else
   TELEGRAM_ENABLED="false"
   TELEGRAM_TOKEN=""
-  TELEGRAM_ALLOW_FROM_CSV=""
+  TELEGRAM_ALLOW_FROM_CSV="*"
   TELEGRAM_GROUP_POLICY="mention"
 fi
 

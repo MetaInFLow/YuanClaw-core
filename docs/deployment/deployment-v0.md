@@ -18,7 +18,8 @@ Provide a clean, first-time YuanClaw setup flow with no nanobot dependency.
 3. Telegram (if using Telegram)
    - `channels.telegram.enabled: true`
    - `channels.telegram.token: <your-bot-token>`
-   - Optional allowlist: `channels.telegram.allowFrom: [<user_id_1>, <user_id_2>]`
+   - Default allowlist is open: `channels.telegram.allowFrom: ["*"]`
+   - If needed, replace with specific user IDs: `[<user_id_1>, <user_id_2>]`
 4. Workspace and safety
    - `agents.defaults.workspace` (default: `~/.yuanclaw/workspace`)
    - `tools.restrictToWorkspace` (recommended: `true`)

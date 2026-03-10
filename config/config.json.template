@@ -24,7 +24,7 @@
     "telegram": {
       "enabled": false,
       "token": "",
-      "allowFrom": [],
+      "allowFrom": ["*"],
       "groupPolicy": "mention"
     }
   },
