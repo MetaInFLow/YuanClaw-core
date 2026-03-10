@@ -1,26 +1,53 @@
 # YuanClaw Deployment Steps (V0)
 
 ## Goal
-Bootstrap YuanClaw locally by reusing `~/.nanobot/config.json` as a reference, while keeping YuanClaw config isolated at `~/.yuanclaw/config.json`.
+Provide a clean, first-time YuanClaw setup flow with no nanobot dependency.
 
-## Steps
-1. Enter repo root.
+## Files involved
+- Setup script: `setup.sh`
+- Template: `config/config.yaml.template`
+- Runtime config:
+  - `~/.yuanclaw/config.yaml` (editable source of truth)
+  - `~/.yuanclaw/config.json` (runtime file used by YuanClaw)
+
+## What must be configured first
+1. Provider credentials
+   - Fill at least one API key under `providers.*.apiKey`
+   - Keep `agents.defaults.provider` aligned with the provider key you filled
+2. Model
+   - Set `agents.defaults.model` to a model available under your provider
+3. Telegram (if using Telegram)
+   - `channels.telegram.enabled: true`
+   - `channels.telegram.token: <your-bot-token>`
+   - Optional allowlist: `channels.telegram.allowFrom: [<user_id_1>, <user_id_2>]`
+4. Workspace and safety
+   - `agents.defaults.workspace` (default: `~/.yuanclaw/workspace`)
+   - `tools.restrictToWorkspace` (recommended: `true`)
+
+## setup.sh behavior
+`setup.sh` does the following:
+1. Creates `~/.yuanclaw/` if missing
+2. Copies `config/config.yaml.template` to `~/.yuanclaw/config.yaml` on first run
+3. Converts `~/.yuanclaw/config.yaml` to `~/.yuanclaw/config.json`
+4. Ensures default keys exist (provider/model/workspace/tool timeout/etc.)
+5. Creates `~/.yuanclaw/workspace`
+
+## Standard setup flow
+1. Enter repo root:
    - `cd /Users/anthonyf/projects/metainflow/YuanClaw`
-2. Ensure config bootstrap script is executable.
-   - `chmod +x scripts/setup_yuanclaw_config_from_nanobot.sh`
-3. Generate YuanClaw config from nanobot config.
-   - `bash scripts/setup_yuanclaw_config_from_nanobot.sh`
-4. Verify runtime entry.
-   - `python3 -m yuanclaw --version`
-   - `python3 -m yuanclaw --help`
-5. Verify config path and workspace path migration.
-   - `python3 - <<'PY'\nimport json, pathlib\np=pathlib.Path.home()/'.yuanclaw'/'config.json'\nd=json.loads(p.read_text())\nprint('config_exists=',p.exists())\nprint('workspace=',d.get('agents',{}).get('defaults',{}).get('workspace'))\nPY`
+2. Run setup:
+   - `chmod +x setup.sh`
+   - `bash setup.sh`
+3. Edit `~/.yuanclaw/config.yaml` with real values
+4. Re-run setup to regenerate `config.json`:
+   - `bash setup.sh`
+5. Start gateway:
+   - `python3 -m yuanclaw gateway`
 
-## Re-deploy Test (Clean State)
-1. Remove YuanClaw local runtime dir.
-   - `rm -r ~/.yuanclaw`
-2. Re-run steps 3-5.
-3. Success criteria:
-   - `~/.yuanclaw/config.json` exists
-   - workspace path is `~/.yuanclaw/workspace` (or migrated to `.yuanclaw` path)
-   - `python3 -m yuanclaw --help` exits successfully
+## Verification commands
+1. Check runtime config exists:
+   - `test -f ~/.yuanclaw/config.json && echo ok`
+2. Check CLI works:
+   - `python3 -m yuanclaw --help`
+3. Check Telegram settings were applied:
+   - `python3 - <<'PY'\nimport json, pathlib\np=pathlib.Path.home()/'.yuanclaw/config.json'\nd=json.loads(p.read_text())\nprint(d.get('channels',{}).get('telegram',{}))\nPY`

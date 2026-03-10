@@ -15,3 +15,7 @@ MetaInFlow’s in-house built claw bot, designed with enterprise-grade security 
   - `bash scripts/reference_repo.sh pull-full clawx`
 
 Details: `docs/dev-onboarding-v0.md`.
+
+## Deployment (V0)
+- First-time runtime setup: `bash setup.sh`
+- Deployment guide: `docs/deploy-yuanclaw-v0.md`
