@@ -10,7 +10,7 @@ Define a stable project folder baseline and branch policy for the YuanClaw devel
 ## 2. Branch policy (V0)
 - `main`: must not include `_reference_repo`.
 - `dev`: can use local `_reference_repo` for external reference repositories.
-- `UAT`: must not include `_reference_repo`.
+- `uat`: must not include `_reference_repo`.
 
 Notes:
 - `_reference_repo` is local-only and gitignored.
@@ -22,6 +22,8 @@ Notes:
 YuanClaw/
 ├── docs/
 │   ├── README.md
+│   ├── architecture/
+│   │   └── current-architecture.md
 │   ├── project/
 │   │   ├── dev-onboarding-v0.md
 │   │   └── folder-declaration-v0.md
@@ -56,7 +58,7 @@ YuanClaw/
 - Any structural change must include:
   - What changed
   - Why it changed
-  - Impact on `main/dev/UAT`
+  - Impact on `main/dev/uat`
 
 ## 6. Bootstrap command
 - Auto-detect current branch:
@@ -64,7 +66,7 @@ YuanClaw/
 - Force target branch mode:
   - `bash scripts/bootstrap_dev_env.sh dev`
   - `bash scripts/bootstrap_dev_env.sh main`
-  - `bash scripts/bootstrap_dev_env.sh UAT`
+  - `bash scripts/bootstrap_dev_env.sh uat`
 
 ## 7. Reference pull policy
 - Default: do not auto-clone reference repositories.

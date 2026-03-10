@@ -38,7 +38,7 @@ EOF
     fi
     ;;
   *)
-    echo "[INFO] Branch '$BRANCH' is not in {main, dev, UAT}. Skipping branch-specific policy."
+    echo "[INFO] Branch '$BRANCH' is not in {main, dev, uat}. Skipping branch-specific policy."
     ;;
 esac
 

@@ -1,6 +1,9 @@
 # Docs Index
 
-This repository organizes docs into three categories:
+This repository organizes docs into four categories:
+
+## Architecture
+- [Current Architecture (Living)](./architecture/current-architecture.md)
 
 ## Project
 - [Dev Onboarding](./project/dev-onboarding-v0.md)
