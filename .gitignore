@@ -1,0 +1,6 @@
+# Local reference repositories are for dev-only local use.
+_reference_repo/
+
+# Common local/system noise
+.DS_Store
+*.swp
