@@ -1,125 +1,149 @@
-# DesignDoc V0 - Nanobot Basic Replica
+# DesignDoc V0 - YuanClaw Architecture-Preserving Replica of Nanobot
 
 ## Background
-YuanClaw 进入正式研发阶段，V0 目标是基于 `_reference_repo/nanobot` 的核心思想，先做一个可运行、可迭代、可验证的最小闭环版本，而不是一次性复刻全部能力。
+你给出的新目标是：
+1. 尽量保留 nanobot 原项目架构。
+2. 将所有 `nanobot` 相关命名替换为 `yuanclaw`。
+3. 对代码中的 import 顺序进行全仓 shuffle。
 
-我们将优先复刻 nanobot 的核心主链路：
-- CLI 入口
-- Agent Loop（LLM 调用 + Tool Call + 迭代）
-- 最小工具集
-- 会话与记忆持久化
-
-通过该 V0 打通后，再逐步扩展到多渠道、多 Provider、MCP 等增强能力。
+因此 V0 不再是“最小功能重做”，而是“架构镜像式复刻”：先把 nanobot 的工程组织、模块边界、运行链路整体迁移到 YuanClaw，再进行品牌/命名替换与代码风格扰动（import shuffle）。
 
 ## Scope
 ### In Scope (V0)
-1. 运行形态：本地 CLI 单通道交互。
-2. LLM 适配：1 个 OpenAI-compatible Provider（统一接口，后续可扩展）。
-3. Agent Core：
-   - 消息循环与多轮 tool-calling
-   - 最大迭代次数与错误兜底
-4. Tooling（最小集）：
-   - 文件工具：`read/write/edit/list`
-   - Shell 工具：`exec`（带超时与工作目录限制）
-5. 状态持久化：
-   - Session 历史
-   - Memory 双层文件（`MEMORY.md` + `HISTORY.md`）的简化版
-6. 基础可观测性：
-   - 结构化日志
-   - 错误路径可定位
+1. 保留 nanobot 原目录与模块分层（`agent/bus/channels/cli/config/cron/heartbeat/providers/session/utils/skills/templates`）。
+2. 包命名全量替换：`nanobot.*` -> `yuanclaw.*`。
+3. CLI 与发行元信息替换：
+- 可执行命令名：`nanobot` -> `yuanclaw`
+- 包名：`nanobot-ai` -> `yuanclaw-ai`
+- 文案、logo、状态输出中的 nanobot 文本替换
+4. 配置/运行目录替换：
+- `~/.nanobot` -> `~/.yuanclaw`
+5. import 顺序 shuffle（全仓执行，含 `src` 与测试代码）。
+6. 保持功能行为等价（除命名替换与 import 顺序变化外）。
 
 ### Out of Scope (V0)
-1. 多聊天渠道（Telegram/Discord/Slack/Feishu 等）。
-2. MCP servers 集成。
-3. 子代理（Subagent）并发编排。
-4. 复杂权限策略（先做基础安全边界）。
-5. 完整插件/技能市场能力。
+1. 新增业务能力或新架构。
+2. 对原有模块进行合并/拆分重构。
+3. 改写 provider/channel 设计。
+4. 引入与 nanobot 不一致的运行模式。
 
 ## Architecture / Workflow
-### High-level Flow
+### C4 Context (Level 1)
 ```mermaid
-flowchart LR
-  U["User (CLI)"] --> C["CLI Commands"]
-  C --> L["Agent Loop"]
-  L --> P["LLM Provider Adapter"]
-  P --> M["Model API"]
-  L --> T["Tool Registry"]
-  T --> F["File Tools"]
-  T --> S["Exec Tool"]
-  L --> SS["Session Store"]
-  L --> MM["Memory Store"]
+C4Context
+  title System Context - YuanClaw (Replica of nanobot)
+
+  Person(user, "Developer/User", "Runs YuanClaw via CLI or chat channels")
+  System(yuanclaw, "YuanClaw", "Architecture-preserving replica of nanobot")
+  System_Ext(llm, "LLM Providers", "OpenAI-compatible and other providers")
+  System_Ext(chat, "Chat Platforms", "Telegram/Discord/Slack/Feishu etc.")
+  System_Ext(fs, "Local Filesystem", "Workspace, config, sessions, memory")
+
+  Rel(user, yuanclaw, "Uses")
+  Rel(yuanclaw, llm, "Calls model APIs", "HTTPS")
+  Rel(yuanclaw, chat, "Receives/sends messages", "Platform APIs")
+  Rel(yuanclaw, fs, "Reads/writes runtime state")
 ```
 
-### Component Design
-1. `cli/commands`  
-职责：启动、配置加载、交互输入输出、触发 agent run。  
-原则：保持薄层，仅做参数解析和 I/O 编排。
+### C4 Container (Level 2)
+```mermaid
+C4Container
+  title Container Diagram - YuanClaw Internal Containers
 
-2. `provider/base` + `provider/openai_compatible`  
-职责：屏蔽不同模型 API 差异，统一返回：
-- `content`
-- `tool_calls`
-- `finish_reason`
+  Person(user, "Developer/User", "Interacts with the agent")
+  System_Ext(llm, "LLM Providers", "Model APIs")
+  System_Ext(chat, "Chat Platforms", "Telegram/Discord/Slack/Feishu")
 
-3. `agent/loop`  
-职责：核心状态机，步骤为：
-1) 拼装上下文  
-2) 调用 LLM  
-3) 解析 tool call 并执行  
-4) 回填 tool 结果继续迭代  
-5) 产出最终回复或失败兜底
+  System_Boundary(yc, "YuanClaw") {
+    Container(cli, "CLI Layer", "Typer", "onboard/agent/gateway/status commands")
+    Container(loop, "Agent Loop", "Python Async", "Context build, model call, tool-call iteration")
+    Container(tools, "Tool Runtime", "Tool Registry", "Filesystem/exec/web/cron/message/spawn")
+    Container(channels, "Channel Manager", "Channel Adapters", "Multi-channel message ingress/egress")
+    Container(memory, "Session & Memory", "File-backed storage", "Session history and long-term memory")
+    Container(config, "Config System", "Pydantic Settings", "Provider/channel/runtime config loading")
+  }
 
-4. `agent/tools`  
-职责：工具注册、schema 暴露、统一执行。  
-V0 仅保留文件和 shell 两类工具，确保闭环与安全边界可控。
+  Rel(user, cli, "Runs commands")
+  Rel(cli, loop, "Starts runtime")
+  Rel(loop, tools, "Executes tools")
+  Rel(loop, memory, "Reads/writes context")
+  Rel(loop, config, "Loads settings")
+  Rel(loop, llm, "Chat completion + tool call", "HTTPS")
+  Rel(channels, loop, "Pushes inbound events")
+  Rel(loop, channels, "Publishes outbound events")
+  Rel(channels, chat, "Platform integration APIs")
+```
 
-5. `session` + `memory`  
-职责：
-- `session` 保存近期对话
-- `memory` 汇总长期信息  
-V0 先做可用性优先，memory consolidation 可先走简化策略（周期性归档 + 人工可读）。
+### Source-to-Target Structural Mapping
+| nanobot source | YuanClaw target |
+|---|---|
+| `nanobot/agent/**` | `yuanclaw/agent/**` |
+| `nanobot/bus/**` | `yuanclaw/bus/**` |
+| `nanobot/channels/**` | `yuanclaw/channels/**` |
+| `nanobot/cli/**` | `yuanclaw/cli/**` |
+| `nanobot/config/**` | `yuanclaw/config/**` |
+| `nanobot/cron/**` | `yuanclaw/cron/**` |
+| `nanobot/heartbeat/**` | `yuanclaw/heartbeat/**` |
+| `nanobot/providers/**` | `yuanclaw/providers/**` |
+| `nanobot/session/**` | `yuanclaw/session/**` |
+| `nanobot/utils/**` | `yuanclaw/utils/**` |
+| `nanobot/skills/**` | `yuanclaw/skills/**` |
+| `nanobot/templates/**` | `yuanclaw/templates/**` |
 
-### V0 安全边界
-1. `exec` 默认限定在项目 workspace 下。
-2. 设置命令执行超时（默认 60s，后续可配置）。
-3. 对工具返回做长度截断，避免上下文污染与 token 爆炸。
+## Rename + Import Shuffle Strategy
+### A. 全量命名替换（`nanobot` -> `yuanclaw`）
+1. 目录名、包名、入口点、脚本名、CLI command、配置目录常量、日志命名空间统一替换。
+2. 文案替换范围：
+- README/文档中的产品名
+- CLI 输出中的品牌名
+- 安装提示命令中的包名
+3. 替换后必须满足：
+- `python -m yuanclaw` 可运行
+- `yuanclaw` CLI 命令可运行
+- 无残留 `from nanobot ...` 或 `import nanobot ...`
+
+### B. Import 顺序 Shuffle（全仓）
+1. 原则：只改 import 排序，不改语义。
+2. 必须保留的约束：
+- 模块 docstring 在最前。
+- `from __future__ import ...` 必须保持在最顶部合法位置，不参与 shuffle。
+- 明显依赖导入顺序的文件加入 skip-list（手工豁免）。
+3. 执行方式：
+- 用脚本对每个 Python 文件做“确定性 shuffle”（同一文件每次结果一致，便于复现）。
+- shuffle 后执行 lint + tests + 启动冒烟，失败则自动回滚到该文件原排序。
 
 ## Milestones
-1. M1 - Skeleton + CLI (1-2 天)
-- 完成目录骨架与 `cli` 启动命令
-- 完成基础配置加载（模型、key、workspace）
-- 验收：可执行 `yuanclaw agent` 并完成一次无工具问答
+1. M1 - 结构镜像迁移（2 天）
+- 完成代码树拷贝与路径映射
+- 验收：`yuanclaw/*` 目录结构与 nanobot 对齐
 
-2. M2 - Agent Loop + Provider (2-3 天)
-- 完成统一 provider 接口
-- 完成 agent loop 多轮 tool-calling
-- 验收：模型可正确发起并消费至少 2 次 tool call
+2. M2 - 命名替换闭环（2 天）
+- 完成包名/入口/配置路径/文案替换
+- 验收：`python -m yuanclaw` 与 `yuanclaw --help` 可运行
 
-3. M3 - Core Tools + Persistence (2-3 天)
-- 文件工具、exec 工具接入
-- session + memory 基础持久化
-- 验收：跨会话可读到历史/记忆；工具执行有日志可追踪
+3. M3 - Import Shuffle 执行（1-2 天）
+- 对全仓执行 import shuffle + 豁免机制
+- 验收：无语法错误，关键命令冒烟通过
 
-4. M4 - Hardening + Tests (2 天)
-- 异常兜底、超时、空内容处理
-- 补齐最小自动化测试
-- 验收：关键路径测试通过，形成 V0 可演示版本
+4. M4 - 等价性验证（2 天）
+- 关键路径对照测试（CLI、agent loop、tool call、session/memory）
+- 验收：行为与 nanobot 对齐（允许品牌命名差异）
 
 ## Risks and Mitigations
-1. 风险：不同模型返回 tool-call 格式不一致。  
-缓解：在 provider 层做标准化转换，loop 层只消费统一结构。
+1. 风险：全量替换遗漏导致运行时仍引用 `nanobot`。  
+缓解：增加静态扫描门禁（禁止 `import nanobot` 字符串残留）。
 
-2. 风险：exec 工具存在误操作风险。  
-缓解：默认 workspace 限制 + 超时 + 命令白/黑名单（V0 先黑名单高危命令）。
+2. 风险：import shuffle 触发隐式顺序依赖。  
+缓解：`__future__` 保序、skip-list、失败自动回滚机制。
 
-3. 风险：上下文迅速膨胀导致成本和稳定性问题。  
-缓解：控制 tool 结果长度、会话窗口裁剪、memory consolidation。
+3. 风险：路径替换导致用户历史配置不可用。  
+缓解：提供一次性迁移脚本（`~/.nanobot` -> `~/.yuanclaw`）并可回退。
 
-4. 风险：一开始复刻范围过大拖慢交付。  
-缓解：严格执行 In/Out Scope，先交付 CLI 单通道最小闭环。
+4. 风险：复刻后可维护性下降。  
+缓解：先保证“可运行等价”，后续再通过 optimize design doc 做结构清理。
 
 ## Open Questions
-1. V0 默认模型与供应商是否固定（例如 OpenAI 还是 OpenRouter）？
-2. `exec` 工具在 V0 是否需要“默认关闭，按配置开启”？
-3. memory consolidation 在 V0 是否要求 LLM 自动总结，还是先做规则归档？
-4. V0 演示标准是“本地 CLI demo”还是“可部署服务 demo”？
+1. CLI 命令是否保留 `nanobot` 兼容别名（过渡期）？
+2. `~/.nanobot` 到 `~/.yuanclaw` 是否要自动迁移，还是只给手动命令？
+3. import shuffle 是否对 `tests/` 目录同样强制执行？
+4. V0 验收时是否要求与 nanobot 指定版本（当前参考 `v0.1.4.post4`）逐项对齐？
