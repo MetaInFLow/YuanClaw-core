@@ -16,6 +16,7 @@
 说明:
 - 默认不会自动下载大型 reference 仓库代码。
 - `_reference_repo` 是本地目录，已在 `.gitignore` 中忽略。
+- 只要 `_reference_repo` 不进入 Git 跟踪即可，是否保留在本地由开发者自行决定。
 
 ## 3. 按需下载 reference 仓库
 可选项目:

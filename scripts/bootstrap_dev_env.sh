@@ -34,7 +34,7 @@ EOF
   main|uat|UAT)
     if [[ -d _reference_repo ]]; then
       echo "[WARN] Branch '$BRANCH' should not include _reference_repo."
-      echo "[WARN] Remove it manually if you want strict cleanup: rm -rf _reference_repo"
+      echo "[WARN] _reference_repo is gitignored, but you can remove it locally if needed."
     fi
     ;;
   *)
