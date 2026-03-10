@@ -2,9 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TEMPLATE_PATH="${YUANCLAW_TEMPLATE_PATH:-$ROOT_DIR/config/config.yaml.template}"
+TEMPLATE_PATH="${YUANCLAW_TEMPLATE_PATH:-$ROOT_DIR/config/config.json.template}"
 YUANCLAW_HOME="${YUANCLAW_HOME:-$HOME/.yuanclaw}"
-YAML_PATH="$YUANCLAW_HOME/config.yaml"
 JSON_PATH="$YUANCLAW_HOME/config.json"
 
 if [[ ! -f "$TEMPLATE_PATH" ]]; then
@@ -14,35 +13,27 @@ fi
 
 mkdir -p "$YUANCLAW_HOME"
 
-if [[ ! -f "$YAML_PATH" ]]; then
-  cp "$TEMPLATE_PATH" "$YAML_PATH"
-  chmod 600 "$YAML_PATH"
-  echo "[OK] Created $YAML_PATH from template."
-  echo "[NEXT] Edit provider API key and Telegram settings in $YAML_PATH."
+if [[ ! -f "$JSON_PATH" ]]; then
+  cp "$TEMPLATE_PATH" "$JSON_PATH"
+  chmod 600 "$JSON_PATH"
+  echo "[OK] Created $JSON_PATH from template."
+  echo "[NEXT] Edit provider API key and Telegram settings in $JSON_PATH."
 fi
 
-python3 - "$YAML_PATH" "$JSON_PATH" <<'PY'
+python3 - "$JSON_PATH" <<'PY'
 import json
 import pathlib
 import sys
 
+json_path = pathlib.Path(sys.argv[1]).expanduser()
 try:
-    import yaml
-except Exception:
-    print("[ERROR] Missing dependency: pyyaml")
-    print("[HINT] Install with: python3 -m pip install --user pyyaml")
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+except json.JSONDecodeError as exc:
+    print(f"[ERROR] Invalid JSON in {json_path}: {exc}")
     raise SystemExit(1)
-
-
-yaml_path = pathlib.Path(sys.argv[1]).expanduser()
-json_path = pathlib.Path(sys.argv[2]).expanduser()
-
-raw = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
-if not isinstance(raw, dict):
-    print("[ERROR] config.yaml must be a mapping/object at root.")
+if not isinstance(data, dict):
+    print("[ERROR] config.json must be a JSON object at root.")
     raise SystemExit(1)
-
-data = raw
 
 agents = data.setdefault("agents", {})
 defaults = agents.setdefault("defaults", {})

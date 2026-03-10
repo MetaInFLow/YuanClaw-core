@@ -11,7 +11,7 @@ else
   BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
 fi
 
-mkdir -p docs/design-doc scripts src tests tools
+mkdir -p docs/project docs/deployment docs/design scripts src tests tools
 
 case "$BRANCH" in
   dev)

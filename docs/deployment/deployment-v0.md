@@ -5,10 +5,9 @@ Provide a clean, first-time YuanClaw setup flow with no nanobot dependency.
 
 ## Files involved
 - Setup script: `setup.sh`
-- Template: `config/config.yaml.template`
+- Template: `config/config.json.template`
 - Runtime config:
-  - `~/.yuanclaw/config.yaml` (editable source of truth)
-  - `~/.yuanclaw/config.json` (runtime file used by YuanClaw)
+  - `~/.yuanclaw/config.json` (editable + runtime file)
 
 ## What must be configured first
 1. Provider credentials
@@ -27,10 +26,9 @@ Provide a clean, first-time YuanClaw setup flow with no nanobot dependency.
 ## setup.sh behavior
 `setup.sh` does the following:
 1. Creates `~/.yuanclaw/` if missing
-2. Copies `config/config.yaml.template` to `~/.yuanclaw/config.yaml` on first run
-3. Converts `~/.yuanclaw/config.yaml` to `~/.yuanclaw/config.json`
-4. Ensures default keys exist (provider/model/workspace/tool timeout/etc.)
-5. Creates `~/.yuanclaw/workspace`
+2. Copies `config/config.json.template` to `~/.yuanclaw/config.json` on first run
+3. Validates JSON and fills default keys if missing
+4. Creates `~/.yuanclaw/workspace`
 
 ## Standard setup flow
 1. Enter repo root:
@@ -38,8 +36,8 @@ Provide a clean, first-time YuanClaw setup flow with no nanobot dependency.
 2. Run setup:
    - `chmod +x setup.sh`
    - `bash setup.sh`
-3. Edit `~/.yuanclaw/config.yaml` with real values
-4. Re-run setup to regenerate `config.json`:
+3. Edit `~/.yuanclaw/config.json` with real values
+4. Re-run setup for validation/default-fill:
    - `bash setup.sh`
 5. Start gateway:
    - `python3 -m yuanclaw gateway`

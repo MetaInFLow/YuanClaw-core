@@ -4,7 +4,7 @@ MetaInFlow’s in-house built claw bot, designed with enterprise-grade security 
 ## V0 Bootstrap
 - Run `bash scripts/bootstrap_dev_env.sh` after checkout.
 - Optional: force a target mode, e.g. `bash scripts/bootstrap_dev_env.sh dev`.
-- Folder and branch rules: `docs/project-folder-declaration-v0.md`.
+- Folder and branch rules: `docs/project/folder-declaration-v0.md`.
 
 ## Dev Onboarding (Reference Repos)
 - Switch to `dev` first: `git checkout dev`.
@@ -14,8 +14,8 @@ MetaInFlow’s in-house built claw bot, designed with enterprise-grade security 
   - `bash scripts/reference_repo.sh pull-full nanobot`
   - `bash scripts/reference_repo.sh pull-full clawx`
 
-Details: `docs/dev-onboarding-v0.md`.
+Details: `docs/project/dev-onboarding-v0.md`.
 
 ## Deployment (V0)
 - First-time runtime setup: `bash setup.sh`
-- Deployment guide: `docs/deploy-yuanclaw-v0.md`
+- Deployment guide: `docs/deployment/deployment-v0.md`

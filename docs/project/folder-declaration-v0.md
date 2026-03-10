@@ -21,15 +21,23 @@ Notes:
 ```text
 YuanClaw/
 ├── docs/
-│   ├── dev-onboarding-v0.md
-│   ├── project-folder-declaration-v0.md
-│   └── design-doc/
+│   ├── README.md
+│   ├── project/
+│   │   ├── dev-onboarding-v0.md
+│   │   └── folder-declaration-v0.md
+│   ├── deployment/
+│   │   └── deployment-v0.md
+│   └── design/
 │       ├── README.md
 │       ├── designdoc-v0-template.md
+│       ├── designdoc-v0-nanobot-basic-replica.md
 │       └── optimize-designdoc-v0-template.md
 ├── scripts/
 │   ├── bootstrap_dev_env.sh
 │   └── reference_repo.sh
+├── config/
+│   └── config.json.template
+├── setup.sh
 ├── src/
 ├── tests/
 ├── tools/
@@ -37,7 +45,7 @@ YuanClaw/
 ```
 
 ## 4. `docs/` rules
-- All design docs must be stored under `docs/design-doc/`.
+- All design docs must be stored under `docs/design/`.
 - Naming convention:
   - `designdoc-v<version>-<topic>.md`
   - `optimize-designdoc-v<version>-<topic>.md`
