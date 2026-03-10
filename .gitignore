@@ -4,3 +4,8 @@ _reference_repo/
 # Common local/system noise
 .DS_Store
 *.swp
+
+# Python cache artifacts
+__pycache__/
+*.pyc
+.pytest_cache/
