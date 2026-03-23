@@ -1,6 +1,12 @@
 # Docs Index
 
-This repository organizes docs into three categories:
+This repository organizes docs into five categories:
+
+## API
+- [Current Supported Interfaces](./api/current-supported-interfaces.md)
+
+## Architecture
+- [Current Architecture (Living)](./architecture/current-architecture.md)
 
 ## Project
 - [Dev Onboarding](./project/dev-onboarding-v0.md)
@@ -14,3 +20,4 @@ This repository organizes docs into three categories:
 - [DesignDoc V0 Template](./design/designdoc-v0-template.md)
 - [Optimize DesignDoc V0 Template](./design/optimize-designdoc-v0-template.md)
 - [DesignDoc V0 - Nanobot Basic Replica](./design/designdoc-v0-nanobot-basic-replica.md)
+- [DesignDoc V0.0.2 - Visual UI + macOS + Full Rebuild](./design/designdoc-v0.0.2-visual-macos-full-rebuild.md)

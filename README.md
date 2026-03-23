@@ -1,5 +1,5 @@
-# YuanClaw
-MetaInFlow’s in-house built claw bot, designed with enterprise-grade security for the AI agent era.
+# YuanClaw-core
+Multi-channel personal AI assistant runtime — the brain of YuanClaw
 
 ## V0 Bootstrap
 - Run `bash scripts/bootstrap_dev_env.sh` after checkout.

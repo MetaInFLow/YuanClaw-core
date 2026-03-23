@@ -1,7 +1,7 @@
 [project]
-name = "yuanclaw-ai"
+name = "YuanClaw-core"
 version = "0.1.4.post4"
-description = "A lightweight personal AI assistant framework"
+description = "Multi-channel personal AI assistant runtime — the brain of YuanClaw"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [
