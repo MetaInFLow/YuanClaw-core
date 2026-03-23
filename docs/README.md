@@ -1,6 +1,9 @@
 # Docs Index
 
-This repository organizes docs into four categories:
+This repository organizes docs into five categories:
+
+## API
+- [Current Supported Interfaces](./api/current-supported-interfaces.md)
 
 ## Architecture
 - [Current Architecture (Living)](./architecture/current-architecture.md)
