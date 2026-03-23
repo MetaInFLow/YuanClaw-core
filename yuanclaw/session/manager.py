@@ -194,20 +194,53 @@ class SessionManager:
 
         for path in self.sessions_dir.glob("*.jsonl"):
             try:
-                # Read just the metadata line
+                metadata: dict[str, Any] | None = None
+                message_count = 0
+                last_message: dict[str, Any] | None = None
+
                 with open(path, encoding="utf-8") as f:
-                    first_line = f.readline().strip()
-                    if first_line:
-                        data = json.loads(first_line)
+                    for raw_line in f:
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+
+                        data = json.loads(line)
                         if data.get("_type") == "metadata":
-                            key = data.get("key") or path.stem.replace("_", ":", 1)
-                            sessions.append({
-                                "key": key,
-                                "created_at": data.get("created_at"),
-                                "updated_at": data.get("updated_at"),
-                                "path": str(path)
-                            })
+                            metadata = data
+                            continue
+
+                        message_count += 1
+                        last_message = data
+
+                if metadata is None:
+                    continue
+
+                key = metadata.get("key") or path.stem.replace("_", ":", 1)
+                sessions.append({
+                    "key": key,
+                    "created_at": metadata.get("created_at"),
+                    "updated_at": metadata.get("updated_at"),
+                    "path": str(path),
+                    "message_count": message_count,
+                    "last_role": last_message.get("role") if last_message else None,
+                    "last_message_preview": self._preview_message(last_message),
+                })
             except Exception:
                 continue
 
         return sorted(sessions, key=lambda x: x.get("updated_at", ""), reverse=True)
+
+    @staticmethod
+    def _preview_message(message: dict[str, Any] | None, limit: int = 120) -> str | None:
+        """Build a compact preview for list APIs."""
+        if not message:
+            return None
+
+        content = str(message.get("content") or "").strip()
+        if not content:
+            return None
+
+        normalized = " ".join(content.split())
+        if len(normalized) <= limit:
+            return normalized
+        return normalized[: limit - 1].rstrip() + "…"
