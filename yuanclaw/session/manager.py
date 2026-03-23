@@ -224,6 +224,7 @@ class SessionManager:
                     "message_count": message_count,
                     "last_role": last_message.get("role") if last_message else None,
                     "last_message_preview": self._preview_message(last_message),
+                    "thread_summary": (metadata.get("metadata") or {}).get("thread_summary"),
                 })
             except Exception:
                 continue
@@ -244,3 +245,11 @@ class SessionManager:
         if len(normalized) <= limit:
             return normalized
         return normalized[: limit - 1].rstrip() + "…"
+
+    def set_thread_summary(self, key: str, summary: str) -> Session:
+        """Persist a UI-facing thread summary in session metadata."""
+        session = self.get_or_create(key)
+        session.metadata["thread_summary"] = summary
+        session.updated_at = datetime.now()
+        self.save(session)
+        return session

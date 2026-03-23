@@ -26,6 +26,7 @@ from yuanclaw.bus.events import InboundMessage, OutboundMessage
 from yuanclaw.bus.queue import MessageBus
 from yuanclaw.providers.base import LLMProvider
 from yuanclaw.session.manager import Session, SessionManager
+from yuanclaw.studio_agents import get_fixed_skills_for_session
 
 if TYPE_CHECKING:
     from yuanclaw.config.schema import ChannelsConfig, ExecToolConfig
@@ -416,10 +417,18 @@ class AgentLoop:
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
+        skill_names = msg.metadata.get("skill_names")
+        if not isinstance(skill_names, list):
+            skill_names = None
+        if skill_names is None:
+            fixed_skills = get_fixed_skills_for_session(key)
+            skill_names = fixed_skills or None
+
         history = session.get_history(max_messages=self.memory_window)
         initial_messages = self.context.build_messages(
             history=history,
             current_message=msg.content,
+            skill_names=skill_names,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
         )
@@ -500,10 +509,18 @@ class AgentLoop:
         session_key: str = "cli:direct",
         channel: str = "cli",
         chat_id: str = "direct",
+        skill_names: list[str] | None = None,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
         """Process a message directly (for CLI or cron usage)."""
         await self._connect_mcp()
-        msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
+        metadata = {"skill_names": skill_names} if skill_names else {}
+        msg = InboundMessage(
+            channel=channel,
+            sender_id="user",
+            chat_id=chat_id,
+            content=content,
+            metadata=metadata,
+        )
         response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
         return response.content if response else ""

@@ -165,6 +165,42 @@ def _provider_rows(config: Config) -> list[dict[str, Any]]:
     return rows
 
 
+def _has_summary_model_access(config: Config) -> bool:
+    """Return whether the active model is likely callable for summary generation."""
+    model = config.agents.defaults.model
+    provider_name = config.get_provider_name(model)
+    provider = config.get_provider(model)
+    spec = find_by_name(provider_name) if provider_name else None
+
+    if model.startswith("bedrock/"):
+        return True
+    if spec and spec.is_oauth:
+        return True
+    if provider_name == "custom":
+        return bool((provider and provider.api_key) or config.get_api_base(model))
+    if provider_name == "azure_openai":
+        return bool(provider and provider.api_key and provider.api_base)
+    return bool(provider and provider.api_key)
+
+
+def _compact_thread_summary(text: str, limit: int = 24) -> str:
+    """Return a compact single-line thread summary."""
+    normalized = " ".join(str(text or "").split()).strip().strip("'\"`")
+    if not normalized:
+        return "新对话"
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 1].rstrip() + "…"
+
+
+def _normalize_thread_summary(raw: str | None, fallback: str) -> str:
+    """Normalize model output for thread list display."""
+    cleaned = " ".join(str(raw or "").split()).strip().strip("'\"`")
+    if not cleaned:
+        return fallback
+    return _compact_thread_summary(cleaned)
+
+
 def _channel_is_configured(channel_id: str, cfg: Any) -> bool:
     """Best-effort channel configuration check for UI display."""
     required: dict[str, list[str]] = {
@@ -436,6 +472,53 @@ class CoreRuntime:
             },
         }
 
+    async def generate_thread_summary(
+        self,
+        session_key: str,
+        content: str,
+        cowboy_name: str | None = None,
+    ) -> dict[str, str]:
+        """Generate and persist a thread summary for Studio UI."""
+        fallback = _compact_thread_summary(content)
+
+        if not _has_summary_model_access(self.config):
+            self.session_manager.set_thread_summary(session_key, fallback)
+            return {"summary": fallback, "mode": "input"}
+
+        try:
+            response = await self.provider.chat(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "你在为桌面应用生成线程列表标题。"
+                            "请根据用户开启任务时的首条输入，为当前角色写一句简短概述。"
+                            "要求：只输出标题文本；中文优先；不要换行、不要引号、不要序号、不要解释；"
+                            "长度控制在 8 到 18 个中文字符或 24 个字符以内。"
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"角色：{cowboy_name or 'AI 助手'}\n"
+                            f"用户输入：{content}\n"
+                            "输出："
+                        ),
+                    },
+                ],
+                model=self.config.agents.defaults.model,
+                max_tokens=64,
+                temperature=0.2,
+                reasoning_effort=self.config.agents.defaults.reasoning_effort,
+            )
+            summary = _normalize_thread_summary(response.content, fallback)
+            self.session_manager.set_thread_summary(session_key, summary)
+            return {"summary": summary, "mode": "llm"}
+        except Exception as exc:
+            logger.warning("Thread summary generation failed for {}: {}", session_key, exc)
+            self.session_manager.set_thread_summary(session_key, fallback)
+            return {"summary": fallback, "mode": "input"}
+
 
 def create_app(runtime: CoreRuntime) -> FastAPI:
     """Create FastAPI application for local Studio runtime."""
@@ -500,6 +583,23 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
     async def sessions() -> dict[str, Any]:
         items = runtime.session_manager.list_sessions()
         return {"items": items, "total": len(items)}
+
+    @app.post("/api/sessions/{session_key:path}/summary")
+    async def session_summary(session_key: str, payload: dict[str, Any]) -> dict[str, Any]:
+        key = unquote(session_key)
+        if not key:
+            raise HTTPException(status_code=400, detail="session key is required")
+
+        content = str(payload.get("content") or "").strip()
+        if not content:
+            raise HTTPException(status_code=400, detail="content is required")
+
+        cowboy_name = str(payload.get("cowboyName") or "").strip() or None
+        return await runtime.generate_thread_summary(
+            session_key=key,
+            content=content,
+            cowboy_name=cowboy_name,
+        )
 
     @app.get("/api/sessions/{session_key:path}")
     async def session_detail(session_key: str) -> dict[str, Any]:
@@ -568,6 +668,11 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
                 continue
 
             session_key = str(payload.get("sessionKey") or "studio:default")
+            skill_names = [
+                str(name).strip()
+                for name in (payload.get("skillNames") or [])
+                if str(name).strip()
+            ]
             if ":" in session_key:
                 _, chat_id = session_key.split(":", 1)
             else:
@@ -614,6 +719,7 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
                     session_key=session_key,
                     channel="studio",
                     chat_id=chat_id or "default",
+                    skill_names=skill_names,
                     on_progress=on_progress,
                 )
                 if not final:

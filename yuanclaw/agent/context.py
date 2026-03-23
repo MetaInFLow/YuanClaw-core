@@ -37,10 +37,12 @@ class ContextBuilder:
             parts.append(f"# Memory\n\n{memory}")
 
         always_skills = self.skills.get_always_skills()
-        if always_skills:
-            always_content = self.skills.load_skills_for_context(always_skills)
-            if always_content:
-                parts.append(f"# Active Skills\n\n{always_content}")
+        requested_skills = [name for name in (skill_names or []) if isinstance(name, str) and name.strip()]
+        active_skill_names = list(dict.fromkeys([*always_skills, *requested_skills]))
+        if active_skill_names:
+            active_content = self.skills.load_skills_for_context(active_skill_names)
+            if active_content:
+                parts.append(f"# Active Skills\n\n{active_content}")
 
         skills_summary = self.skills.build_skills_summary()
         if skills_summary:
