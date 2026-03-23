@@ -289,6 +289,40 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
 
 
 @app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind host (local only by default)"),
+    port: int = typer.Option(18789, "--port", "-p", help="Studio API port"),
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+    with_channels: bool = typer.Option(
+        False,
+        "--with-channels",
+        help="Also start configured channel adapters (off by default)",
+    ),
+):
+    """Start local Studio API server (HTTP + WebSocket)."""
+    from yuanclaw.api.server import run_api_server
+
+    loaded = _load_runtime_config(config, workspace)
+    sync_workspace_templates(loaded.workspace_path)
+
+    console.print(f"{__logo__} Starting yuanclaw studio API on {host}:{port}...")
+    if with_channels:
+        console.print("[yellow]with_channels enabled: channel adapters will be started[/yellow]")
+
+    try:
+        run_api_server(
+            config=loaded,
+            host=host,
+            port=port,
+            with_channels=with_channels,
+        )
+    except RuntimeError as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        raise typer.Exit(1) from exc
+
+
+@app.command()
 def gateway(
     port: int | None = typer.Option(None, "--port", "-p", help="Gateway port"),
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
