@@ -13,6 +13,72 @@ from yuanclaw.config.paths import get_legacy_sessions_dir
 from yuanclaw.utils.helpers import ensure_dir, safe_filename
 
 
+def _usage_bucket() -> dict[str, Any]:
+    """Create an empty usage bucket."""
+    return {
+        "requests": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "last_used_at": None,
+    }
+
+
+def _normalize_usage_values(usage: dict[str, Any] | None) -> dict[str, int]:
+    """Normalize usage counters to non-negative integers."""
+    usage = usage or {}
+    prompt_tokens = max(0, int(usage.get("prompt_tokens", 0) or 0))
+    completion_tokens = max(0, int(usage.get("completion_tokens", 0) or 0))
+    total_tokens = max(
+        0,
+        int(usage.get("total_tokens", prompt_tokens + completion_tokens) or 0),
+    )
+    requests = max(0, int(usage.get("requests", 0) or 0))
+    return {
+        "requests": requests,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _merge_usage_bucket(target: dict[str, Any], source: dict[str, Any] | None) -> None:
+    """Merge usage counters into a bucket in place."""
+    normalized = _normalize_usage_values(source)
+    for key, value in normalized.items():
+        target[key] = int(target.get(key, 0) or 0) + value
+
+    source_last_used_at = (source or {}).get("last_used_at")
+    if source_last_used_at:
+        current_last_used_at = target.get("last_used_at")
+        if not current_last_used_at or str(source_last_used_at) > str(current_last_used_at):
+            target["last_used_at"] = source_last_used_at
+
+
+def _assistant_usage_snapshot(message: dict[str, Any]) -> dict[str, Any] | None:
+    usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
+    provider = str(message.get("provider") or "").strip()
+    model = str(message.get("model") or "").strip()
+    has_request_marker = bool(usage) or bool(provider or model)
+    if not has_request_marker:
+        return None
+
+    normalized = _normalize_usage_values(
+        {
+            "requests": usage.get("requests", 1),
+            "prompt_tokens": usage.get("prompt_tokens", 0),
+            "completion_tokens": usage.get("completion_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+        }
+    )
+    return {
+        **normalized,
+        "provider": provider or "unknown",
+        "model": model or "unknown",
+        "last_used_at": message.get("timestamp"),
+    }
+
+
 @dataclass
 class Session:
     """
@@ -253,3 +319,137 @@ class SessionManager:
         session.updated_at = datetime.now()
         self.save(session)
         return session
+
+    def record_usage(
+        self,
+        session_or_key: Session | str,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        usage: dict[str, Any] | None = None,
+    ) -> Session:
+        """Accumulate LLM usage counters in session metadata."""
+        session = (
+            session_or_key
+            if isinstance(session_or_key, Session)
+            else self.get_or_create(session_or_key)
+        )
+        usage_snapshot = _normalize_usage_values(usage)
+        if not any(usage_snapshot.values()):
+            return session
+
+        now = datetime.now().isoformat()
+        usage_meta = session.metadata.setdefault("usage", _usage_bucket())
+        _merge_usage_bucket(usage_meta, {**usage_snapshot, "last_used_at": now})
+
+        if provider:
+            providers = usage_meta.setdefault("providers", {})
+            provider_bucket = providers.setdefault(provider, _usage_bucket())
+            _merge_usage_bucket(provider_bucket, {**usage_snapshot, "last_used_at": now})
+
+        if model:
+            models = usage_meta.setdefault("models", {})
+            model_bucket = models.setdefault(model, _usage_bucket())
+            _merge_usage_bucket(model_bucket, {**usage_snapshot, "last_used_at": now})
+
+        session.updated_at = datetime.now()
+        return session
+
+    def summarize_usage(self) -> dict[str, Any]:
+        """Aggregate persisted usage counters across all sessions."""
+        totals = _usage_bucket()
+        providers: dict[str, dict[str, Any]] = {}
+        models: dict[str, dict[str, Any]] = {}
+        sessions_with_usage = 0
+
+        for path in self.sessions_dir.glob("*.jsonl"):
+            try:
+                metadata: dict[str, Any] | None = None
+                assistant_messages: list[dict[str, Any]] = []
+
+                with open(path, encoding="utf-8") as f:
+                    for raw_line in f:
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+
+                        data = json.loads(line)
+                        if data.get("_type") == "metadata":
+                            metadata = data
+                            continue
+                        if data.get("role") == "assistant":
+                            assistant_messages.append(data)
+
+                if metadata is None:
+                    continue
+
+                usage = ((metadata.get("metadata") or {}).get("usage") or {})
+                normalized = _normalize_usage_values(usage)
+                if not any(normalized.values()):
+                    session_has_fallback_usage = False
+                    for message in assistant_messages:
+                        snapshot = _assistant_usage_snapshot(message)
+                        if snapshot is None:
+                            continue
+
+                        if not session_has_fallback_usage:
+                            sessions_with_usage += 1
+                            session_has_fallback_usage = True
+
+                        _merge_usage_bucket(totals, snapshot)
+
+                        provider_bucket = providers.setdefault(
+                            snapshot["provider"],
+                            _usage_bucket(),
+                        )
+                        _merge_usage_bucket(provider_bucket, snapshot)
+
+                        model_bucket = models.setdefault(
+                            snapshot["model"],
+                            _usage_bucket(),
+                        )
+                        _merge_usage_bucket(model_bucket, snapshot)
+                    continue
+
+                sessions_with_usage += 1
+                _merge_usage_bucket(
+                    totals,
+                    {**normalized, "last_used_at": usage.get("last_used_at")},
+                )
+
+                for key, bucket in (usage.get("providers") or {}).items():
+                    provider_bucket = providers.setdefault(key, _usage_bucket())
+                    _merge_usage_bucket(provider_bucket, bucket)
+
+                for key, bucket in (usage.get("models") or {}).items():
+                    model_bucket = models.setdefault(key, _usage_bucket())
+                    _merge_usage_bucket(model_bucket, bucket)
+            except Exception:
+                continue
+
+        def _rows(items: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+            rows = [
+                {
+                    "key": key,
+                    "label": key,
+                    **bucket,
+                }
+                for key, bucket in items.items()
+            ]
+            rows.sort(
+                key=lambda item: (
+                    -int(item.get("total_tokens", 0) or 0),
+                    -int(item.get("requests", 0) or 0),
+                    str(item.get("label") or ""),
+                )
+            )
+            return rows
+
+        return {
+            "available": sessions_with_usage > 0,
+            "sessions": sessions_with_usage,
+            "last_used_at": totals.get("last_used_at"),
+            "totals": totals,
+            "providers": _rows(providers),
+            "models": _rows(models),
+        }

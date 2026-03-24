@@ -52,6 +52,7 @@ class AgentLoop:
         bus: MessageBus,
         provider: LLMProvider,
         workspace: Path,
+        provider_name: str | None = None,
         model: str | None = None,
         max_iterations: int = 40,
         temperature: float = 0.1,
@@ -72,6 +73,7 @@ class AgentLoop:
         self.channels_config = channels_config
         self.provider = provider
         self.workspace = workspace
+        self.provider_name = provider_name
         self.model = model or provider.get_default_model()
         self.max_iterations = max_iterations
         self.temperature = temperature
@@ -182,12 +184,18 @@ class AgentLoop:
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
-    ) -> tuple[str | None, list[str], list[dict]]:
-        """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
+    ) -> tuple[str | None, list[str], list[dict], dict[str, int]]:
+        """Run the agent iteration loop. Returns (final_content, tools_used, messages, usage)."""
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        usage_totals = {
+            "requests": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -200,6 +208,10 @@ class AgentLoop:
                 max_tokens=self.max_tokens,
                 reasoning_effort=self.reasoning_effort,
             )
+            usage_totals["requests"] += 1
+            usage_totals["prompt_tokens"] += int(response.usage.get("prompt_tokens", 0) or 0)
+            usage_totals["completion_tokens"] += int(response.usage.get("completion_tokens", 0) or 0)
+            usage_totals["total_tokens"] += int(response.usage.get("total_tokens", 0) or 0)
 
             if response.has_tool_calls:
                 if on_progress:
@@ -223,6 +235,9 @@ class AgentLoop:
                     messages, response.content, tool_call_dicts,
                     reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
+                    usage=response.usage or None,
+                    model=self.model,
+                    provider=self.provider_name,
                 )
 
                 for tool_call in response.tool_calls:
@@ -244,6 +259,9 @@ class AgentLoop:
                 messages = self.context.add_assistant_message(
                     messages, clean, reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
+                    usage=response.usage or None,
+                    model=self.model,
+                    provider=self.provider_name,
                 )
                 final_content = clean
                 break
@@ -255,7 +273,7 @@ class AgentLoop:
                 "without completing the task. You can try breaking the task into smaller steps."
             )
 
-        return final_content, tools_used, messages
+        return final_content, tools_used, messages, usage_totals
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -348,7 +366,13 @@ class AgentLoop:
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(messages)
+            final_content, _, all_msgs, usage = await self._run_agent_loop(messages)
+            self.sessions.record_usage(
+                session,
+                provider=self.provider_name,
+                model=self.model,
+                usage=usage,
+            )
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             return OutboundMessage(channel=channel, chat_id=chat_id,
@@ -441,13 +465,19 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
+        final_content, _, all_msgs, usage = await self._run_agent_loop(
             initial_messages, on_progress=on_progress or _bus_progress,
         )
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
 
+        self.sessions.record_usage(
+            session,
+            provider=self.provider_name,
+            model=self.model,
+            usage=usage,
+        )
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
 

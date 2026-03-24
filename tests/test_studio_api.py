@@ -138,3 +138,76 @@ def test_session_summary_api_uses_model_output_when_provider_is_configured(tmp_p
 
     sessions = runtime.session_manager.list_sessions()
     assert sessions[0]["thread_summary"] == "飞书表格结构梳理"
+
+
+def test_usage_api_aggregates_session_usage(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    first = runtime.session_manager.get_or_create("studio:cowboy-biaoge:thread-1")
+    runtime.session_manager.record_usage(
+        first,
+        provider="openai",
+        model="gpt-4o-mini",
+        usage={
+            "requests": 2,
+            "prompt_tokens": 120,
+            "completion_tokens": 80,
+            "total_tokens": 200,
+        },
+    )
+    runtime.session_manager.save(first)
+
+    second = runtime.session_manager.get_or_create("studio:cowboy-manong:thread-2")
+    runtime.session_manager.record_usage(
+        second,
+        provider="moonshot",
+        model="moonshot/kimi-k2.5",
+        usage={
+            "requests": 1,
+            "prompt_tokens": 60,
+            "completion_tokens": 40,
+            "total_tokens": 100,
+        },
+    )
+    runtime.session_manager.save(second)
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.get("/api/usage")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["available"] is True
+    assert payload["sessions"] == 2
+    assert payload["totals"]["requests"] == 3
+    assert payload["totals"]["prompt_tokens"] == 180
+    assert payload["totals"]["completion_tokens"] == 120
+    assert payload["totals"]["total_tokens"] == 300
+    assert payload["providers"][0]["key"] == "openai"
+    assert payload["providers"][0]["total_tokens"] == 200
+    assert payload["models"][0]["key"] == "gpt-4o-mini"
+
+
+def test_usage_api_counts_assistant_requests_without_metadata_usage(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    session = runtime.session_manager.get_or_create("studio:cowboy-biaoge:thread-usage-fallback")
+    session.add_message("user", "hi")
+    session.add_message(
+        "assistant",
+        "hello",
+        model="openai-codex/gpt-5.1-codex",
+        provider="openai_codex",
+    )
+    runtime.session_manager.save(session)
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.get("/api/usage")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["available"] is True
+    assert payload["sessions"] == 1
+    assert payload["totals"]["requests"] == 1
+    assert payload["totals"]["total_tokens"] == 0
+    assert payload["providers"][0]["key"] == "openai_codex"
+    assert payload["providers"][0]["requests"] == 1
+    assert payload["models"][0]["key"] == "openai-codex/gpt-5.1-codex"
+    assert payload["models"][0]["requests"] == 1

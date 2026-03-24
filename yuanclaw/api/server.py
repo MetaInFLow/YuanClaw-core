@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import urllib.parse
 import time
 from contextlib import asynccontextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from secrets import token_urlsafe
 from typing import Any
 from urllib.parse import unquote
 
@@ -28,6 +30,276 @@ from yuanclaw.cron.types import CronJob
 from yuanclaw.providers.registry import PROVIDERS, find_by_name
 from yuanclaw.session.manager import SessionManager
 from yuanclaw.utils.helpers import sync_workspace_templates
+
+
+@dataclass
+class OAuthLoginSession:
+    """Transient OAuth browser-login state for desktop settings."""
+
+    provider_id: str
+    session_id: str
+    authorize_url: str
+    state: str
+    verifier: str
+    started_at_ms: int
+    updated_at_ms: int
+    status: str = "waiting_browser"
+    message: str = "Waiting for browser authorization."
+    account_id: str | None = None
+    expires_at_ms: int | None = None
+    server: Any = field(default=None, repr=False)
+    code_future: asyncio.Future[str] | None = field(default=None, repr=False)
+    task: asyncio.Task[None] | None = field(default=None, repr=False)
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "provider_id": self.provider_id,
+            "session_id": self.session_id,
+            "authorize_url": self.authorize_url,
+            "started_at_ms": self.started_at_ms,
+            "updated_at_ms": self.updated_at_ms,
+            "status": self.status,
+            "message": self.message,
+            "account_id": self.account_id,
+            "expires_at_ms": self.expires_at_ms,
+        }
+
+
+class OAuthLoginManager:
+    """Manage desktop OAuth state without requiring a terminal login."""
+
+    def __init__(self) -> None:
+        self._sessions: dict[str, OAuthLoginSession] = {}
+
+    @staticmethod
+    def _provider_definition(provider_id: str):
+        if provider_id != "openai_codex":
+            return None
+
+        from oauth_cli_kit.constants import OPENAI_CODEX_PROVIDER
+
+        return OPENAI_CODEX_PROVIDER
+
+    def _storage(self, provider_id: str):
+        from oauth_cli_kit.storage import FileTokenStorage
+
+        provider = self._provider_definition(provider_id)
+        if provider is None:
+            raise RuntimeError(f"Unsupported OAuth provider: {provider_id}")
+        return FileTokenStorage(token_filename=provider.token_filename)
+
+    def _token_status(self, provider_id: str, *, refresh: bool) -> dict[str, Any]:
+        provider = self._provider_definition(provider_id)
+        if provider is None:
+            return {
+                "provider_id": provider_id,
+                "supported": False,
+                "configured": False,
+                "state": "unsupported",
+                "message": "Desktop OAuth flow is not implemented for this provider yet.",
+                "account_id": None,
+                "expires_at_ms": None,
+                "active_session": None,
+            }
+
+        from oauth_cli_kit import get_token
+
+        storage = self._storage(provider_id)
+        token = storage.load()
+        if not token:
+            return {
+                "provider_id": provider_id,
+                "supported": True,
+                "configured": False,
+                "state": "missing",
+                "message": "Not signed in.",
+                "account_id": None,
+                "expires_at_ms": None,
+                "active_session": None,
+            }
+
+        now_ms = int(time.time() * 1000)
+        if token.expires - now_ms > 60 * 1000:
+            return {
+                "provider_id": provider_id,
+                "supported": True,
+                "configured": True,
+                "state": "connected",
+                "message": "OAuth session is ready.",
+                "account_id": token.account_id,
+                "expires_at_ms": token.expires,
+                "active_session": None,
+            }
+
+        if not refresh:
+            return {
+                "provider_id": provider_id,
+                "supported": True,
+                "configured": False,
+                "state": "expiring",
+                "message": "Stored token is expiring and needs refresh.",
+                "account_id": token.account_id,
+                "expires_at_ms": token.expires,
+                "active_session": None,
+            }
+
+        try:
+            refreshed = get_token(provider=provider, storage=storage)
+            return {
+                "provider_id": provider_id,
+                "supported": True,
+                "configured": True,
+                "state": "connected",
+                "message": "OAuth session is ready.",
+                "account_id": refreshed.account_id,
+                "expires_at_ms": refreshed.expires,
+                "active_session": None,
+            }
+        except Exception as exc:
+            return {
+                "provider_id": provider_id,
+                "supported": True,
+                "configured": False,
+                "state": "reauth_required",
+                "message": str(exc),
+                "account_id": token.account_id,
+                "expires_at_ms": token.expires,
+                "active_session": None,
+            }
+
+    async def start_login(self, provider_id: str) -> dict[str, Any]:
+        provider = self._provider_definition(provider_id)
+        if provider is None:
+            raise RuntimeError(f"Unsupported OAuth provider: {provider_id}")
+
+        current = self._sessions.get(provider_id)
+        if current and current.status in {"waiting_browser", "exchanging"}:
+            return self.status(provider_id)
+
+        from oauth_cli_kit.flow import _create_state, _exchange_code_for_token_async, _generate_pkce
+        from oauth_cli_kit.server import _start_local_server
+
+        verifier, challenge = _generate_pkce()
+        state = _create_state()
+        params = {
+            "response_type": "code",
+            "client_id": provider.client_id,
+            "redirect_uri": provider.redirect_uri,
+            "scope": provider.scope,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": state,
+            "id_token_add_organizations": "true",
+            "codex_cli_simplified_flow": "true",
+            "originator": provider.default_originator,
+        }
+        authorize_url = f"{provider.authorize_url}?{urllib.parse.urlencode(params)}"
+
+        loop = asyncio.get_running_loop()
+        code_future: asyncio.Future[str] = loop.create_future()
+
+        def _notify(code_value: str) -> None:
+            if code_future.done():
+                return
+            loop.call_soon_threadsafe(code_future.set_result, code_value)
+
+        server, server_error = _start_local_server(state, on_code=_notify)
+        if not server:
+            raise RuntimeError(server_error or "Failed to start local OAuth callback server.")
+
+        session = OAuthLoginSession(
+            provider_id=provider_id,
+            session_id=token_urlsafe(12),
+            authorize_url=authorize_url,
+            state=state,
+            verifier=verifier,
+            started_at_ms=int(time.time() * 1000),
+            updated_at_ms=int(time.time() * 1000),
+            server=server,
+            code_future=code_future,
+        )
+        self._sessions[provider_id] = session
+
+        async def _complete_login() -> None:
+            try:
+                code = await asyncio.wait_for(code_future, timeout=300)
+                session.status = "exchanging"
+                session.updated_at_ms = int(time.time() * 1000)
+                session.message = "Browser callback received. Exchanging tokens..."
+                token = await _exchange_code_for_token_async(code, verifier, provider)()
+                self._storage(provider_id).save(token)
+                session.status = "success"
+                session.updated_at_ms = int(time.time() * 1000)
+                session.message = "OAuth login completed."
+                session.account_id = token.account_id
+                session.expires_at_ms = token.expires
+            except asyncio.TimeoutError:
+                session.status = "error"
+                session.updated_at_ms = int(time.time() * 1000)
+                session.message = "Timed out waiting for the browser callback. Please try again."
+            except Exception as exc:
+                session.status = "error"
+                session.updated_at_ms = int(time.time() * 1000)
+                session.message = str(exc)
+            finally:
+                try:
+                    server.shutdown()
+                    server.server_close()
+                except Exception:
+                    pass
+
+        session.task = asyncio.create_task(_complete_login(), name=f"oauth-login-{provider_id}")
+        return self.status(provider_id)
+
+    def status(self, provider_id: str) -> dict[str, Any]:
+        status = self._token_status(provider_id, refresh=True)
+        session = self._sessions.get(provider_id)
+        if session is None:
+            return status
+
+        status["active_session"] = session.payload()
+        if session.status in {"waiting_browser", "exchanging"}:
+            status["configured"] = False
+            status["state"] = session.status
+            status["message"] = session.message
+        elif session.status == "error":
+            status["configured"] = False
+            status["state"] = "reauth_required"
+            status["message"] = session.message
+        elif session.status == "success":
+            status["configured"] = True
+            status["state"] = "connected"
+            status["message"] = session.message
+            status["account_id"] = session.account_id
+            status["expires_at_ms"] = session.expires_at_ms
+
+        return status
+
+    def logout(self, provider_id: str) -> dict[str, Any]:
+        provider = self._provider_definition(provider_id)
+        if provider is None:
+            raise RuntimeError(f"Unsupported OAuth provider: {provider_id}")
+
+        session = self._sessions.get(provider_id)
+        if session is not None:
+            if session.task and not session.task.done():
+                session.task.cancel()
+            try:
+                if session.server:
+                    session.server.shutdown()
+                    session.server.server_close()
+            except Exception:
+                pass
+            self._sessions.pop(provider_id, None)
+
+        token_path = self._storage(provider_id).get_token_path()
+        try:
+            if token_path.exists():
+                token_path.unlink()
+        except Exception as exc:
+            raise RuntimeError(f"Failed to remove OAuth token: {exc}") from exc
+
+        return self.status(provider_id)
 
 
 def _make_provider(config: Config):
@@ -140,7 +412,10 @@ def _list_skills() -> list[dict[str, Any]]:
     return items
 
 
-def _provider_rows(config: Config) -> list[dict[str, Any]]:
+def _provider_rows(
+    config: Config,
+    oauth_statuses: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """Summarize providers for Settings page."""
     selected = config.get_provider_name(config.agents.defaults.model)
     rows: list[dict[str, Any]] = []
@@ -150,7 +425,10 @@ def _provider_rows(config: Config) -> list[dict[str, Any]]:
         if provider is None:
             continue
 
-        configured = bool(spec.is_oauth or provider.api_key or provider.api_base)
+        oauth_status = (oauth_statuses or {}).get(spec.name, {})
+        configured = (
+            bool(oauth_status.get("configured")) if oauth_status.get("supported") else True
+        ) if spec.is_oauth else bool(provider.api_key or provider.api_base)
         rows.append(
             {
                 "id": spec.name,
@@ -159,6 +437,11 @@ def _provider_rows(config: Config) -> list[dict[str, Any]]:
                 "is_default": spec.name == selected,
                 "api_key_masked": _mask_secret(provider.api_key or ""),
                 "api_base": provider.api_base or "",
+                "oauth_supported": bool(oauth_status.get("supported")) if spec.is_oauth else False,
+                "oauth_state": oauth_status.get("state") if spec.is_oauth else None,
+                "oauth_message": oauth_status.get("message") if spec.is_oauth else None,
+                "oauth_account_id": oauth_status.get("account_id") if spec.is_oauth else None,
+                "oauth_expires_at_ms": oauth_status.get("expires_at_ms") if spec.is_oauth else None,
             }
         )
 
@@ -297,47 +580,89 @@ class CoreRuntime:
     """In-memory runtime used by the Studio API server."""
 
     def __init__(self, config: Config, host: str, port: int, with_channels: bool) -> None:
-        self.config = config
         self.host = host
         self.port = port
         self.with_channels = with_channels
         self.started_at = 0.0
-
-        sync_workspace_templates(config.workspace_path)
-        self.bus = MessageBus()
         self.events = RuntimeEventBroker()
+        self.config = config
+        self.bus = MessageBus()
         self.provider = _make_provider(config)
         self.session_manager = SessionManager(config.workspace_path)
         self.cron = CronService(get_cron_dir() / "jobs.json")
-        self.bus.add_inbound_listener(self._on_bus_inbound)
-        self.bus.add_outbound_listener(self._on_bus_outbound)
-
         self.agent = AgentLoop(
             bus=self.bus,
             provider=self.provider,
             workspace=config.workspace_path,
-            model=config.agents.defaults.model,
-            temperature=config.agents.defaults.temperature,
-            max_tokens=config.agents.defaults.max_tokens,
-            max_iterations=config.agents.defaults.max_tool_iterations,
-            memory_window=config.agents.defaults.memory_window,
-            reasoning_effort=config.agents.defaults.reasoning_effort,
-            brave_api_key=config.tools.web.search.api_key or None,
-            web_proxy=config.tools.web.proxy or None,
-            exec_config=config.tools.exec,
-            cron_service=self.cron,
-            restrict_to_workspace=config.tools.restrict_to_workspace,
-            session_manager=self.session_manager,
-            mcp_servers=config.tools.mcp_servers,
-            channels_config=config.channels,
         )
-
-        self.cron.on_job = self._on_cron_job
-        self.channels = ChannelManager(config, self.bus) if with_channels else None
+        self.channels = None
         self._agent_task: asyncio.Task | None = None
         self._channels_task: asyncio.Task | None = None
         self._started = False
         self._lifecycle_lock = asyncio.Lock()
+        self._install_components(config, self._create_components(config))
+
+    def _create_components(self, config: Config) -> dict[str, Any]:
+        """Build runtime components for a config without mutating the active runtime."""
+        try:
+            sync_workspace_templates(config.workspace_path)
+
+            bus = MessageBus()
+            bus.add_inbound_listener(self._on_bus_inbound)
+            bus.add_outbound_listener(self._on_bus_outbound)
+
+            provider = _make_provider(config)
+            session_manager = SessionManager(config.workspace_path)
+            cron = CronService(get_cron_dir() / "jobs.json")
+            agent = AgentLoop(
+                bus=bus,
+                provider=provider,
+                workspace=config.workspace_path,
+                model=config.agents.defaults.model,
+                provider_name=config.get_provider_name(config.agents.defaults.model),
+                temperature=config.agents.defaults.temperature,
+                max_tokens=config.agents.defaults.max_tokens,
+                max_iterations=config.agents.defaults.max_tool_iterations,
+                memory_window=config.agents.defaults.memory_window,
+                reasoning_effort=config.agents.defaults.reasoning_effort,
+                brave_api_key=config.tools.web.search.api_key or None,
+                web_proxy=config.tools.web.proxy or None,
+                exec_config=config.tools.exec,
+                cron_service=cron,
+                restrict_to_workspace=config.tools.restrict_to_workspace,
+                session_manager=session_manager,
+                mcp_servers=config.tools.mcp_servers,
+                channels_config=config.channels,
+            )
+            cron.on_job = self._on_cron_job
+            channels = ChannelManager(config, bus) if self.with_channels else None
+        except BaseException as exc:
+            if isinstance(exc, KeyboardInterrupt):
+                raise
+            raise RuntimeError(f"Failed to prepare runtime components: {exc}") from exc
+
+        return {
+            "bus": bus,
+            "provider": provider,
+            "session_manager": session_manager,
+            "cron": cron,
+            "agent": agent,
+            "channels": channels,
+        }
+
+    def _install_components(self, config: Config, components: dict[str, Any]) -> None:
+        """Swap in a fully prepared runtime component set."""
+        self.config = config
+        self.bus = components["bus"]
+        self.provider = components["provider"]
+        self.session_manager = components["session_manager"]
+        self.cron = components["cron"]
+        self.agent = components["agent"]
+        self.channels = components["channels"]
+
+    def prepare_config(self, config: Config) -> dict[str, Any]:
+        """Validate whether a config can be applied to the running Core."""
+        return self._create_components(config)
 
     def _on_bus_inbound(self, msg: Any) -> None:
         content = (msg.content or "").strip()
@@ -387,55 +712,92 @@ class CoreRuntime:
             chat_id=job.payload.to or "direct",
         )
 
+    async def _start_locked(self) -> None:
+        if self._started:
+            return
+
+        await self.cron.start()
+        if self.with_channels:
+            self._agent_task = asyncio.create_task(self.agent.run(), name="yuanclaw-agent-loop")
+            self._channels_task = asyncio.create_task(
+                self.channels.start_all(), name="yuanclaw-channels"
+            )
+        self.started_at = time.time()
+        self._started = True
+        logger.info("Studio API runtime started on {}:{}", self.host, self.port)
+        self.events.publish(
+            {
+                "type": "core.started",
+                "host": self.host,
+                "port": self.port,
+                "pid": os.getpid(),
+                "with_channels": self.with_channels,
+            }
+        )
+
     async def start(self) -> None:
         """Start runtime services."""
         async with self._lifecycle_lock:
-            if self._started:
-                return
+            await self._start_locked()
 
-            await self.cron.start()
-            if self.with_channels:
-                self._agent_task = asyncio.create_task(self.agent.run(), name="yuanclaw-agent-loop")
-                self._channels_task = asyncio.create_task(
-                    self.channels.start_all(), name="yuanclaw-channels"
-                )
-            self.started_at = time.time()
-            self._started = True
-            logger.info("Studio API runtime started on {}:{}", self.host, self.port)
-            self.events.publish(
-                {
-                    "type": "core.started",
-                    "host": self.host,
-                    "port": self.port,
-                    "pid": os.getpid(),
-                    "with_channels": self.with_channels,
-                }
-            )
+    async def _stop_locked(self) -> None:
+        if not self._started:
+            return
+
+        self.cron.stop()
+        if self.channels is not None:
+            await self.channels.stop_all()
+        self.agent.stop()
+        await self.agent.close_mcp()
+
+        tasks = [t for t in (self._agent_task, self._channels_task) if t is not None]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        self._agent_task = None
+        self._channels_task = None
+        self._started = False
+        self.events.publish({"type": "core.stopped"})
+        logger.info("Studio API runtime stopped")
 
     async def stop(self) -> None:
         """Stop runtime services."""
         async with self._lifecycle_lock:
-            if not self._started:
-                return
+            await self._stop_locked()
 
-            self.cron.stop()
-            if self.channels is not None:
-                await self.channels.stop_all()
-            self.agent.stop()
-            await self.agent.close_mcp()
+    async def apply_config(
+        self,
+        config: Config,
+        prepared_components: dict[str, Any] | None = None,
+    ) -> None:
+        """Hot-apply config so provider/model/channel changes take effect immediately."""
+        components = prepared_components or self._create_components(config)
 
-            tasks = [t for t in (self._agent_task, self._channels_task) if t is not None]
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+        async with self._lifecycle_lock:
+            was_running = self._started
+            if was_running:
+                await self._stop_locked()
 
-            self._agent_task = None
-            self._channels_task = None
-            self._started = False
-            self.events.publish({"type": "core.stopped"})
-            logger.info("Studio API runtime stopped")
+            self._install_components(config, components)
+
+            if was_running:
+                await self._start_locked()
+
+        self.events.publish(
+            {
+                "type": "core.reconfigured",
+                "model": config.agents.defaults.model,
+                "workspace": str(config.workspace_path),
+            }
+        )
+        logger.info(
+            "Studio API runtime reconfigured: model={}, workspace={}",
+            config.agents.defaults.model,
+            config.workspace_path,
+        )
 
     @property
     def running(self) -> bool:
@@ -522,6 +884,7 @@ class CoreRuntime:
 
 def create_app(runtime: CoreRuntime) -> FastAPI:
     """Create FastAPI application for local Studio runtime."""
+    oauth_manager = OAuthLoginManager()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -618,12 +981,42 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
 
     @app.get("/api/config")
     async def read_config() -> dict[str, Any]:
+        oauth_statuses = {
+            spec.name: oauth_manager.status(spec.name)
+            for spec in PROVIDERS
+            if spec.is_oauth
+        }
         return {
             "model": runtime.config.agents.defaults.model,
             "workspace": str(runtime.config.workspace_path),
-            "providers": _provider_rows(runtime.config),
+            "providers": _provider_rows(runtime.config, oauth_statuses=oauth_statuses),
             "raw": runtime.config.model_dump(by_alias=True),
         }
+
+    @app.get("/api/usage")
+    async def usage() -> dict[str, Any]:
+        return runtime.session_manager.summarize_usage()
+
+    @app.get("/api/providers/oauth/{provider_id}")
+    async def oauth_provider_status(provider_id: str) -> dict[str, Any]:
+        try:
+            return oauth_manager.status(provider_id.replace("-", "_"))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/providers/oauth/{provider_id}/start")
+    async def oauth_provider_start(provider_id: str) -> dict[str, Any]:
+        try:
+            return await oauth_manager.start_login(provider_id.replace("-", "_"))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/providers/oauth/{provider_id}/logout")
+    async def oauth_provider_logout(provider_id: str) -> dict[str, Any]:
+        try:
+            return oauth_manager.logout(provider_id.replace("-", "_"))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.put("/api/config")
     async def write_config(payload: dict[str, Any]) -> dict[str, Any]:
@@ -632,11 +1025,20 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"invalid config payload: {exc}") from exc
 
-        save_config(next_config)
-        runtime.config = next_config
+        try:
+            prepared_components = runtime.prepare_config(next_config)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"config is not applicable: {exc}") from exc
+
+        try:
+            save_config(next_config)
+            await runtime.apply_config(next_config, prepared_components=prepared_components)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"failed to apply config: {exc}") from exc
+
         return {
             "ok": True,
-            "requires_restart": True,
+            "requires_restart": False,
             "saved_at": int(time.time()),
         }
 
