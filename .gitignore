@@ -9,3 +9,4 @@ _reference_repo/
 __pycache__/
 *.pyc
 .pytest_cache/
+.venv/
