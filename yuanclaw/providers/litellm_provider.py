@@ -4,6 +4,7 @@ import hashlib
 import os
 import secrets
 import string
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import json_repair
@@ -214,6 +215,7 @@ class LiteLLMProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
+        on_text_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request via LiteLLM.
@@ -270,6 +272,13 @@ class LiteLLMProvider(LLMProvider):
             kwargs["tool_choice"] = "auto"
 
         try:
+            if on_text_delta is not None:
+                stream_kwargs = dict(kwargs)
+                stream_kwargs["stream"] = True
+                try:
+                    return await self._parse_streaming_response(stream_kwargs, on_text_delta)
+                except Exception as stream_error:
+                    logger.warning("LiteLLM streaming failed, falling back to non-streaming: {}", stream_error)
             response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
@@ -278,6 +287,88 @@ class LiteLLMProvider(LLMProvider):
                 content=f"Error calling LLM: {str(e)}",
                 finish_reason="error",
             )
+
+    async def _parse_streaming_response(
+        self,
+        kwargs: dict[str, Any],
+        on_text_delta: Callable[[str], Awaitable[None]],
+    ) -> LLMResponse:
+        stream = await acompletion(**kwargs)
+        content_parts: list[str] = []
+        finish_reason = "stop"
+        usage: dict[str, int] = {}
+        tool_call_buffers: dict[int, dict[str, Any]] = {}
+
+        async for chunk in stream:
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+
+            choice = choices[0]
+            delta = getattr(choice, "delta", None)
+
+            if delta is not None:
+                text_delta = getattr(delta, "content", None)
+                if text_delta:
+                    content_parts.append(text_delta)
+                    await on_text_delta(text_delta)
+
+                delta_tool_calls = getattr(delta, "tool_calls", None) or []
+                for delta_tool_call in delta_tool_calls:
+                    index = getattr(delta_tool_call, "index", None)
+                    if index is None:
+                        index = len(tool_call_buffers)
+                    buffer = tool_call_buffers.setdefault(
+                        index,
+                        {
+                            "id": None,
+                            "name": None,
+                            "arguments": "",
+                        },
+                    )
+                    if getattr(delta_tool_call, "id", None):
+                        buffer["id"] = delta_tool_call.id
+                    function = getattr(delta_tool_call, "function", None)
+                    if function is not None:
+                        if getattr(function, "name", None):
+                            buffer["name"] = function.name
+                        if getattr(function, "arguments", None):
+                            buffer["arguments"] += function.arguments
+
+            if getattr(choice, "finish_reason", None):
+                finish_reason = choice.finish_reason or finish_reason
+
+            chunk_usage = getattr(chunk, "usage", None)
+            if chunk_usage:
+                usage = {
+                    "prompt_tokens": int(getattr(chunk_usage, "prompt_tokens", 0) or 0),
+                    "completion_tokens": int(getattr(chunk_usage, "completion_tokens", 0) or 0),
+                    "total_tokens": int(getattr(chunk_usage, "total_tokens", 0) or 0),
+                }
+
+        tool_calls = []
+        for index in sorted(tool_call_buffers):
+            buffer = tool_call_buffers[index]
+            args_raw = buffer["arguments"] or "{}"
+            try:
+                args = json_repair.loads(args_raw) if isinstance(args_raw, str) else args_raw
+            except Exception:
+                args = {"raw": args_raw}
+
+            tool_calls.append(
+                ToolCallRequest(
+                    id=buffer["id"] or _short_tool_id(),
+                    name=buffer["name"] or f"tool_{index}",
+                    arguments=args,
+                )
+            )
+
+        return LLMResponse(
+            content="".join(content_parts) or None,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+            usage=usage,
+        )
 
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""

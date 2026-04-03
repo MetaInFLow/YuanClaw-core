@@ -207,6 +207,7 @@ class AgentLoop:
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 reasoning_effort=self.reasoning_effort,
+                on_text_delta=on_progress,
             )
             usage_totals["requests"] += 1
             usage_totals["prompt_tokens"] += int(response.usage.get("prompt_tokens", 0) or 0)

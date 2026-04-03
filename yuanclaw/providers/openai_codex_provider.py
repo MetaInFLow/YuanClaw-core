@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections.abc import Awaitable, Callable
 from typing import Any, AsyncGenerator
 
 import httpx
@@ -32,6 +33,7 @@ class OpenAICodexProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
+        on_text_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         model = model or self.default_model
         system_prompt, input_items = _convert_messages(messages)
@@ -63,14 +65,14 @@ class OpenAICodexProvider(LLMProvider):
         try:
             try:
                 content, tool_calls, finish_reason, usage = await _request_codex(
-                    url, headers, body, verify=True
+                    url, headers, body, verify=True, on_text_delta=on_text_delta
                 )
             except Exception as e:
                 if "CERTIFICATE_VERIFY_FAILED" not in str(e):
                     raise
                 logger.warning("SSL certificate verification failed for Codex API; retrying with verify=False")
                 content, tool_calls, finish_reason, usage = await _request_codex(
-                    url, headers, body, verify=False
+                    url, headers, body, verify=False, on_text_delta=on_text_delta
                 )
             return LLMResponse(
                 content=content,
@@ -111,13 +113,14 @@ async def _request_codex(
     headers: dict[str, str],
     body: dict[str, Any],
     verify: bool,
+    on_text_delta: Callable[[str], Awaitable[None]] | None = None,
 ) -> tuple[str, list[ToolCallRequest], str, dict[str, int]]:
     async with httpx.AsyncClient(timeout=60.0, verify=verify) as client:
         async with client.stream("POST", url, headers=headers, json=body) as response:
             if response.status_code != 200:
                 text = await response.aread()
                 raise RuntimeError(_friendly_error(response.status_code, text.decode("utf-8", "ignore")))
-            return await _consume_sse(response)
+            return await _consume_sse(response, on_text_delta=on_text_delta)
 
 
 def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -251,7 +254,10 @@ async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], 
         buffer.append(line)
 
 
-async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequest], str, dict[str, int]]:
+async def _consume_sse(
+    response: httpx.Response,
+    on_text_delta: Callable[[str], Awaitable[None]] | None = None,
+) -> tuple[str, list[ToolCallRequest], str, dict[str, int]]:
     content = ""
     tool_calls: list[ToolCallRequest] = []
     tool_call_buffers: dict[str, dict[str, Any]] = {}
@@ -272,7 +278,10 @@ async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequ
                     "arguments": item.get("arguments") or "",
                 }
         elif event_type == "response.output_text.delta":
-            content += event.get("delta") or ""
+            delta = event.get("delta") or ""
+            content += delta
+            if delta and on_text_delta is not None:
+                await on_text_delta(delta)
         elif event_type == "response.function_call_arguments.delta":
             call_id = event.get("call_id")
             if call_id and call_id in tool_call_buffers:

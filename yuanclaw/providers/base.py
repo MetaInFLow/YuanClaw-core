@@ -1,6 +1,7 @@
 """Base LLM provider interface."""
 
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -110,6 +111,7 @@ class LLMProvider(ABC):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
+        on_text_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request.
