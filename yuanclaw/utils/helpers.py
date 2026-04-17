@@ -57,6 +57,9 @@ def build_assistant_message(
     tool_calls: list[dict[str, Any]] | None = None,
     reasoning_content: str | None = None,
     thinking_blocks: list[dict] | None = None,
+    usage: dict[str, int] | None = None,
+    model: str | None = None,
+    provider: str | None = None,
 ) -> dict[str, Any]:
     """Build a provider-safe assistant message with optional reasoning fields."""
     msg: dict[str, Any] = {"role": "assistant", "content": content}
@@ -66,6 +69,12 @@ def build_assistant_message(
         msg["reasoning_content"] = reasoning_content
     if thinking_blocks:
         msg["thinking_blocks"] = thinking_blocks
+    if usage:
+        msg["usage"] = usage
+    if model:
+        msg["model"] = model
+    if provider:
+        msg["provider"] = provider
     return msg
 
 

@@ -181,6 +181,9 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         tool_calls: list[dict[str, Any]] | None = None,
         reasoning_content: str | None = None,
         thinking_blocks: list[dict] | None = None,
+        usage: dict[str, int] | None = None,
+        model: str | None = None,
+        provider: str | None = None,
     ) -> list[dict[str, Any]]:
         """Add an assistant message to the message list."""
         messages.append(
@@ -189,6 +192,9 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
                 tool_calls=tool_calls,
                 reasoning_content=reasoning_content,
                 thinking_blocks=thinking_blocks,
+                usage=usage,
+                model=model,
+                provider=provider,
             )
         )
         return messages

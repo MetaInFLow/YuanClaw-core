@@ -59,7 +59,7 @@ class CustomProvider(LLMProvider):
 
     async def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
                    model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7,
-                   reasoning_effort: str | None = None,
+                   reasoning_effort: str | None = None, on_text_delta=None,
                    tool_choice: str | dict[str, Any] | None = None) -> LLMResponse:
         kwargs = self._build_kwargs(messages, tools, model, max_tokens, temperature, reasoning_effort, tool_choice)
         try:

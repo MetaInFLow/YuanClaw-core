@@ -121,6 +121,7 @@ class AzureOpenAIProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
+        on_text_delta=None,
         tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
         """

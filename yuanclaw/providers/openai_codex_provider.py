@@ -33,9 +33,17 @@ class OpenAICodexProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
+        on_text_delta: Callable[[str], Awaitable[None]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
-        return await self._call_codex(messages, tools, model, reasoning_effort, tool_choice)
+        return await self._call_codex(
+            messages,
+            tools,
+            model,
+            reasoning_effort,
+            tool_choice,
+            on_content_delta=on_text_delta,
+        )
 
     async def chat_stream(
         self,
@@ -96,20 +104,21 @@ class OpenAICodexProvider(LLMProvider):
 
         try:
             try:
-                content, tool_calls, finish_reason = await _request_codex(
-                    url, headers, body, verify=True, on_content_delta=on_content_delta
+                content, tool_calls, finish_reason, usage = await _request_codex(
+                    url, headers, body, verify=True, on_text_delta=on_content_delta
                 )
             except Exception as e:
                 if "CERTIFICATE_VERIFY_FAILED" not in str(e):
                     raise
                 logger.warning("SSL certificate verification failed for Codex API; retrying with verify=False")
-                content, tool_calls, finish_reason = await _request_codex(
-                    url, headers, body, verify=False, on_content_delta=on_content_delta
+                content, tool_calls, finish_reason, usage = await _request_codex(
+                    url, headers, body, verify=False, on_text_delta=on_content_delta
                 )
             return LLMResponse(
                 content=content,
                 tool_calls=tool_calls,
                 finish_reason=finish_reason,
+                usage=usage,
             )
         except Exception as e:
             return LLMResponse(
@@ -144,14 +153,14 @@ async def _request_codex(
     headers: dict[str, str],
     body: dict[str, Any],
     verify: bool,
-    on_content_delta: Callable[[str], Awaitable[None]] | None = None,
-) -> tuple[str, list[ToolCallRequest], str]:
+    on_text_delta: Callable[[str], Awaitable[None]] | None = None,
+) -> tuple[str, list[ToolCallRequest], str, dict[str, int]]:
     async with httpx.AsyncClient(timeout=60.0, verify=verify) as client:
         async with client.stream("POST", url, headers=headers, json=body) as response:
             if response.status_code != 200:
                 text = await response.aread()
                 raise RuntimeError(_friendly_error(response.status_code, text.decode("utf-8", "ignore")))
-            return await _consume_sse(response, on_content_delta)
+            return await _consume_sse(response, on_text_delta=on_text_delta)
 
 
 def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -287,12 +296,13 @@ async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], 
 
 async def _consume_sse(
     response: httpx.Response,
-    on_content_delta: Callable[[str], Awaitable[None]] | None = None,
-) -> tuple[str, list[ToolCallRequest], str]:
+    on_text_delta: Callable[[str], Awaitable[None]] | None = None,
+) -> tuple[str, list[ToolCallRequest], str, dict[str, int]]:
     content = ""
     tool_calls: list[ToolCallRequest] = []
     tool_call_buffers: dict[str, dict[str, Any]] = {}
     finish_reason = "stop"
+    usage: dict[str, int] = {}
 
     async for event in _iter_sse(response):
         event_type = event.get("type")
@@ -310,8 +320,8 @@ async def _consume_sse(
         elif event_type == "response.output_text.delta":
             delta_text = event.get("delta") or ""
             content += delta_text
-            if on_content_delta and delta_text:
-                await on_content_delta(delta_text)
+            if on_text_delta and delta_text:
+                await on_text_delta(delta_text)
         elif event_type == "response.function_call_arguments.delta":
             call_id = event.get("call_id")
             if call_id and call_id in tool_call_buffers:
@@ -340,12 +350,45 @@ async def _consume_sse(
                     )
                 )
         elif event_type == "response.completed":
-            status = (event.get("response") or {}).get("status")
+            response_payload = event.get("response") or {}
+            status = response_payload.get("status")
             finish_reason = _map_finish_reason(status)
+            usage = _extract_usage(response_payload)
         elif event_type in {"error", "response.failed"}:
             raise RuntimeError("Codex response failed")
 
-    return content, tool_calls, finish_reason
+    return content, tool_calls, finish_reason, usage
+
+
+def _extract_usage(response_payload: dict[str, Any] | None) -> dict[str, int]:
+    payload = response_payload or {}
+    usage_payload = payload.get("usage") or {}
+
+    def _to_int(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    prompt_tokens = _to_int(
+        usage_payload.get("prompt_tokens", usage_payload.get("input_tokens"))
+    )
+    completion_tokens = _to_int(
+        usage_payload.get("completion_tokens", usage_payload.get("output_tokens"))
+    )
+    total_tokens = _to_int(usage_payload.get("total_tokens"))
+
+    if total_tokens == 0:
+        total_tokens = prompt_tokens + completion_tokens
+
+    if prompt_tokens == 0 and completion_tokens == 0 and total_tokens == 0:
+        return {}
+
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
 
 
 _FINISH_REASON_MAP = {"completed": "stop", "incomplete": "length", "failed": "error", "cancelled": "error"}

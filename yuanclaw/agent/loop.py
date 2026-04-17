@@ -29,6 +29,7 @@ from yuanclaw.command import CommandContext, CommandRouter, register_builtin_com
 from yuanclaw.memory import CoreMemoryBackend, LegacyMemoryBackend, MemoryBackend
 from yuanclaw.providers.base import LLMProvider
 from yuanclaw.session.manager import Session, SessionManager
+from yuanclaw.studio_agents import get_fixed_skills_for_session
 from yuanclaw.utils.helpers import strip_think
 
 if TYPE_CHECKING:
@@ -60,6 +61,7 @@ class AgentLoop:
         bus: MessageBus,
         provider: LLMProvider,
         workspace: Path,
+        provider_name: str | None = None,
         model: str | None = None,
         max_iterations: int = 40,
         temperature: float = 0.1,
@@ -86,6 +88,7 @@ class AgentLoop:
         self.channels_config = channels_config
         self.provider = provider
         self.workspace = workspace
+        self.provider_name = provider_name
         self.model = model or provider.get_default_model()
         self.max_iterations = max_iterations
         self.temperature = temperature
@@ -287,12 +290,18 @@ class AgentLoop:
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
-    ) -> tuple[str | None, list[str], list[dict]]:
-        """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
+    ) -> tuple[str | None, list[str], list[dict], dict[str, int]]:
+        """Run the agent iteration loop. Returns (final_content, tools_used, messages, usage)."""
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        usage_totals = {
+            "requests": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -309,6 +318,14 @@ class AgentLoop:
                     on_content_delta=on_stream,
                 )
             else:
+                streamed_via_chat = False
+
+                async def _on_chat_delta(text: str) -> None:
+                    nonlocal streamed_via_chat
+                    streamed_via_chat = True
+                    if on_stream:
+                        await on_stream(text)
+
                 response = await self.provider.chat(
                     messages=messages,
                     tools=tool_defs,
@@ -316,11 +333,16 @@ class AgentLoop:
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                     reasoning_effort=self.reasoning_effort,
+                    on_text_delta=_on_chat_delta if on_stream else None,
                 )
-                if on_stream and response.content:
+                if on_stream and response.content and not streamed_via_chat:
                     await on_stream(response.content)
 
             usage = response.usage or {}
+            usage_totals["requests"] += 1
+            usage_totals["prompt_tokens"] += int(usage.get("prompt_tokens", 0) or 0)
+            usage_totals["completion_tokens"] += int(usage.get("completion_tokens", 0) or 0)
+            usage_totals["total_tokens"] += int(usage.get("total_tokens", 0) or 0)
             self._last_usage = {
                 "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
                 "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
@@ -353,6 +375,9 @@ class AgentLoop:
                     messages, response.content, tool_call_dicts,
                     reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
+                    usage=usage or None,
+                    model=self.model,
+                    provider=self.provider_name,
                 )
 
                 for tool_call in response.tool_calls:
@@ -376,6 +401,9 @@ class AgentLoop:
                 messages = self.context.add_assistant_message(
                     messages, clean, reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
+                    usage=usage or None,
+                    model=self.model,
+                    provider=self.provider_name,
                 )
                 final_content = clean
                 break
@@ -387,7 +415,7 @@ class AgentLoop:
                 "without completing the task. You can try breaking the task into smaller steps."
             )
 
-        return final_content, tools_used, messages
+        return final_content, tools_used, messages, usage_totals
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -535,11 +563,17 @@ class AgentLoop:
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 memory_context=memory_context,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(
+            final_content, _, all_msgs, usage = await self._run_agent_loop(
                 messages,
                 on_progress=on_progress,
                 on_stream=on_stream,
                 on_stream_end=on_stream_end,
+            )
+            self.sessions.record_usage(
+                session,
+                provider=self.provider_name,
+                model=self.model,
+                usage=usage,
             )
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
@@ -584,6 +618,13 @@ class AgentLoop:
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
+        skill_names = msg.metadata.get("skill_names")
+        if not isinstance(skill_names, list):
+            skill_names = None
+        if skill_names is None:
+            fixed_skills = get_fixed_skills_for_session(key)
+            skill_names = fixed_skills or None
+
         history = session.get_history(max_messages=self.memory_window)
         memory_context = self._build_memory_context(
             session_key=key,
@@ -594,6 +635,7 @@ class AgentLoop:
         initial_messages = self.context.build_messages(
             history=history,
             current_message=msg.content,
+            skill_names=skill_names,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
             memory_context=memory_context,
@@ -607,7 +649,7 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
+        final_content, _, all_msgs, usage = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
             on_stream=on_stream,
@@ -617,6 +659,12 @@ class AgentLoop:
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
 
+        self.sessions.record_usage(
+            session,
+            provider=self.provider_name,
+            model=self.model,
+            usage=usage,
+        )
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
 
@@ -685,10 +733,18 @@ class AgentLoop:
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        skill_names: list[str] | None = None,
     ) -> str:
         """Process a message directly (for CLI or cron usage)."""
         await self._connect_mcp()
-        msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
+        metadata = {"skill_names": skill_names} if skill_names else {}
+        msg = InboundMessage(
+            channel=channel,
+            sender_id="user",
+            chat_id=chat_id,
+            content=content,
+            metadata=metadata,
+        )
         response = await self._process_message(
             msg,
             session_key=session_key,
