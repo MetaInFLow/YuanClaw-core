@@ -36,7 +36,8 @@ class ExecTool(Tool):
         ]
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
-        self.path_append = path_append
+        self.base_path_append = self._normalize_path_entries(path_append)
+        self.runtime_path_append: list[str] = []
 
     @property
     def name(self) -> str:
@@ -70,8 +71,9 @@ class ExecTool(Tool):
             return guard_error
         
         env = os.environ.copy()
-        if self.path_append:
-            env["PATH"] = env.get("PATH", "") + os.pathsep + self.path_append
+        effective_path_append = self._effective_path_append()
+        if effective_path_append:
+            env["PATH"] = env.get("PATH", "") + os.pathsep + effective_path_append
 
         try:
             process = await asyncio.create_subprocess_shell(
@@ -121,6 +123,29 @@ class ExecTool(Tool):
             
         except Exception as e:
             return f"Error executing command: {str(e)}"
+
+    def set_runtime_path_append(self, path_append: list[str] | str | None) -> None:
+        self.runtime_path_append = self._normalize_path_entries(path_append)
+
+    def _effective_path_append(self) -> str:
+        entries: list[str] = []
+        for value in [*self.base_path_append, *self.runtime_path_append]:
+            if value and value not in entries:
+                entries.append(value)
+        return os.pathsep.join(entries)
+
+    @staticmethod
+    def _normalize_path_entries(path_append: list[str] | str | None) -> list[str]:
+        if path_append is None:
+            return []
+
+        raw_values = path_append if isinstance(path_append, list) else path_append.split(os.pathsep)
+        normalized: list[str] = []
+        for raw_value in raw_values:
+            value = str(raw_value).strip()
+            if value and value not in normalized:
+                normalized.append(value)
+        return normalized
 
     def _guard_command(self, command: str, cwd: str) -> str | None:
         """Best-effort safety guard for potentially destructive commands."""

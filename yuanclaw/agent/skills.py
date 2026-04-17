@@ -21,7 +21,17 @@ class SkillsLoader:
     def __init__(self, workspace: Path, builtin_skills_dir: Path | None = None):
         self.workspace = workspace
         self.workspace_skills = workspace / "skills"
+        self.component_skills = workspace / "components" / "skills"
+        self.global_component_skills = Path.home() / ".cowdy" / "components" / "skills"
         self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR
+
+    def _component_skill_roots(self) -> list[Path]:
+        """Return component skill roots in lookup priority order."""
+        roots: list[Path] = []
+        for root in (self.component_skills, self.global_component_skills):
+            if root.exists() and root not in roots:
+                roots.append(root)
+        return roots
 
     def list_skills(self, filter_unavailable: bool = True) -> list[dict[str, str]]:
         """
@@ -42,6 +52,14 @@ class SkillsLoader:
                     skill_file = skill_dir / "SKILL.md"
                     if skill_file.exists():
                         skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "workspace"})
+
+        # Studio-installed component skills
+        for component_root in self._component_skill_roots():
+            for skill_dir in component_root.iterdir():
+                if skill_dir.is_dir():
+                    skill_file = skill_dir / "SKILL.md"
+                    if skill_file.exists() and not any(s["name"] == skill_dir.name for s in skills):
+                        skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "component"})
 
         # Built-in skills
         if self.builtin_skills and self.builtin_skills.exists():
@@ -70,6 +88,12 @@ class SkillsLoader:
         workspace_skill = self.workspace_skills / name / "SKILL.md"
         if workspace_skill.exists():
             return workspace_skill.read_text(encoding="utf-8")
+
+        # Check Studio-installed components next
+        for component_root in self._component_skill_roots():
+            component_skill = component_root / name / "SKILL.md"
+            if component_skill.exists():
+                return component_skill.read_text(encoding="utf-8")
 
         # Check built-in
         if self.builtin_skills:

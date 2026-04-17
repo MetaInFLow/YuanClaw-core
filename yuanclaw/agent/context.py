@@ -24,7 +24,11 @@ class ContextBuilder:
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
 
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+    def build_system_prompt(
+        self,
+        skill_names: list[str] | None = None,
+        include_skills_catalog: bool = True,
+    ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity()]
 
@@ -45,7 +49,7 @@ class ContextBuilder:
                 parts.append(f"# Active Skills\n\n{active_content}")
 
         skills_summary = self.skills.build_skills_summary()
-        if skills_summary:
+        if include_skills_catalog and skills_summary:
             parts.append(f"""# Skills
 
 The following skills extend your capabilities. To use a skill, read its SKILL.md file using the read_file tool.
@@ -99,13 +103,47 @@ Your workspace is at: {workspace_path}
 Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel."""
 
     @staticmethod
-    def _build_runtime_context(channel: str | None, chat_id: str | None) -> str:
+    def _build_runtime_context(
+        channel: str | None,
+        chat_id: str | None,
+        exec_commands: list[str] | None = None,
+        skill_paths: list[str] | None = None,
+    ) -> str:
         """Build untrusted runtime metadata block for injection before the user message."""
         now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
         tz = time.strftime("%Z") or "UTC"
         lines = [f"Current Time: {now} ({tz})"]
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
+        available_commands = [
+            command.strip()
+            for command in (exec_commands or [])
+            if isinstance(command, str) and command.strip()
+        ]
+        if available_commands:
+            lines.append(
+                "Bound CLI Commands: " + ", ".join(dict.fromkeys(available_commands))
+            )
+        available_skill_paths = [
+            path.strip()
+            for path in (skill_paths or [])
+            if isinstance(path, str) and path.strip()
+        ]
+        if available_skill_paths:
+            skill_roots = [
+                str(Path(path).resolve().parent)
+                for path in available_skill_paths
+            ]
+            lines.append("Bound Skill Paths:")
+            lines.extend(f"- {path}" for path in dict.fromkeys(available_skill_paths))
+            lines.append("Bound Skill Roots:")
+            lines.extend(f"- {path}" for path in dict.fromkeys(skill_roots))
+            lines.append(
+                "These are Studio-bound skills for this request. Do not infer their absence from workspace/skills."
+            )
+            lines.append(
+                "When a skill references relative resources like scripts/... or data/..., resolve them against the matching Bound Skill Root and prefer absolute paths for tool calls."
+            )
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
     def _load_bootstrap_files(self) -> str:
@@ -128,9 +166,16 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
+        exec_commands: list[str] | None = None,
+        skill_paths: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
-        runtime_ctx = self._build_runtime_context(channel, chat_id)
+        runtime_ctx = self._build_runtime_context(
+            channel,
+            chat_id,
+            exec_commands,
+            skill_paths,
+        )
         user_content = self._build_user_content(current_message, media)
 
         # Merge runtime context and user content into a single user message
@@ -140,8 +185,19 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         else:
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
 
+        requested_skills = [
+            name for name in (skill_names or []) if isinstance(name, str) and name.strip()
+        ]
+        include_skills_catalog = not (channel == "studio" and requested_skills)
+
         return [
-            {"role": "system", "content": self.build_system_prompt(skill_names)},
+            {
+                "role": "system",
+                "content": self.build_system_prompt(
+                    skill_names,
+                    include_skills_catalog=include_skills_catalog,
+                ),
+            },
             *history,
             {"role": "user", "content": merged},
         ]

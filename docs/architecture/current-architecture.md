@@ -127,8 +127,8 @@ C4Container
 
 ## 8. 给后续开发 AI 的建议阅读顺序
 
-1. `docs/project/folder-declaration-v0.md`（分支与目录政策）
-2. `docs/deployment/deployment-v0.md`（配置与部署入口）
+1. `docs/engineering/governance/folder-declaration-v0.md`（分支与目录政策）
+2. `docs/engineering/operations/deployment-v0.md`（配置与部署入口）
 3. `yuanclaw/cli/commands.py`（运行时装配主入口）
 4. `yuanclaw/agent/loop.py`（核心执行循环）
 5. `yuanclaw/channels/manager.py` + `yuanclaw/providers/registry.py`（可扩展点）

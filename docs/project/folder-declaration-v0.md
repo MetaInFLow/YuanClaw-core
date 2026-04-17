@@ -47,7 +47,7 @@ YuanClaw/
 ```
 
 ## 4. `docs/` rules
-- All design docs must be stored under `docs/design/`.
+- All design docs must be stored under `docs/engineering/specs/`.
 - Naming convention:
   - `designdoc-v<version>-<topic>.md`
   - `optimize-designdoc-v<version>-<topic>.md`

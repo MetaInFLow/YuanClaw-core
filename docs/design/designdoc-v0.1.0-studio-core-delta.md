@@ -4,7 +4,7 @@
 - 日期: `2026-03-10`
 - 目标分支: `dev`
 - 适用仓库: `MetaInFLow/YuanClaw-core`
-- 对齐文档: `docs/design/designdoc-v0.1.0-whole-system-overview.md`（Studio 根目录）
+- 对齐文档: `docs/engineering/specs/designdoc-v0.1.0-whole-system-overview.md`（Studio 根目录）
 
 ## 1. 背景
 

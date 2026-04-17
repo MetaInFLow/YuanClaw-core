@@ -27,6 +27,7 @@ from yuanclaw.config.paths import get_cron_dir
 from yuanclaw.config.schema import Config
 from yuanclaw.cron.service import CronService
 from yuanclaw.cron.types import CronJob
+from yuanclaw.providers.base import LLMProvider
 from yuanclaw.providers.registry import PROVIDERS, find_by_name
 from yuanclaw.session.manager import SessionManager
 from yuanclaw.utils.helpers import sync_workspace_templates
@@ -321,6 +322,7 @@ def _make_provider(config: Config):
             api_key=p.api_key if p else "no-key",
             api_base=config.get_api_base(model) or "http://localhost:8000/v1",
             default_model=model,
+            adapter=(p.adapter if p else None),
         )
 
     if provider_name == "azure_openai":
@@ -353,6 +355,54 @@ def _make_provider(config: Config):
         extra_headers=p.extra_headers if p else None,
         provider_name=provider_name,
     )
+
+
+def _snake_to_camel(value: str) -> str:
+    parts = value.split("_")
+    return parts[0] + "".join(part[:1].upper() + part[1:] for part in parts[1:])
+
+
+def _build_request_runtime_override(
+    base_config: Config, payload: dict[str, Any]
+) -> tuple[LLMProvider | None, str | None, str | None]:
+    raw_override = payload.get("runtimeConfig")
+    if not isinstance(raw_override, dict):
+        return None, None, None
+
+    model = str(raw_override.get("model") or "").strip()
+    provider_id = str(
+        raw_override.get("provider") or raw_override.get("providerId") or ""
+    ).strip().replace("-", "_")
+    if not model or not provider_id:
+        return None, None, None
+
+    raw_config = base_config.model_dump(by_alias=True)
+    agents = raw_config.setdefault("agents", {})
+    defaults = agents.setdefault("defaults", {})
+    defaults["model"] = model
+    defaults["provider"] = provider_id
+
+    providers = raw_config.setdefault("providers", {})
+    provider_key = _snake_to_camel(provider_id)
+    provider_entry = providers.setdefault(provider_key, {})
+    if "apiKey" in raw_override:
+        provider_entry["apiKey"] = str(raw_override.get("apiKey") or "")
+    if "apiBase" in raw_override:
+        api_base = str(raw_override.get("apiBase") or "").strip()
+        provider_entry["apiBase"] = api_base or None
+    if "adapter" in raw_override:
+        provider_entry["adapter"] = str(raw_override.get("adapter") or "").strip() or None
+
+    try:
+        override_config = Config.model_validate(raw_config)
+        return (
+            _make_provider(override_config),
+            model,
+            override_config.get_provider_name(model),
+        )
+    except Exception as exc:
+        logger.warning("Ignoring invalid per-request runtime override: {}", exc)
+        return None, None, None
 
 
 def _mask_secret(value: str) -> str:
@@ -480,6 +530,19 @@ def _normalize_thread_summary(raw: str | None, fallback: str) -> str:
     """Normalize model output for thread list display."""
     cleaned = " ".join(str(raw or "").split()).strip().strip("'\"`")
     if not cleaned:
+        return fallback
+    lowered = cleaned.lower()
+    if (
+        lowered.startswith("error:")
+        or lowered.startswith("error code:")
+        or "error code: 429" in lowered
+        or "request timed out" in lowered
+        or "timed out" in lowered
+        or "timeout" in lowered
+        or "余额不足" in cleaned
+        or "无可用资源包" in cleaned
+        or "请充值" in cleaned
+    ):
         return fallback
     return _compact_thread_summary(cleaned)
 
@@ -683,11 +746,18 @@ class CoreRuntime:
         meta = msg.metadata or {}
         is_progress = bool(meta.get("_progress"))
         is_tool_hint = bool(meta.get("_tool_hint"))
+        completion_kind = str(meta.get("_completion_kind") or "done")
+        error_kind = str(meta.get("_error_kind") or "").strip() or None
+        degraded_reason = str(meta.get("_degraded_reason") or "").strip() or None
 
         if is_progress:
             event_type = "agent.tool_hint" if is_tool_hint else "agent.progress"
         elif msg.channel not in {"studio", "cli", "system"}:
             event_type = "channel.reply_sent"
+        elif completion_kind == "degraded":
+            event_type = "agent.reply_degraded"
+        elif completion_kind == "error":
+            event_type = "agent.reply_error"
         else:
             event_type = "agent.reply_done"
 
@@ -700,6 +770,9 @@ class CoreRuntime:
                 "content": (msg.content or "")[:280],
                 "progress": is_progress,
                 "tool_hint": is_tool_hint,
+                "completion_kind": completion_kind,
+                "error_kind": error_kind,
+                "degraded_reason": degraded_reason,
             }
         )
 
@@ -1075,6 +1148,27 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
                 for name in (payload.get("skillNames") or [])
                 if str(name).strip()
             ]
+            skill_paths = [
+                str(path).strip()
+                for path in (payload.get("skillPaths") or [])
+                if str(path).strip()
+            ]
+            logger.info(
+                "Studio WS chat received: session_key={}, skill_names={}, skill_paths={}",
+                session_key,
+                skill_names,
+                skill_paths,
+            )
+            exec_path_append = [
+                str(path).strip()
+                for path in (payload.get("execPathAppend") or [])
+                if str(path).strip()
+            ]
+            exec_commands = [
+                str(command).strip()
+                for command in (payload.get("execCommands") or [])
+                if str(command).strip()
+            ]
             if ":" in session_key:
                 _, chat_id = session_key.split(":", 1)
             else:
@@ -1092,6 +1186,9 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
 
             progress_lines: list[str] = []
             started = time.time()
+            provider_override, model_override, provider_name_override = (
+                _build_request_runtime_override(runtime.config, payload)
+            )
 
             async def on_progress(text: str, *, tool_hint: bool = False) -> None:
                 progress_lines.append(text)
@@ -1116,31 +1213,72 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
                 )
 
             try:
-                final = await runtime.agent.process_direct(
+                response = await runtime.agent.process_direct_outbound(
                     content=content,
                     session_key=session_key,
                     channel="studio",
                     chat_id=chat_id or "default",
                     skill_names=skill_names,
+                    skill_paths=skill_paths,
+                    exec_path_append=exec_path_append,
+                    exec_commands=exec_commands,
                     on_progress=on_progress,
+                    provider_override=provider_override,
+                    model_override=model_override,
+                    provider_name_override=provider_name_override,
                 )
+                metadata = response.metadata if response else {}
+                final = response.content if response else ""
                 if not final:
                     final = "\n".join(progress_lines).strip()
+
+                completion_kind = str(metadata.get("_completion_kind") or "done")
+                error_kind = str(metadata.get("_error_kind") or "").strip() or None
+                degraded_reason = str(metadata.get("_degraded_reason") or "").strip() or None
+                latency_ms = int((time.time() - started) * 1000)
+
+                if completion_kind == "error":
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "message": final or "Chat failed",
+                            "errorKind": error_kind,
+                            "latencyMs": latency_ms,
+                            "sessionKey": session_key,
+                        }
+                    )
+                    runtime.events.publish(
+                        {
+                            "type": "agent.reply_error",
+                            "channel": "studio",
+                            "chat_id": chat_id or "default",
+                            "session_key": session_key,
+                            "content": final[:280],
+                            "completion_kind": completion_kind,
+                            "error_kind": error_kind,
+                        }
+                    )
+                    continue
+
                 await websocket.send_json(
                     {
                         "type": "done",
                         "content": final,
-                        "latencyMs": int((time.time() - started) * 1000),
+                        "completionKind": "degraded" if completion_kind == "degraded" else "done",
+                        "degradedReason": degraded_reason,
+                        "latencyMs": latency_ms,
                         "sessionKey": session_key,
                     }
                 )
                 runtime.events.publish(
                     {
-                        "type": "agent.reply_done",
+                        "type": "agent.reply_degraded" if completion_kind == "degraded" else "agent.reply_done",
                         "channel": "studio",
                         "chat_id": chat_id or "default",
                         "session_key": session_key,
                         "content": final[:280],
+                        "completion_kind": completion_kind,
+                        "degraded_reason": degraded_reason,
                     }
                 )
             except WebSocketDisconnect:

@@ -107,13 +107,93 @@ class TestMessageToolSuppressLogic:
         async def on_progress(content: str, *, tool_hint: bool = False) -> None:
             progress.append((content, tool_hint))
 
-        final_content, _, _, _ = await loop._run_agent_loop([], on_progress=on_progress)
+        final_content, _, _, _, final_metadata = await loop._run_agent_loop([], on_progress=on_progress)
 
         assert final_content == "Done"
+        assert final_metadata == {}
         assert progress == [
             ("Visible", False),
             ('read_file("foo.txt")', True),
         ]
+
+    async def test_degrades_when_tool_succeeds_but_llm_times_out(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(
+            id="call1",
+            name="exec",
+            arguments={"command": "lark-cli api GET /open-apis/authen/v1/user_info"},
+        )
+        calls = iter([
+            LLMResponse(content="", tool_calls=[tool_call]),
+            LLMResponse(content="Error: Request timed out.", tool_calls=[], finish_reason="error"),
+        ])
+        loop.provider.chat = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.execute = AsyncMock(return_value="code: 0, msg: success")
+
+        final_content, _, _, _, final_metadata = await loop._run_agent_loop([])
+
+        assert final_content is not None
+        assert "工具已执行成功" in final_content
+        assert "lark-cli api GET /open-apis/authen/v1/user_info" in final_content
+        assert "code: 0, msg: success" in final_content
+        assert final_metadata == {
+            "_completion_kind": "degraded",
+            "_degraded_reason": "tool_succeeded_but_llm_timeout",
+        }
+
+    async def test_keeps_plain_error_when_no_successful_tool_exists(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(
+            id="call1",
+            name="exec",
+            arguments={"command": "lark-cli auth status --verify"},
+        )
+        calls = iter([
+            LLMResponse(content="", tool_calls=[tool_call]),
+            LLMResponse(content="Error: Request timed out.", tool_calls=[], finish_reason="error"),
+        ])
+        loop.provider.chat = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.execute = AsyncMock(return_value="Error: Command timed out after 60 seconds")
+
+        final_content, _, _, _, final_metadata = await loop._run_agent_loop([])
+
+        assert final_content is not None
+        assert "工具执行超时" in final_content
+        assert "lark-cli auth status --verify" in final_content
+        assert final_metadata == {
+            "_completion_kind": "error",
+            "_error_kind": "tool_timeout",
+        }
+
+    @pytest.mark.asyncio
+    async def test_process_message_persists_degraded_assistant_message(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(
+            id="call1",
+            name="exec",
+            arguments={"command": "lark-cli api GET /open-apis/authen/v1/user_info"},
+        )
+        calls = iter([
+            LLMResponse(content="", tool_calls=[tool_call]),
+            LLMResponse(content="Error: Request timed out.", tool_calls=[], finish_reason="error"),
+        ])
+        loop.provider.chat = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.execute = AsyncMock(return_value="code: 0, msg: success")
+
+        result = await loop._process_message(
+            InboundMessage(channel="studio", sender_id="user1", chat_id="chat123", content="probe"),
+        )
+
+        assert result is not None
+        assert result.metadata.get("_completion_kind") == "degraded"
+
+        session = loop.sessions.get_or_create("studio:chat123")
+        assert session.messages[-1]["role"] == "assistant"
+        assert "工具已执行成功" in session.messages[-1]["content"]
+        assert session.messages[-1]["completion_kind"] == "degraded"
 
 
 class TestMessageToolTurnTracking:
