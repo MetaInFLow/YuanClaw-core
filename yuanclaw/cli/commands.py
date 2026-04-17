@@ -5,7 +5,9 @@ import os
 import select
 import signal
 import sys
+from contextlib import nullcontext
 from pathlib import Path
+from typing import Any
 
 # Force UTF-8 encoding for Windows console
 if sys.platform == "win32":
@@ -19,8 +21,9 @@ if sys.platform == "win32":
             pass
 
 import typer
-from prompt_toolkit import PromptSession
-from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit import PromptSession, print_formatted_text
+from prompt_toolkit.application import run_in_terminal
+from prompt_toolkit.formatted_text import ANSI, HTML
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
@@ -29,6 +32,7 @@ from rich.table import Table
 from rich.text import Text
 
 from yuanclaw import __logo__, __version__
+from yuanclaw.cli.stream import StreamRenderer, ThinkingSpinner
 from yuanclaw.config.paths import get_workspace_path
 from yuanclaw.config.schema import Config
 from yuanclaw.utils.helpers import sync_workspace_templates
@@ -111,14 +115,85 @@ def _init_prompt_session() -> None:
     )
 
 
-def _print_agent_response(response: str, render_markdown: bool) -> None:
+def _make_console() -> Console:
+    return Console(file=sys.stdout)
+
+
+def _render_interactive_ansi(render_fn) -> str:
+    """Render Rich output to ANSI so prompt_toolkit can print it safely."""
+    ansi_console = Console(
+        force_terminal=True,
+        color_system=console.color_system or "standard",
+        width=console.width,
+    )
+    with ansi_console.capture() as capture:
+        render_fn(ansi_console)
+    return capture.get()
+
+
+def _response_renderable(content: str, render_markdown: bool, metadata: dict[str, Any] | None = None):
+    """Render plain-text command output without markdown collapsing newlines."""
+    if not render_markdown:
+        return Text(content)
+    if (metadata or {}).get("render_as") == "text":
+        return Text(content)
+    return Markdown(content)
+
+
+def _print_agent_response(
+    response: str,
+    render_markdown: bool,
+    metadata: dict[str, Any] | None = None,
+) -> None:
     """Render assistant response with consistent terminal styling."""
     content = response or ""
-    body = Markdown(content) if render_markdown else Text(content)
+    body = _response_renderable(content, render_markdown, metadata)
     console.print()
     console.print(f"[cyan]{__logo__} yuanclaw[/cyan]")
     console.print(body)
     console.print()
+
+
+async def _print_interactive_line(text: str) -> None:
+    """Print async interactive updates with prompt_toolkit-safe Rich styling."""
+    def _write() -> None:
+        ansi = _render_interactive_ansi(lambda c: c.print(f"  [dim]↳ {text}[/dim]"))
+        print_formatted_text(ANSI(ansi), end="")
+
+    await run_in_terminal(_write)
+
+
+async def _print_interactive_response(
+    response: str,
+    render_markdown: bool,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Print async interactive replies with prompt_toolkit-safe Rich styling."""
+    def _write() -> None:
+        content = response or ""
+        ansi = _render_interactive_ansi(
+            lambda c: (
+                c.print(),
+                c.print(f"[cyan]{__logo__} yuanclaw[/cyan]"),
+                c.print(_response_renderable(content, render_markdown, metadata)),
+                c.print(),
+            )
+        )
+        print_formatted_text(ANSI(ansi), end="")
+
+    await run_in_terminal(_write)
+
+
+def _print_cli_progress_line(text: str, thinking: ThinkingSpinner | None) -> None:
+    """Print a CLI progress line, pausing the spinner if needed."""
+    with thinking.pause() if thinking else nullcontext():
+        console.print(f"  [dim]↳ {text}[/dim]")
+
+
+async def _print_interactive_progress_line(text: str, thinking: ThinkingSpinner | None) -> None:
+    """Print an interactive progress line, pausing the spinner if needed."""
+    with thinking.pause() if thinking else nullcontext():
+        await _print_interactive_line(text)
 
 
 def _is_exit_command(command: str) -> bool:
@@ -213,8 +288,9 @@ def onboard():
 
 def _make_provider(config: Config):
     """Create the appropriate LLM provider from config."""
-    from yuanclaw.providers.openai_codex_provider import OpenAICodexProvider
     from yuanclaw.providers.azure_openai_provider import AzureOpenAIProvider
+    from yuanclaw.providers.custom_provider import CustomProvider
+    from yuanclaw.providers.openai_codex_provider import OpenAICodexProvider
 
     model = config.agents.defaults.model
     provider_name = config.get_provider_name(model)
@@ -225,12 +301,12 @@ def _make_provider(config: Config):
         return OpenAICodexProvider(default_model=model)
 
     # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
-    from yuanclaw.providers.custom_provider import CustomProvider
     if provider_name == "custom":
         return CustomProvider(
             api_key=p.api_key if p else "no-key",
             api_base=config.get_api_base(model) or "http://localhost:8000/v1",
             default_model=model,
+            extra_headers=p.extra_headers if p else None,
         )
 
     # Azure OpenAI: direct Azure OpenAI endpoint with deployment name
@@ -240,17 +316,25 @@ def _make_provider(config: Config):
             console.print("Set them in ~/.yuanclaw/config.json under providers.azure_openai section")
             console.print("Use the model field to specify the deployment name.")
             raise typer.Exit(1)
-        
+
         return AzureOpenAIProvider(
             api_key=p.api_key,
             api_base=p.api_base,
             default_model=model,
         )
 
+    if provider_name == "ovms":
+        return CustomProvider(
+            api_key=p.api_key if p else "no-key",
+            api_base=config.get_api_base(model) or "http://localhost:8000/v3",
+            default_model=model,
+            extra_headers=p.extra_headers if p else None,
+        )
+
     from yuanclaw.providers.litellm_provider import LiteLLMProvider
     from yuanclaw.providers.registry import find_by_name
     spec = find_by_name(provider_name)
-    if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and spec.is_oauth):
+    if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and (spec.is_oauth or spec.is_local)):
         console.print("[red]Error: No API key configured.[/red]")
         console.print("Set one in ~/.yuanclaw/config.json under providers section")
         raise typer.Exit(1)
@@ -364,10 +448,16 @@ def gateway(
         model=config.agents.defaults.model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
+        context_window_tokens=config.agents.defaults.context_window_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
+        memory_config=config.agents.defaults.memory,
+        compaction_config=config.agents.defaults.compaction,
         reasoning_effort=config.agents.defaults.reasoning_effort,
         brave_api_key=config.tools.web.search.api_key or None,
+        web_search_provider=config.tools.web.search.provider,
+        web_search_base_url=config.tools.web.search.base_url or None,
+        web_search_max_results=config.tools.web.search.max_results,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
         cron_service=cron,
@@ -549,10 +639,16 @@ def agent(
         model=config.agents.defaults.model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
+        context_window_tokens=config.agents.defaults.context_window_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
+        memory_config=config.agents.defaults.memory,
+        compaction_config=config.agents.defaults.compaction,
         reasoning_effort=config.agents.defaults.reasoning_effort,
         brave_api_key=config.tools.web.search.api_key or None,
+        web_search_provider=config.tools.web.search.provider,
+        web_search_base_url=config.tools.web.search.base_url or None,
+        web_search_max_results=config.tools.web.search.max_results,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
         cron_service=cron,
@@ -560,14 +656,6 @@ def agent(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
     )
-
-    # Show spinner when logs are off (no output to miss); skip when logs are on
-    def _thinking_ctx():
-        if logs:
-            from contextlib import nullcontext
-            return nullcontext()
-        # Animated spinner is safe to use with prompt_toolkit input handling
-        return console.status("[dim]yuanclaw is thinking...[/dim]", spinner="dots")
 
     async def _cli_progress(content: str, *, tool_hint: bool = False) -> None:
         ch = agent_loop.channels_config
@@ -580,9 +668,17 @@ def agent(
     if message:
         # Single message mode — direct call, no bus needed
         async def run_once():
-            with _thinking_ctx():
-                response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
-            _print_agent_response(response, render_markdown=markdown)
+            renderer = StreamRenderer(render_markdown=markdown)
+            response = await agent_loop.process_direct(
+                message,
+                session_id,
+                on_progress=_cli_progress,
+                on_stream=renderer.on_delta,
+                on_stream_end=renderer.on_end,
+            )
+            if not renderer.streamed:
+                await renderer.on_end()
+                _print_agent_response(response, render_markdown=markdown)
             await agent_loop.close_mcp()
 
         asyncio.run(run_once())
@@ -618,11 +714,26 @@ def agent(
             turn_done = asyncio.Event()
             turn_done.set()
             turn_response: list[str] = []
+            turn_meta: list[dict[str, Any]] = []
+            renderer: StreamRenderer | None = None
 
             async def _consume_outbound():
                 while True:
                     try:
                         msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+                        if msg.metadata.get("_stream_delta"):
+                            if renderer:
+                                await renderer.on_delta(msg.content)
+                            continue
+                        if msg.metadata.get("_stream_end"):
+                            if renderer:
+                                await renderer.on_end(
+                                    resuming=msg.metadata.get("_resuming", False),
+                                )
+                            continue
+                        if msg.metadata.get("_streamed"):
+                            turn_done.set()
+                            continue
                         if msg.metadata.get("_progress"):
                             is_tool_hint = msg.metadata.get("_tool_hint", False)
                             ch = agent_loop.channels_config
@@ -631,14 +742,18 @@ def agent(
                             elif ch and not is_tool_hint and not ch.send_progress:
                                 pass
                             else:
-                                console.print(f"  [dim]↳ {msg.content}[/dim]")
+                                await _print_interactive_progress_line(msg.content, None)
                         elif not turn_done.is_set():
                             if msg.content:
                                 turn_response.append(msg.content)
+                                turn_meta.append(dict(msg.metadata or {}))
                             turn_done.set()
                         elif msg.content:
-                            console.print()
-                            _print_agent_response(msg.content, render_markdown=markdown)
+                            await _print_interactive_response(
+                                msg.content,
+                                render_markdown=markdown,
+                                metadata=msg.metadata,
+                            )
                     except asyncio.TimeoutError:
                         continue
                     except asyncio.CancelledError:
@@ -662,19 +777,24 @@ def agent(
 
                         turn_done.clear()
                         turn_response.clear()
+                        turn_meta.clear()
+                        renderer = StreamRenderer(render_markdown=markdown)
 
                         await bus.publish_inbound(InboundMessage(
                             channel=cli_channel,
                             sender_id="user",
                             chat_id=cli_chat_id,
                             content=user_input,
+                            metadata={"_wants_stream": True},
                         ))
 
-                        with _thinking_ctx():
-                            await turn_done.wait()
+                        await turn_done.wait()
 
                         if turn_response:
-                            _print_agent_response(turn_response[0], render_markdown=markdown)
+                            content = turn_response[0]
+                            meta = turn_meta[0] if turn_meta else {}
+                            if not meta.get("_streamed"):
+                                _print_agent_response(content, render_markdown=markdown, metadata=meta)
                     except KeyboardInterrupt:
                         _restore_terminal()
                         console.print("\nGoodbye!")

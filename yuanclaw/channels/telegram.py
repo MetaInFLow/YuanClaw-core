@@ -179,6 +179,8 @@ class TelegramChannel(BaseChannel):
         self._media_group_buffers: dict[str, dict] = {}
         self._media_group_tasks: dict[str, asyncio.Task] = {}
         self._message_threads: dict[tuple[str, int], int] = {}
+        self._stream_buffers: dict[str, str] = {}
+        self._stream_drafts: dict[str, int] = {}
         self._bot_user_id: int | None = None
         self._bot_username: str | None = None
 
@@ -276,6 +278,8 @@ class TelegramChannel(BaseChannel):
             task.cancel()
         self._media_group_tasks.clear()
         self._media_group_buffers.clear()
+        self._stream_buffers.clear()
+        self._stream_drafts.clear()
 
         if self._app:
             logger.info("Stopping Telegram bot...")
@@ -364,6 +368,60 @@ class TelegramChannel(BaseChannel):
                     await self._send_with_streaming(chat_id, chunk, reply_params, thread_kwargs)
                 else:
                     await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
+
+    async def send_delta(
+        self,
+        chat_id: str,
+        delta: str,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        """Update the live draft for a streamed response."""
+        if not self._app:
+            return
+
+        try:
+            chat_id_int = int(chat_id)
+        except ValueError:
+            logger.error("Invalid chat_id: {}", chat_id)
+            return
+
+        meta = metadata or {}
+        buffer = self._stream_buffers.get(chat_id, "")
+        if delta:
+            buffer += delta
+            self._stream_buffers[chat_id] = buffer
+
+        draft_id = self._stream_drafts.setdefault(chat_id, int(time.time() * 1000) % (2**31))
+        try:
+            if buffer:
+                await self._app.bot.send_message_draft(
+                    chat_id=chat_id_int,
+                    draft_id=draft_id,
+                    text=buffer,
+                )
+        except Exception as e:
+            logger.debug("Telegram draft update failed for {}: {}", chat_id, e)
+
+        if meta.get("_stream_end") and not meta.get("_resuming"):
+            text = self._stream_buffers.pop(chat_id, "")
+            self._stream_drafts.pop(chat_id, None)
+            self._stop_typing(chat_id)
+            if text:
+                reply_to_message_id = meta.get("message_id")
+                message_thread_id = meta.get("message_thread_id")
+                if message_thread_id is None and reply_to_message_id is not None:
+                    message_thread_id = self._message_threads.get((chat_id, reply_to_message_id))
+                thread_kwargs = {}
+                if message_thread_id is not None:
+                    thread_kwargs["message_thread_id"] = message_thread_id
+
+                reply_params = None
+                if self.config.reply_to_message and reply_to_message_id:
+                    reply_params = ReplyParameters(
+                        message_id=reply_to_message_id,
+                        allow_sending_without_reply=True,
+                    )
+                await self._send_text(chat_id_int, text, reply_params, thread_kwargs)
 
     async def _send_text(
         self,

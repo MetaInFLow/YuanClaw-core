@@ -31,6 +31,9 @@ class SubagentManager:
         max_tokens: int = 4096,
         reasoning_effort: str | None = None,
         brave_api_key: str | None = None,
+        web_search_provider: str | None = None,
+        web_search_base_url: str | None = None,
+        web_search_max_results: int = 5,
         web_proxy: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
@@ -44,6 +47,9 @@ class SubagentManager:
         self.max_tokens = max_tokens
         self.reasoning_effort = reasoning_effort
         self.brave_api_key = brave_api_key
+        self.web_search_provider = web_search_provider
+        self.web_search_base_url = web_search_base_url
+        self.web_search_max_results = web_search_max_results
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
@@ -106,9 +112,17 @@ class SubagentManager:
                 restrict_to_workspace=self.restrict_to_workspace,
                 path_append=self.exec_config.path_append,
             ))
-            tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
+            tools.register(
+                WebSearchTool(
+                    api_key=self.brave_api_key,
+                    max_results=self.web_search_max_results,
+                    proxy=self.web_proxy,
+                    provider=self.web_search_provider,
+                    base_url=self.web_search_base_url,
+                )
+            )
             tools.register(WebFetchTool(proxy=self.web_proxy))
-            
+
             system_prompt = self._build_subagent_prompt()
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
@@ -208,7 +222,7 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
 
         await self.bus.publish_inbound(msg)
         logger.debug("Subagent [{}] announced result to {}:{}", task_id, origin['channel'], origin['chat_id'])
-    
+
     def _build_subagent_prompt(self) -> str:
         """Build a focused system prompt for the subagent."""
         from yuanclaw.agent.context import ContextBuilder
@@ -230,7 +244,7 @@ Stay focused on the assigned task. Your final response will be reported back to 
             parts.append(f"## Skills\n\nRead SKILL.md with read_file to use a skill.\n\n{skills_summary}")
 
         return "\n\n".join(parts)
-    
+
     async def cancel_by_session(self, session_key: str) -> int:
         """Cancel all subagents for the given session. Returns count cancelled."""
         tasks = [self._running_tasks[tid] for tid in self._session_tasks.get(session_key, [])

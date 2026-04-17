@@ -63,6 +63,22 @@ class Session:
             out.append(entry)
         return out
 
+    def get_consolidation_messages(
+        self,
+        *,
+        archive_all: bool = False,
+        keep_count: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Return the message slice used for memory consolidation.
+
+        This is a pure helper and does not modify the JSONL persistence shape.
+        """
+        if archive_all:
+            return list(self.messages)
+        if keep_count <= 0:
+            return self.messages[self.last_consolidated:]
+        return self.messages[self.last_consolidated:-keep_count]
+
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""
         self.messages = []

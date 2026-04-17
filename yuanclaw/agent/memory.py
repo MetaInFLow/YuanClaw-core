@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -43,12 +44,34 @@ _SAVE_MEMORY_TOOL = [
 
 
 class MemoryStore:
-    """Two-layer memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log)."""
+    """Two-layer memory: MEMORY.md (long-term facts) + daily pages + HISTORY.md legacy log."""
 
     def __init__(self, workspace: Path):
         self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "HISTORY.md"
+
+    @staticmethod
+    def _today_key() -> str:
+        """Return the current day key used for daily memory pages."""
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def _daily_page_path(self, day_key: str | None = None) -> Path:
+        """Return the daily page path for a given day key."""
+        return self.memory_dir / f"{day_key or self._today_key()}.md"
+
+    @staticmethod
+    def _format_daily_entry(entry: str) -> str:
+        """Render a consolidation entry as markdown suitable for daily pages."""
+        text = entry.rstrip()
+        if not text:
+            return ""
+        lines = text.splitlines()
+        first = f"- {lines[0]}"
+        if len(lines) == 1:
+            return first
+        tail = "\n".join(f"  {line}" if line else "  " for line in lines[1:])
+        return f"{first}\n{tail}"
 
     def read_long_term(self) -> str:
         if self.memory_file.exists():
@@ -58,9 +81,73 @@ class MemoryStore:
     def write_long_term(self, content: str) -> None:
         self.memory_file.write_text(content, encoding="utf-8")
 
-    def append_history(self, entry: str) -> None:
+    def _append_daily_page(self, entry: str) -> None:
+        """Append a consolidation entry to the current daily page."""
+        daily_page = self._daily_page_path()
+        daily_page.parent.mkdir(parents=True, exist_ok=True)
+        if not daily_page.exists() or daily_page.stat().st_size == 0:
+            daily_page.write_text(f"# {self._today_key()}\n\n", encoding="utf-8")
+
+        formatted = self._format_daily_entry(entry)
+        if not formatted:
+            return
+
+        with open(daily_page, "a", encoding="utf-8") as f:
+            f.write(formatted.rstrip() + "\n\n")
+
+    def _append_legacy_history(self, entry: str) -> None:
+        """Append a consolidation entry to the legacy HISTORY.md file."""
         with open(self.history_file, "a", encoding="utf-8") as f:
             f.write(entry.rstrip() + "\n\n")
+
+    def append_history(self, entry: str) -> None:
+        """Append a consolidation entry to both daily pages and legacy HISTORY.md."""
+        self._append_daily_page(entry)
+        self._append_legacy_history(entry)
+
+    def read_daily_page(self, day_key: str | None = None) -> str:
+        """Read a daily page if it exists."""
+        path = self._daily_page_path(day_key)
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return ""
+
+    def list_daily_pages(self) -> list[Path]:
+        """List known daily memory pages."""
+        pages = [
+            path for path in self.memory_dir.glob("????-??-??.md")
+            if path.name not in {"MEMORY.md", "HISTORY.md"}
+        ]
+        return sorted(pages, key=lambda p: p.name, reverse=True)
+
+    def read_history_log(self) -> str:
+        """Read the newest available history source.
+
+        Daily pages are preferred; HISTORY.md remains a compatibility fallback.
+        """
+        daily_pages = self.list_daily_pages()
+        if daily_pages:
+            return "\n\n".join(page.read_text(encoding="utf-8") for page in daily_pages)
+        return self.history_file.read_text(encoding="utf-8") if self.history_file.exists() else ""
+
+    @staticmethod
+    def _render_content(content: Any) -> str:
+        """Render persisted message content for history output."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text = item.get("text", "")
+                    if isinstance(text, str) and text:
+                        parts.append(text)
+                else:
+                    parts.append(json.dumps(item, ensure_ascii=False))
+            return "\n".join(parts) if parts else json.dumps(content, ensure_ascii=False)
+        if content is None:
+            return ""
+        return json.dumps(content, ensure_ascii=False)
 
     def get_memory_context(self) -> str:
         long_term = self.read_long_term()
@@ -80,7 +167,10 @@ class MemoryStore:
         Returns True on success (including no-op), False on failure.
         """
         if archive_all:
-            old_messages = session.messages
+            if hasattr(session, "get_consolidation_messages"):
+                old_messages = session.get_consolidation_messages(archive_all=True)
+            else:
+                old_messages = session.messages
             keep_count = 0
             logger.info("Memory consolidation (archive_all): {} messages", len(session.messages))
         else:
@@ -89,17 +179,22 @@ class MemoryStore:
                 return True
             if len(session.messages) - session.last_consolidated <= 0:
                 return True
-            old_messages = session.messages[session.last_consolidated:-keep_count]
+            if hasattr(session, "get_consolidation_messages"):
+                old_messages = session.get_consolidation_messages(keep_count=keep_count)
+            else:
+                old_messages = session.messages[session.last_consolidated:-keep_count]
             if not old_messages:
                 return True
             logger.info("Memory consolidation: {} to consolidate, {} keep", len(old_messages), keep_count)
 
         lines = []
         for m in old_messages:
-            if not m.get("content"):
+            content = m.get("content")
+            rendered = self._render_content(content)
+            if not rendered:
                 continue
             tools = f" [tools: {', '.join(m['tools_used'])}]" if m.get("tools_used") else ""
-            lines.append(f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}")
+            lines.append(f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {rendered}")
 
         current_memory = self.read_long_term()
         prompt = f"""Process this conversation and call the save_memory tool with your consolidation.

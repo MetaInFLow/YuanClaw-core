@@ -3,14 +3,12 @@
 import base64
 import mimetypes
 import platform
-import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from yuanclaw.agent.memory import MemoryStore
 from yuanclaw.agent.skills import SkillsLoader
-from yuanclaw.utils.helpers import detect_image_mime
+from yuanclaw.utils.helpers import build_assistant_message, current_time_str, detect_image_mime
 
 
 class ContextBuilder:
@@ -24,7 +22,11 @@ class ContextBuilder:
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
 
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+    def build_system_prompt(
+        self,
+        skill_names: list[str] | None = None,
+        memory_context: str | None = None,
+    ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity()]
 
@@ -32,7 +34,7 @@ class ContextBuilder:
         if bootstrap:
             parts.append(bootstrap)
 
-        memory = self.memory.get_memory_context()
+        memory = self.memory.get_memory_context() if memory_context is None else memory_context
         if memory:
             parts.append(f"# Memory\n\n{memory}")
 
@@ -99,9 +101,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
     @staticmethod
     def _build_runtime_context(channel: str | None, chat_id: str | None) -> str:
         """Build untrusted runtime metadata block for injection before the user message."""
-        now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
-        tz = time.strftime("%Z") or "UTC"
-        lines = [f"Current Time: {now} ({tz})"]
+        lines = [f"Current Time: {current_time_str()}"]
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
@@ -126,6 +126,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
+        memory_context: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(channel, chat_id)
@@ -139,7 +140,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
 
         return [
-            {"role": "system", "content": self.build_system_prompt(skill_names)},
+            {"role": "system", "content": self.build_system_prompt(skill_names, memory_context)},
             *history,
             {"role": "user", "content": merged},
         ]
@@ -168,7 +169,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
     def add_tool_result(
         self, messages: list[dict[str, Any]],
-        tool_call_id: str, tool_name: str, result: str,
+        tool_call_id: str, tool_name: str, result: Any,
     ) -> list[dict[str, Any]]:
         """Add a tool result to the message list."""
         messages.append({"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result})
@@ -182,12 +183,12 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         thinking_blocks: list[dict] | None = None,
     ) -> list[dict[str, Any]]:
         """Add an assistant message to the message list."""
-        msg: dict[str, Any] = {"role": "assistant", "content": content}
-        if tool_calls:
-            msg["tool_calls"] = tool_calls
-        if reasoning_content is not None:
-            msg["reasoning_content"] = reasoning_content
-        if thinking_blocks:
-            msg["thinking_blocks"] = thinking_blocks
-        messages.append(msg)
+        messages.append(
+            build_assistant_message(
+                content,
+                tool_calls=tool_calls,
+                reasoning_content=reasoning_content,
+                thinking_blocks=thinking_blocks,
+            )
+        )
         return messages

@@ -47,8 +47,9 @@ class TestMemoryConsolidationTypeHandling:
     """Test that consolidation handles various argument types correctly."""
 
     @pytest.mark.asyncio
-    async def test_string_arguments_work(self, tmp_path: Path) -> None:
+    async def test_string_arguments_work(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Normal case: LLM returns string arguments."""
+        monkeypatch.setattr(MemoryStore, "_today_key", staticmethod(lambda: "2026-01-01"))
         store = MemoryStore(tmp_path)
         provider = AsyncMock()
         provider.chat = AsyncMock(
@@ -62,8 +63,14 @@ class TestMemoryConsolidationTypeHandling:
         result = await store.consolidate(session, provider, "test-model", memory_window=50)
 
         assert result is True
+        daily_page = tmp_path / "memory" / "2026-01-01.md"
+        assert daily_page.exists()
+        daily_content = daily_page.read_text()
+        assert "# 2026-01-01" in daily_content
+        assert "User discussed testing." in daily_content
         assert store.history_file.exists()
         assert "[2026-01-01] User discussed testing." in store.history_file.read_text()
+        assert "User discussed testing." in store.read_history_log()
         assert "User likes testing." in store.memory_file.read_text()
 
     @pytest.mark.asyncio

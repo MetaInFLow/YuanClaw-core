@@ -14,7 +14,13 @@ class Base(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
 
 
-class WhatsAppConfig(Base):
+class ChannelBase(Base):
+    """Base model for channel sections that may carry plugin-specific extras."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="allow")
+
+
+class WhatsAppConfig(ChannelBase):
     """WhatsApp channel configuration."""
 
     enabled: bool = False
@@ -23,7 +29,7 @@ class WhatsAppConfig(Base):
     allow_from: list[str] = Field(default_factory=list)  # Allowed phone numbers
 
 
-class TelegramConfig(Base):
+class TelegramConfig(ChannelBase):
     """Telegram channel configuration."""
 
     enabled: bool = False
@@ -36,7 +42,7 @@ class TelegramConfig(Base):
     group_policy: Literal["open", "mention"] = "mention"  # "mention" responds when @mentioned or replied to, "open" responds to all
 
 
-class FeishuConfig(Base):
+class FeishuConfig(ChannelBase):
     """Feishu/Lark channel configuration using WebSocket long connection."""
 
     enabled: bool = False
@@ -50,7 +56,7 @@ class FeishuConfig(Base):
     )
 
 
-class DingTalkConfig(Base):
+class DingTalkConfig(ChannelBase):
     """DingTalk channel configuration using Stream mode."""
 
     enabled: bool = False
@@ -59,7 +65,7 @@ class DingTalkConfig(Base):
     allow_from: list[str] = Field(default_factory=list)  # Allowed staff_ids
 
 
-class DiscordConfig(Base):
+class DiscordConfig(ChannelBase):
     """Discord channel configuration."""
 
     enabled: bool = False
@@ -70,7 +76,7 @@ class DiscordConfig(Base):
     group_policy: Literal["mention", "open"] = "mention"
 
 
-class MatrixConfig(Base):
+class MatrixConfig(ChannelBase):
     """Matrix (Element) channel configuration."""
 
     enabled: bool = False
@@ -91,7 +97,7 @@ class MatrixConfig(Base):
     allow_room_mentions: bool = False
 
 
-class EmailConfig(Base):
+class EmailConfig(ChannelBase):
     """Email channel configuration (IMAP inbound + SMTP outbound)."""
 
     enabled: bool = False
@@ -125,19 +131,19 @@ class EmailConfig(Base):
     allow_from: list[str] = Field(default_factory=list)  # Allowed sender email addresses
 
 
-class MochatMentionConfig(Base):
+class MochatMentionConfig(ChannelBase):
     """Mochat mention behavior configuration."""
 
     require_in_groups: bool = False
 
 
-class MochatGroupRule(Base):
+class MochatGroupRule(ChannelBase):
     """Mochat per-group mention requirement."""
 
     require_mention: bool = False
 
 
-class MochatConfig(Base):
+class MochatConfig(ChannelBase):
     """Mochat channel configuration."""
 
     enabled: bool = False
@@ -164,7 +170,7 @@ class MochatConfig(Base):
     reply_delay_ms: int = 120000
 
 
-class SlackDMConfig(Base):
+class SlackDMConfig(ChannelBase):
     """Slack DM policy configuration."""
 
     enabled: bool = True
@@ -172,7 +178,7 @@ class SlackDMConfig(Base):
     allow_from: list[str] = Field(default_factory=list)  # Allowed Slack user IDs
 
 
-class SlackConfig(Base):
+class SlackConfig(ChannelBase):
     """Slack channel configuration."""
 
     enabled: bool = False
@@ -189,7 +195,7 @@ class SlackConfig(Base):
     dm: SlackDMConfig = Field(default_factory=SlackDMConfig)
 
 
-class QQConfig(Base):
+class QQConfig(ChannelBase):
     """QQ channel configuration using botpy SDK."""
 
     enabled: bool = False
@@ -200,10 +206,22 @@ class QQConfig(Base):
     )  # Allowed user openids (empty = public access)
 
 
+class WeComConfig(ChannelBase):
+    """WeCom (Enterprise WeChat) AI bot channel configuration."""
+
+    enabled: bool = False
+    bot_id: str = ""
+    secret: str = ""
+    allow_from: list[str] = Field(default_factory=list)
+    welcome_message: str = ""
+
+
 
 
 class ChannelsConfig(Base):
     """Configuration for chat channels."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="allow")
 
     send_progress: bool = True  # stream agent's text progress to the channel
     send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
@@ -217,6 +235,31 @@ class ChannelsConfig(Base):
     slack: SlackConfig = Field(default_factory=SlackConfig)
     qq: QQConfig = Field(default_factory=QQConfig)
     matrix: MatrixConfig = Field(default_factory=MatrixConfig)
+    wecom: WeComConfig = Field(default_factory=WeComConfig)
+
+
+class MemoryConfig(Base):
+    """Memory backend and recall configuration."""
+
+    backend: Literal["legacy", "core"] = "legacy"
+    daily_pages: bool = True
+    recent_days: int = 2
+    search_max_results: int = 8
+    extra_paths: list[str] = Field(default_factory=list)
+
+
+class MemoryFlushConfig(Base):
+    """Pre-compaction memory flush configuration."""
+
+    enabled: bool = True
+    soft_threshold_tokens: int = 4000
+
+
+class CompactionConfig(Base):
+    """Compaction budget and flush thresholds."""
+
+    reserve_tokens_floor: int = 12000
+    memory_flush: MemoryFlushConfig = Field(default_factory=MemoryFlushConfig)
 
 
 class AgentDefaults(Base):
@@ -228,9 +271,12 @@ class AgentDefaults(Base):
         "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
     )
     max_tokens: int = 8192
+    context_window_tokens: int = 65536
     temperature: float = 0.1
     max_tool_iterations: int = 40
     memory_window: int = 100
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    compaction: CompactionConfig = Field(default_factory=CompactionConfig)
     reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
 
 
@@ -261,12 +307,18 @@ class ProvidersConfig(Base):
     zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
     dashscope: ProviderConfig = Field(default_factory=ProviderConfig)  # 阿里云通义千问
     vllm: ProviderConfig = Field(default_factory=ProviderConfig)
+    ollama: ProviderConfig = Field(default_factory=ProviderConfig)  # Ollama local models
+    ovms: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenVINO Model Server
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
+    mistral: ProviderConfig = Field(default_factory=ProviderConfig)
     aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
     siliconflow: ProviderConfig = Field(default_factory=ProviderConfig)  # SiliconFlow (硅基流动)
     volcengine: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine (火山引擎)
+    volcengine_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)
+    byteplus: ProviderConfig = Field(default_factory=ProviderConfig)
+    byteplus_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenAI Codex (OAuth)
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig)  # Github Copilot (OAuth)
 
@@ -289,7 +341,9 @@ class GatewayConfig(Base):
 class WebSearchConfig(Base):
     """Web search tool configuration."""
 
-    api_key: str = ""  # Brave Search API key
+    provider: str = "brave"  # brave, tavily, duckduckgo, searxng, jina
+    api_key: str = ""
+    base_url: str = ""  # SearXNG base URL
     max_results: int = 5
 
 
@@ -368,15 +422,30 @@ class Config(BaseSettings):
         for spec in PROVIDERS:
             p = getattr(self.providers, spec.name, None)
             if p and model_prefix and normalized_prefix == spec.name:
-                if spec.is_oauth or p.api_key:
+                if spec.is_oauth or spec.is_local or p.api_key:
                     return p, spec.name
 
         # Match by keyword (order follows PROVIDERS registry)
         for spec in PROVIDERS:
             p = getattr(self.providers, spec.name, None)
             if p and any(_kw_matches(kw) for kw in spec.keywords):
-                if spec.is_oauth or p.api_key:
+                if spec.is_oauth or spec.is_local or p.api_key:
                     return p, spec.name
+
+        # Local providers can route plain model names when api_base is configured.
+        local_fallback: tuple[ProviderConfig, str] | None = None
+        for spec in PROVIDERS:
+            if not spec.is_local:
+                continue
+            p = getattr(self.providers, spec.name, None)
+            if not (p and p.api_base):
+                continue
+            if spec.detect_by_base_keyword and spec.detect_by_base_keyword in p.api_base:
+                return p, spec.name
+            if local_fallback is None:
+                local_fallback = (p, spec.name)
+        if local_fallback:
+            return local_fallback
 
         # Fallback: gateways first, then others (follows registry order)
         # OAuth providers are NOT valid fallbacks — they require explicit model selection
@@ -384,7 +453,7 @@ class Config(BaseSettings):
             if spec.is_oauth:
                 continue
             p = getattr(self.providers, spec.name, None)
-            if p and p.api_key:
+            if p and (p.api_key or (spec.is_local and p.api_base)):
                 return p, spec.name
         return None, None
 
@@ -404,18 +473,18 @@ class Config(BaseSettings):
         return p.api_key if p else None
 
     def get_api_base(self, model: str | None = None) -> str | None:
-        """Get API base URL for the given model. Applies default URLs for known gateways."""
+        """Get API base URL for the given model. Applies default URLs for known routed providers."""
         from yuanclaw.providers.registry import find_by_name
 
         p, name = self._match_provider(model)
         if p and p.api_base:
             return p.api_base
-        # Only gateways get a default api_base here. Standard providers
-        # (like Moonshot) set their base URL via env vars in _setup_env
-        # to avoid polluting the global litellm.api_base.
+        # Routed providers (gateways/local/direct OpenAI-compatible backends)
+        # can safely use a default api_base here. Standard cloud providers
+        # still rely on provider-specific env setup in LiteLLM.
         if name:
             spec = find_by_name(name)
-            if spec and spec.is_gateway and spec.default_api_base:
+            if spec and spec.default_api_base and (spec.is_gateway or spec.is_local or spec.is_direct):
                 return spec.default_api_base
         return None
 

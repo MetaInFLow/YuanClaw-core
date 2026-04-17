@@ -6,7 +6,23 @@
       "model": "anthropic/claude-opus-4-5",
       "temperature": 0.1,
       "maxTokens": 8192,
-      "maxToolIterations": 40
+      "contextWindowTokens": 65536,
+      "maxToolIterations": 40,
+      "memoryWindow": 100,
+      "memory": {
+        "backend": "legacy",
+        "dailyPages": true,
+        "recentDays": 2,
+        "searchMaxResults": 8,
+        "extraPaths": []
+      },
+      "compaction": {
+        "reserveTokensFloor": 12000,
+        "memoryFlush": {
+          "enabled": true,
+          "softThresholdTokens": 4000
+        }
+      }
     }
   },
   "providers": {
@@ -18,6 +34,12 @@
     },
     "anthropic": {
       "apiKey": ""
+    },
+    "ollama": {
+      "apiBase": "http://localhost:11434"
+    },
+    "mistral": {
+      "apiKey": ""
     }
   },
   "channels": {
@@ -26,6 +48,13 @@
       "token": "",
       "allowFrom": ["*"],
       "groupPolicy": "mention"
+    },
+    "wecom": {
+      "enabled": false,
+      "botId": "",
+      "secret": "",
+      "allowFrom": ["*"],
+      "welcomeMessage": ""
     }
   },
   "tools": {
@@ -35,7 +64,10 @@
     },
     "web": {
       "search": {
-        "apiKey": ""
+        "provider": "brave",
+        "baseUrl": "",
+        "apiKey": "",
+        "maxResults": 5
       }
     }
   },

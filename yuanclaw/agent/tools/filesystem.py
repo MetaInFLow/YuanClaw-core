@@ -1,10 +1,12 @@
 """File system tools: read, write, edit."""
 
 import difflib
+import mimetypes
 from pathlib import Path
 from typing import Any
 
 from yuanclaw.agent.tools.base import Tool
+from yuanclaw.utils.helpers import build_image_content_blocks, detect_image_mime
 
 
 def _resolve_path(
@@ -48,7 +50,7 @@ class ReadFileTool(Tool):
             "required": ["path"],
         }
 
-    async def execute(self, path: str, **kwargs: Any) -> str:
+    async def execute(self, path: str, **kwargs: Any) -> Any:
         try:
             file_path = _resolve_path(path, self._workspace, self._allowed_dir)
             if not file_path.exists():
@@ -63,7 +65,12 @@ class ReadFileTool(Tool):
                     f"Use exec tool with head/tail/grep to read portions."
                 )
 
-            content = file_path.read_text(encoding="utf-8")
+            raw = file_path.read_bytes()
+            mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
+            if mime and mime.startswith("image/"):
+                return build_image_content_blocks(raw, mime, str(file_path), f"(Image file: {path})")
+
+            content = raw.decode("utf-8")
             if len(content) > self._MAX_CHARS:
                 return content[: self._MAX_CHARS] + f"\n\n... (truncated — file is {len(content):,} chars, limit {self._MAX_CHARS:,})"
             return content
