@@ -1,10 +1,11 @@
 """Test session management with cache-friendly message handling."""
 
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from pathlib import Path
+
 from yuanclaw.session.manager import Session, SessionManager
 
 # Test constants
@@ -139,6 +140,27 @@ class TestSessionImmutableHistory:
         for _ in range(10):
             session.get_history(max_messages=3)
         assert len(session.messages) == original_len
+
+
+class TestSessionConsolidationHelper:
+    """Test the helper used by memory consolidation."""
+
+    def test_get_consolidation_messages_matches_slice_rules(self) -> None:
+        session = create_session_with_messages("test:consolidation_helper", 60)
+        session.last_consolidated = 10
+
+        archived = session.get_consolidation_messages(keep_count=KEEP_COUNT)
+        assert len(archived) == 25
+        assert_messages_content(archived, 10, 34)
+
+    def test_get_consolidation_messages_archive_all_returns_copy(self) -> None:
+        session = create_session_with_messages("test:archive_all_helper", 6)
+
+        archived = session.get_consolidation_messages(archive_all=True)
+
+        assert len(archived) == 6
+        assert archived is not session.messages
+        assert archived == session.messages
 
 
 class TestSessionPersistence:

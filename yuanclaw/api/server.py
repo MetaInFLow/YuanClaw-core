@@ -321,6 +321,7 @@ def _make_provider(config: Config):
             api_key=p.api_key if p else "no-key",
             api_base=config.get_api_base(model) or "http://localhost:8000/v1",
             default_model=model,
+            extra_headers=p.extra_headers if p else None,
         )
 
     if provider_name == "azure_openai":
@@ -337,8 +338,16 @@ def _make_provider(config: Config):
             default_model=model,
         )
 
+    if provider_name == "ovms":
+        return CustomProvider(
+            api_key=p.api_key if p else "no-key",
+            api_base=config.get_api_base(model) or "http://localhost:8000/v3",
+            default_model=model,
+            extra_headers=p.extra_headers if p else None,
+        )
+
     spec = find_by_name(provider_name)
-    if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and spec.is_oauth):
+    if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and (spec.is_oauth or spec.is_local)):
         logger.warning("No API key configured, chat responses may fail until provider is configured")
         return CustomProvider(
             api_key="no-key",
@@ -594,6 +603,27 @@ class CoreRuntime:
             bus=self.bus,
             provider=self.provider,
             workspace=config.workspace_path,
+            model=config.agents.defaults.model,
+            provider_name=config.get_provider_name(config.agents.defaults.model),
+            temperature=config.agents.defaults.temperature,
+            max_tokens=config.agents.defaults.max_tokens,
+            context_window_tokens=config.agents.defaults.context_window_tokens,
+            max_iterations=config.agents.defaults.max_tool_iterations,
+            memory_window=config.agents.defaults.memory_window,
+            memory_config=config.agents.defaults.memory,
+            compaction_config=config.agents.defaults.compaction,
+            reasoning_effort=config.agents.defaults.reasoning_effort,
+            brave_api_key=config.tools.web.search.api_key or None,
+            web_search_provider=config.tools.web.search.provider,
+            web_search_base_url=config.tools.web.search.base_url or None,
+            web_search_max_results=config.tools.web.search.max_results,
+            web_proxy=config.tools.web.proxy or None,
+            exec_config=config.tools.exec,
+            cron_service=self.cron,
+            restrict_to_workspace=config.tools.restrict_to_workspace,
+            session_manager=self.session_manager,
+            mcp_servers=config.tools.mcp_servers,
+            channels_config=config.channels,
         )
         self.channels = None
         self._agent_task: asyncio.Task | None = None
@@ -622,10 +652,16 @@ class CoreRuntime:
                 provider_name=config.get_provider_name(config.agents.defaults.model),
                 temperature=config.agents.defaults.temperature,
                 max_tokens=config.agents.defaults.max_tokens,
+                context_window_tokens=config.agents.defaults.context_window_tokens,
                 max_iterations=config.agents.defaults.max_tool_iterations,
                 memory_window=config.agents.defaults.memory_window,
+                memory_config=config.agents.defaults.memory,
+                compaction_config=config.agents.defaults.compaction,
                 reasoning_effort=config.agents.defaults.reasoning_effort,
                 brave_api_key=config.tools.web.search.api_key or None,
+                web_search_provider=config.tools.web.search.provider,
+                web_search_base_url=config.tools.web.search.base_url or None,
+                web_search_max_results=config.tools.web.search.max_results,
                 web_proxy=config.tools.web.proxy or None,
                 exec_config=config.tools.exec,
                 cron_service=cron,

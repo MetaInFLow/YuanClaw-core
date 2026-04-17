@@ -10,7 +10,14 @@ from typing import Any, Callable, Coroutine
 
 from loguru import logger
 
-from yuanclaw.cron.types import CronJob, CronJobState, CronPayload, CronSchedule, CronStore
+from yuanclaw.cron.types import (
+    CronJob,
+    CronJobState,
+    CronPayload,
+    CronRunRecord,
+    CronSchedule,
+    CronStore,
+)
 
 
 def _now_ms() -> int:
@@ -63,6 +70,8 @@ def _validate_schedule_for_add(schedule: CronSchedule) -> None:
 class CronService:
     """Service for managing and executing scheduled jobs."""
 
+    _MAX_RUN_HISTORY = 20
+
     def __init__(
         self,
         store_path: Path,
@@ -113,6 +122,15 @@ class CronService:
                             last_run_at_ms=j.get("state", {}).get("lastRunAtMs"),
                             last_status=j.get("state", {}).get("lastStatus"),
                             last_error=j.get("state", {}).get("lastError"),
+                            run_history=[
+                                CronRunRecord(
+                                    run_at_ms=r["runAtMs"],
+                                    status=r["status"],
+                                    duration_ms=r.get("durationMs", 0),
+                                    error=r.get("error"),
+                                )
+                                for r in j.get("state", {}).get("runHistory", [])
+                            ],
                         ),
                         created_at_ms=j.get("createdAtMs", 0),
                         updated_at_ms=j.get("updatedAtMs", 0),
@@ -160,6 +178,15 @@ class CronService:
                         "lastRunAtMs": j.state.last_run_at_ms,
                         "lastStatus": j.state.last_status,
                         "lastError": j.state.last_error,
+                        "runHistory": [
+                            {
+                                "runAtMs": r.run_at_ms,
+                                "status": r.status,
+                                "durationMs": r.duration_ms,
+                                "error": r.error,
+                            }
+                            for r in j.state.run_history
+                        ],
                     },
                     "createdAtMs": j.created_at_ms,
                     "updatedAtMs": j.updated_at_ms,
@@ -171,7 +198,7 @@ class CronService:
 
         self.store_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         self._last_mtime = self.store_path.stat().st_mtime
-    
+
     async def start(self) -> None:
         """Start the cron service."""
         self._running = True
@@ -248,9 +275,8 @@ class CronService:
         logger.info("Cron: executing job '{}' ({})", job.name, job.id)
 
         try:
-            response = None
             if self.on_job:
-                response = await self.on_job(job)
+                await self.on_job(job)
 
             job.state.last_status = "ok"
             job.state.last_error = None
@@ -263,6 +289,13 @@ class CronService:
 
         job.state.last_run_at_ms = start_ms
         job.updated_at_ms = _now_ms()
+        job.state.run_history.append(CronRunRecord(
+            run_at_ms=start_ms,
+            status=job.state.last_status,
+            duration_ms=job.updated_at_ms - start_ms,
+            error=job.state.last_error,
+        ))
+        job.state.run_history = job.state.run_history[-self._MAX_RUN_HISTORY:]
 
         # Handle one-shot jobs
         if job.schedule.kind == "at":

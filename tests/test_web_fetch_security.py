@@ -1,0 +1,86 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from yuanclaw.agent.tools import web as web_tools
+from yuanclaw.agent.tools.web import WebFetchTool
+
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"demo-bytes"
+
+
+class _FakeResponse:
+    def __init__(self, url: str, content_type: str, body: bytes) -> None:
+        self.url = url
+        self.status_code = 200
+        self.headers = {"content-type": content_type}
+        self.content = body
+        self._body = body
+
+    def raise_for_status(self) -> None:
+        return None
+
+    async def aread(self) -> bytes:
+        return self._body
+
+
+class _FakeStream:
+    def __init__(self, response: _FakeResponse) -> None:
+        self._response = response
+
+    async def __aenter__(self) -> _FakeResponse:
+        return self._response
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
+
+class _FakeAsyncClient:
+    def __init__(self, *args, response: _FakeResponse, **kwargs) -> None:
+        self._response = response
+
+    async def __aenter__(self) -> "_FakeAsyncClient":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def stream(self, method: str, url: str, headers: dict[str, str]) -> _FakeStream:
+        return _FakeStream(self._response)
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_returns_image_content_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    response = _FakeResponse("https://example.com/image.png", "image/png", PNG_BYTES)
+
+    monkeypatch.setattr(web_tools, "_validate_url_target", lambda url: (True, ""))
+    monkeypatch.setattr(web_tools, "_validate_resolved_url", lambda url: (True, ""))
+    monkeypatch.setattr(web_tools.httpx, "AsyncClient", lambda *a, **kw: _FakeAsyncClient(*a, response=response, **kw))
+
+    tool = WebFetchTool()
+    result = await tool.execute("https://example.com/image.png")
+
+    assert isinstance(result, list)
+    assert result[0]["type"] == "image_url"
+    assert result[1]["text"] == "(Image fetched from: https://example.com/image.png)"
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_blocks_private_redirect(monkeypatch: pytest.MonkeyPatch) -> None:
+    response = _FakeResponse("http://127.0.0.1/image.png", "image/png", PNG_BYTES)
+
+    monkeypatch.setattr(web_tools, "_validate_url_target", lambda url: (True, ""))
+    monkeypatch.setattr(
+        web_tools,
+        "_validate_resolved_url",
+        lambda url: (False, "Blocked private redirect") if "127.0.0.1" in url else (True, ""),
+    )
+    monkeypatch.setattr(web_tools.httpx, "AsyncClient", lambda *a, **kw: _FakeAsyncClient(*a, response=response, **kw))
+
+    tool = WebFetchTool()
+    result = await tool.execute("https://example.com/image.png")
+
+    assert isinstance(result, str)
+    payload = json.loads(result)
+    assert payload["error"].startswith("Redirect blocked")

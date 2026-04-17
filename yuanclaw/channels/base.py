@@ -1,6 +1,9 @@
 """Base channel interface for chat platforms."""
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -18,6 +21,8 @@ class BaseChannel(ABC):
     """
 
     name: str = "base"
+    display_name: str = "Base"
+    transcription_api_key: str = ""
 
     def __init__(self, config: Any, bus: MessageBus):
         """
@@ -30,6 +35,41 @@ class BaseChannel(ABC):
         self.config = config
         self.bus = bus
         self._running = False
+
+    async def send_delta(
+        self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None
+    ) -> None:
+        """Deliver a streaming text chunk. Override in subclasses to enable streaming."""
+        return None
+
+    @property
+    def supports_streaming(self) -> bool:
+        """True when config enables streaming and this subclass implements send_delta."""
+        cfg = self.config
+        streaming = (
+            cfg.get("streaming", False)
+            if isinstance(cfg, dict)
+            else getattr(cfg, "streaming", False)
+        )
+        return bool(streaming) and type(self).send_delta is not BaseChannel.send_delta
+
+    @classmethod
+    def default_config(cls) -> dict[str, Any]:
+        """Return the default config shape for onboarding and plugin discovery."""
+        return {"enabled": False}
+
+    async def transcribe_audio(self, file_path: str | Path) -> str:
+        """Transcribe an audio file via Groq Whisper. Returns empty string on failure."""
+        if not self.transcription_api_key:
+            return ""
+        try:
+            from yuanclaw.providers.transcription import GroqTranscriptionProvider
+
+            provider = GroqTranscriptionProvider(api_key=self.transcription_api_key)
+            return await provider.transcribe(file_path)
+        except Exception as e:
+            logger.warning("{}: audio transcription failed: {}", self.name, e)
+            return ""
 
     @abstractmethod
     async def start(self) -> None:
@@ -94,9 +134,14 @@ class BaseChannel(ABC):
             logger.warning(
                 "Access denied for sender {} on channel {}. "
                 "Add them to allowFrom list in config to grant access.",
-                sender_id, self.name,
+                sender_id,
+                self.name,
             )
             return
+
+        meta = metadata or {}
+        if self.supports_streaming:
+            meta = {**meta, "_wants_stream": True}
 
         msg = InboundMessage(
             channel=self.name,
@@ -104,7 +149,7 @@ class BaseChannel(ABC):
             chat_id=str(chat_id),
             content=content,
             media=media or [],
-            metadata=metadata or {},
+            metadata=meta,
             session_key_override=session_key,
         )
 

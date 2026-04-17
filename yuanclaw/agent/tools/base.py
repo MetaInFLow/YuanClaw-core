@@ -21,6 +21,16 @@ class Tool(ABC):
         "object": dict,
     }
 
+    @staticmethod
+    def _resolve_type(t: Any) -> str | None:
+        """Resolve JSON Schema type to a simple string."""
+        if isinstance(t, list):
+            for item in t:
+                if item != "null":
+                    return item
+            return None
+        return t
+
     @property
     @abstractmethod
     def name(self) -> str:
@@ -40,7 +50,7 @@ class Tool(ABC):
         pass
 
     @abstractmethod
-    async def execute(self, **kwargs: Any) -> str:
+    async def execute(self, **kwargs: Any) -> Any:
         """
         Execute the tool with given parameters.
 
@@ -48,14 +58,14 @@ class Tool(ABC):
             **kwargs: Tool-specific parameters.
 
         Returns:
-            String result of the tool execution.
+            Result of the tool execution.
         """
         pass
 
     def cast_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """Apply safe schema-driven casts before validation."""
         schema = self.parameters or {}
-        if schema.get("type", "object") != "object":
+        if self._resolve_type(schema.get("type", "object")) != "object":
             return params
 
         return self._cast_object(params, schema)
@@ -78,7 +88,7 @@ class Tool(ABC):
 
     def _cast_value(self, val: Any, schema: dict[str, Any]) -> Any:
         """Cast a single value according to schema."""
-        target_type = schema.get("type")
+        target_type = self._resolve_type(schema.get("type"))
 
         if target_type == "boolean" and isinstance(val, bool):
             return val
@@ -126,12 +136,16 @@ class Tool(ABC):
         if not isinstance(params, dict):
             return [f"parameters must be an object, got {type(params).__name__}"]
         schema = self.parameters or {}
-        if schema.get("type", "object") != "object":
+        if self._resolve_type(schema.get("type", "object")) != "object":
             raise ValueError(f"Schema must be object type, got {schema.get('type')!r}")
         return self._validate(params, {**schema, "type": "object"}, "")
 
     def _validate(self, val: Any, schema: dict[str, Any], path: str) -> list[str]:
-        t, label = schema.get("type"), path or "parameter"
+        raw_type = schema.get("type")
+        nullable = (isinstance(raw_type, list) and "null" in raw_type) or schema.get("nullable", False)
+        t, label = self._resolve_type(raw_type), path or "parameter"
+        if nullable and val is None:
+            return []
         if t == "integer" and (not isinstance(val, int) or isinstance(val, bool)):
             return [f"{label} should be integer"]
         if t == "number" and (

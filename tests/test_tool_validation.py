@@ -82,6 +82,24 @@ def test_validate_params_ignores_unknown_fields() -> None:
     assert errors == []
 
 
+def test_resolve_type_union_with_null() -> None:
+    assert Tool._resolve_type(["string", "null"]) == "string"
+
+
+def test_resolve_type_only_null() -> None:
+    assert Tool._resolve_type(["null"]) is None
+
+
+def test_validate_nullable_flag_accepts_none() -> None:
+    tool = CastTestTool(
+        {
+            "type": "object",
+            "properties": {"name": {"type": "string", "nullable": True}},
+        }
+    )
+    assert tool.validate_params({"name": None}) == []
+
+
 async def test_registry_returns_validation_error() -> None:
     reg = ToolRegistry()
     reg.register(SampleTool())

@@ -34,7 +34,47 @@ class OpenAICodexProvider(LLMProvider):
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
         on_text_delta: Callable[[str], Awaitable[None]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
+        return await self._call_codex(
+            messages,
+            tools,
+            model,
+            reasoning_effort,
+            tool_choice,
+            on_content_delta=on_text_delta,
+        )
+
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+    ) -> LLMResponse:
+        return await self._call_codex(
+            messages,
+            tools,
+            model,
+            reasoning_effort,
+            tool_choice,
+            on_content_delta=on_content_delta,
+        )
+
+    async def _call_codex(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        model: str | None,
+        reasoning_effort: str | None,
+        tool_choice: str | dict[str, Any] | None,
+        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+    ) -> LLMResponse:
+        """Shared request logic for both chat() and chat_stream()."""
         model = model or self.default_model
         system_prompt, input_items = _convert_messages(messages)
 
@@ -50,7 +90,7 @@ class OpenAICodexProvider(LLMProvider):
             "text": {"verbosity": "medium"},
             "include": ["reasoning.encrypted_content"],
             "prompt_cache_key": _prompt_cache_key(messages),
-            "tool_choice": "auto",
+            "tool_choice": tool_choice or "auto",
             "parallel_tool_calls": True,
         }
 
@@ -65,14 +105,14 @@ class OpenAICodexProvider(LLMProvider):
         try:
             try:
                 content, tool_calls, finish_reason, usage = await _request_codex(
-                    url, headers, body, verify=True, on_text_delta=on_text_delta
+                    url, headers, body, verify=True, on_text_delta=on_content_delta
                 )
             except Exception as e:
                 if "CERTIFICATE_VERIFY_FAILED" not in str(e):
                     raise
                 logger.warning("SSL certificate verification failed for Codex API; retrying with verify=False")
                 content, tool_calls, finish_reason, usage = await _request_codex(
-                    url, headers, body, verify=False, on_text_delta=on_text_delta
+                    url, headers, body, verify=False, on_text_delta=on_content_delta
                 )
             return LLMResponse(
                 content=content,
@@ -239,7 +279,7 @@ async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], 
     async for line in response.aiter_lines():
         if line == "":
             if buffer:
-                data_lines = [l[5:].strip() for l in buffer if l.startswith("data:")]
+                data_lines = [entry[5:].strip() for entry in buffer if entry.startswith("data:")]
                 buffer = []
                 if not data_lines:
                     continue
@@ -278,10 +318,10 @@ async def _consume_sse(
                     "arguments": item.get("arguments") or "",
                 }
         elif event_type == "response.output_text.delta":
-            delta = event.get("delta") or ""
-            content += delta
-            if delta and on_text_delta is not None:
-                await on_text_delta(delta)
+            delta_text = event.get("delta") or ""
+            content += delta_text
+            if on_text_delta and delta_text:
+                await on_text_delta(delta_text)
         elif event_type == "response.function_call_arguments.delta":
             call_id = event.get("call_id")
             if call_id and call_id in tool_call_buffers:

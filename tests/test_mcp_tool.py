@@ -97,3 +97,20 @@ async def test_execute_handles_generic_exception() -> None:
     result = await wrapper.execute()
 
     assert result == "(MCP tool call failed: RuntimeError)"
+
+
+def test_normalizes_nullable_union_schema() -> None:
+    tool_def = SimpleNamespace(
+        name="demo",
+        description="demo tool",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "name": {"type": ["string", "null"]},
+            },
+        },
+    )
+    wrapper = MCPToolWrapper(SimpleNamespace(call_tool=None), "test", tool_def)
+
+    assert wrapper.parameters["properties"]["name"]["type"] == "string"
+    assert wrapper.parameters["properties"]["name"]["nullable"] is True

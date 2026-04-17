@@ -7,9 +7,9 @@ from typing import Any
 
 from loguru import logger
 
-from yuanclaw.bus.events import OutboundMessage
 from yuanclaw.bus.queue import MessageBus
 from yuanclaw.channels.base import BaseChannel
+from yuanclaw.channels.registry import discover_all
 from yuanclaw.config.schema import Config
 
 
@@ -31,124 +31,49 @@ class ChannelManager:
 
         self._init_channels()
 
+    def _channel_section(self, name: str) -> Any | None:
+        """Return the config section for a discovered channel."""
+        camel_name = name.split("_", 1)[0] + "".join(part.capitalize() for part in name.split("_")[1:])
+        channels_cfg = self.config.channels
+        if isinstance(channels_cfg, dict):
+            return channels_cfg.get(name) or channels_cfg.get(camel_name)
+
+        model_extra = getattr(channels_cfg, "model_extra", None)
+        if isinstance(model_extra, dict):
+            if name in model_extra:
+                return model_extra[name]
+            if camel_name in model_extra:
+                return model_extra[camel_name]
+
+        return getattr(channels_cfg, name, None)
+
+    @staticmethod
+    def _is_enabled(section: Any) -> bool:
+        """Check whether a channel config section is enabled."""
+        if isinstance(section, dict):
+            return bool(section.get("enabled", False))
+        return bool(getattr(section, "enabled", False))
+
+    def _build_channel(self, name: str, cls: type[BaseChannel], section: Any) -> BaseChannel:
+        """Instantiate a channel, injecting shared dependencies where needed."""
+        if name in {"telegram", "feishu"}:
+            return cls(section, self.bus, groq_api_key=self.config.providers.groq.api_key)
+        return cls(section, self.bus)
+
     def _init_channels(self) -> None:
-        """Initialize channels based on config."""
+        """Initialize channels discovered from built-ins and plugins."""
+        for name, cls in discover_all().items():
+            section = self._channel_section(name)
+            if section is None or not self._is_enabled(section):
+                continue
 
-        # Telegram channel
-        if self.config.channels.telegram.enabled:
             try:
-                from yuanclaw.channels.telegram import TelegramChannel
-                self.channels["telegram"] = TelegramChannel(
-                    self.config.channels.telegram,
-                    self.bus,
-                    groq_api_key=self.config.providers.groq.api_key,
-                )
-                logger.info("Telegram channel enabled")
-            except ImportError as e:
-                logger.warning("Telegram channel not available: {}", e)
-
-        # WhatsApp channel
-        if self.config.channels.whatsapp.enabled:
-            try:
-                from yuanclaw.channels.whatsapp import WhatsAppChannel
-                self.channels["whatsapp"] = WhatsAppChannel(
-                    self.config.channels.whatsapp, self.bus
-                )
-                logger.info("WhatsApp channel enabled")
-            except ImportError as e:
-                logger.warning("WhatsApp channel not available: {}", e)
-
-        # Discord channel
-        if self.config.channels.discord.enabled:
-            try:
-                from yuanclaw.channels.discord import DiscordChannel
-                self.channels["discord"] = DiscordChannel(
-                    self.config.channels.discord, self.bus
-                )
-                logger.info("Discord channel enabled")
-            except ImportError as e:
-                logger.warning("Discord channel not available: {}", e)
-
-        # Feishu channel
-        if self.config.channels.feishu.enabled:
-            try:
-                from yuanclaw.channels.feishu import FeishuChannel
-                self.channels["feishu"] = FeishuChannel(
-                    self.config.channels.feishu, self.bus,
-                    groq_api_key=self.config.providers.groq.api_key,
-                )
-                logger.info("Feishu channel enabled")
-            except ImportError as e:
-                logger.warning("Feishu channel not available: {}", e)
-
-        # Mochat channel
-        if self.config.channels.mochat.enabled:
-            try:
-                from yuanclaw.channels.mochat import MochatChannel
-
-                self.channels["mochat"] = MochatChannel(
-                    self.config.channels.mochat, self.bus
-                )
-                logger.info("Mochat channel enabled")
-            except ImportError as e:
-                logger.warning("Mochat channel not available: {}", e)
-
-        # DingTalk channel
-        if self.config.channels.dingtalk.enabled:
-            try:
-                from yuanclaw.channels.dingtalk import DingTalkChannel
-                self.channels["dingtalk"] = DingTalkChannel(
-                    self.config.channels.dingtalk, self.bus
-                )
-                logger.info("DingTalk channel enabled")
-            except ImportError as e:
-                logger.warning("DingTalk channel not available: {}", e)
-
-        # Email channel
-        if self.config.channels.email.enabled:
-            try:
-                from yuanclaw.channels.email import EmailChannel
-                self.channels["email"] = EmailChannel(
-                    self.config.channels.email, self.bus
-                )
-                logger.info("Email channel enabled")
-            except ImportError as e:
-                logger.warning("Email channel not available: {}", e)
-
-        # Slack channel
-        if self.config.channels.slack.enabled:
-            try:
-                from yuanclaw.channels.slack import SlackChannel
-                self.channels["slack"] = SlackChannel(
-                    self.config.channels.slack, self.bus
-                )
-                logger.info("Slack channel enabled")
-            except ImportError as e:
-                logger.warning("Slack channel not available: {}", e)
-
-        # QQ channel
-        if self.config.channels.qq.enabled:
-            try:
-                from yuanclaw.channels.qq import QQChannel
-                self.channels["qq"] = QQChannel(
-                    self.config.channels.qq,
-                    self.bus,
-                )
-                logger.info("QQ channel enabled")
-            except ImportError as e:
-                logger.warning("QQ channel not available: {}", e)
-
-        # Matrix channel
-        if self.config.channels.matrix.enabled:
-            try:
-                from yuanclaw.channels.matrix import MatrixChannel
-                self.channels["matrix"] = MatrixChannel(
-                    self.config.channels.matrix,
-                    self.bus,
-                )
-                logger.info("Matrix channel enabled")
-            except ImportError as e:
-                logger.warning("Matrix channel not available: {}", e)
+                channel = self._build_channel(name, cls, section)
+                self.channels[name] = channel
+                display_name = getattr(channel, "display_name", name.replace("_", " ").title())
+                logger.info("{} channel enabled", display_name)
+            except Exception as e:
+                logger.warning("{} channel not available: {}", name, e)
 
         self._validate_allow_from()
 
@@ -211,21 +136,28 @@ class ChannelManager:
 
         while True:
             try:
-                msg = await asyncio.wait_for(
-                    self.bus.consume_outbound(),
-                    timeout=1.0
-                )
+                msg = await asyncio.wait_for(self.bus.consume_outbound(), timeout=1.0)
 
                 if msg.metadata.get("_progress"):
                     if msg.metadata.get("_tool_hint") and not self.config.channels.send_tool_hints:
                         continue
-                    if not msg.metadata.get("_tool_hint") and not self.config.channels.send_progress:
+                    if (
+                        not msg.metadata.get("_tool_hint")
+                        and not self.config.channels.send_progress
+                    ):
                         continue
 
                 channel = self.channels.get(msg.channel)
                 if channel:
                     try:
-                        await channel.send(msg)
+                        if msg.metadata.get("_stream_delta"):
+                            await channel.send_delta(msg.chat_id, msg.content, msg.metadata)
+                        elif msg.metadata.get("_stream_end"):
+                            await channel.send_delta(msg.chat_id, msg.content, msg.metadata)
+                        elif msg.metadata.get("_streamed"):
+                            continue
+                        else:
+                            await channel.send(msg)
                     except Exception as e:
                         logger.error("Error sending to {}: {}", msg.channel, e)
                 else:
@@ -243,10 +175,7 @@ class ChannelManager:
     def get_status(self) -> dict[str, Any]:
         """Get status of all channels."""
         return {
-            name: {
-                "enabled": True,
-                "running": channel.is_running
-            }
+            name: {"enabled": True, "running": channel.is_running}
             for name, channel in self.channels.items()
         }
 
