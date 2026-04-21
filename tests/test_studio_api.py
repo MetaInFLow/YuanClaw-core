@@ -1,9 +1,10 @@
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
 from yuanclaw.api.server import (
+    _build_request_runtime_override,
     _compact_thread_summary,
     _has_summary_model_access,
     _normalize_thread_summary,
@@ -24,6 +25,8 @@ class _RuntimeStub:
         self.port = 18789
         self.started_at = 0.0
         self.provider = SimpleNamespace(chat=AsyncMock())
+        self.applied_configs = []
+        self.prepared_configs = []
 
     async def start(self) -> None:
         return None
@@ -37,6 +40,16 @@ class _RuntimeStub:
 
     def status_payload(self) -> dict[str, object]:
         return {}
+
+    def prepare_config(self, config: Config) -> dict[str, object]:
+        self.prepared_configs.append(config)
+        return {}
+
+    async def apply_config(
+        self, config: Config, prepared_components: dict[str, object] | None = None
+    ) -> None:
+        self.applied_configs.append((config, prepared_components))
+        self.config = config
 
     async def generate_thread_summary(
         self,
@@ -140,6 +153,129 @@ def test_session_summary_api_uses_model_output_when_provider_is_configured(tmp_p
     assert sessions[0]["thread_summary"] == "飞书表格结构梳理"
 
 
+def test_session_summary_api_falls_back_when_model_returns_error_text(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    runtime.config.agents.defaults.provider = "moonshot"
+    runtime.config.providers.moonshot.api_key = "test-key"
+    runtime.provider.chat = AsyncMock(
+        return_value=SimpleNamespace(
+            content="Error: Error code: 429 - {'error': {'code': '1113', 'message': '余额不足或无可用资源包,请充值。'}}"
+        )
+    )
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.post(
+            "/api/sessions/studio%3Acowboy-biaoge%3Athread-3/summary",
+            json={"content": "hi", "cowboyName": "牛表哥"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["mode"] == "llm"
+    assert payload["summary"] == "hi"
+
+    sessions = runtime.session_manager.list_sessions()
+    assert sessions[0]["thread_summary"] == "hi"
+
+
+def test_session_summary_api_falls_back_when_model_returns_timeout_text(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    runtime.config.agents.defaults.provider = "moonshot"
+    runtime.config.providers.moonshot.api_key = "test-key"
+    runtime.provider.chat = AsyncMock(return_value=SimpleNamespace(content="Error: Request timed out."))
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.post(
+            "/api/sessions/studio%3Acowboy-biaoge%3Athread-4/summary",
+            json={"content": "帮我看飞书登录状态", "cowboyName": "牛表哥"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["mode"] == "llm"
+    assert payload["summary"] == "帮我看飞书登录状态"
+
+    sessions = runtime.session_manager.list_sessions()
+    assert sessions[0]["thread_summary"] == "帮我看飞书登录状态"
+
+
+def test_build_request_runtime_override_uses_per_request_model_pool_config() -> None:
+    config = Config()
+    config.agents.defaults.model = "glm-5-turbo"
+    config.agents.defaults.provider = "custom"
+    config.providers.custom.api_key = "old-key"
+    config.providers.custom.api_base = "https://old.example.com/v1"
+
+    provider, model, provider_name = _build_request_runtime_override(
+        config,
+        {
+            "runtimeConfig": {
+                "provider": "custom",
+                "adapter": "openai_chat_stream_aggregate",
+                "model": "gpt-4.1",
+                "apiKey": "new-key",
+                "apiBase": "https://override.example.com/v1",
+            }
+        },
+    )
+
+    assert provider is not None
+    assert model == "gpt-4.1"
+    assert provider_name == "custom"
+    assert provider.api_key == "new-key"
+    assert provider.api_base == "https://override.example.com/v1"
+    assert provider.adapter == "openai_chat_stream_aggregate"
+
+
+def test_write_config_api_rejects_incomplete_present_channel_payload(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    payload = runtime.config.model_dump(by_alias=True)
+    payload["studio"] = {
+        "channelRows": {
+            "telegram": {
+                "present": True,
+            }
+        },
+        "channels": {
+            "telegram": {
+                "enabled": False,
+                "token": "",
+            }
+        },
+    }
+    payload["channels"]["telegram"] = {
+        "enabled": False,
+        "token": "",
+    }
+
+    with patch("yuanclaw.api.server.save_config") as mock_save_config:
+        with TestClient(create_app(runtime)) as client:
+            response = client.put("/api/config", json=payload)
+
+    assert response.status_code == 400
+    assert "telegram" in response.json()["detail"]
+    assert "token" in response.json()["detail"]
+    mock_save_config.assert_not_called()
+    assert runtime.prepared_configs == []
+    assert runtime.applied_configs == []
+
+
+def test_write_config_api_rejects_enabled_runtime_channel_without_required_fields(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    payload = runtime.config.model_dump(by_alias=True)
+    payload["channels"]["telegram"]["enabled"] = True
+    payload["channels"]["telegram"]["token"] = ""
+
+    with patch("yuanclaw.api.server.save_config") as mock_save_config:
+        with TestClient(create_app(runtime)) as client:
+            response = client.put("/api/config", json=payload)
+
+    assert response.status_code == 400
+    assert "telegram" in response.json()["detail"]
+    assert "token" in response.json()["detail"]
+    mock_save_config.assert_not_called()
+    assert runtime.prepared_configs == []
+    assert runtime.applied_configs == []
 def test_usage_api_aggregates_session_usage(tmp_path) -> None:
     runtime = _RuntimeStub(tmp_path / "workspace")
     first = runtime.session_manager.get_or_create("studio:cowboy-biaoge:thread-1")
