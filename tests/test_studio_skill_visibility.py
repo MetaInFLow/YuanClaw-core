@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from yuanclaw.agent.context import ContextBuilder
-from yuanclaw.agent.skills import SkillsLoader
+from yuanclaw.agent.skills import BUILTIN_SKILLS_DIR, SkillsLoader
 
 
 def test_studio_bound_skills_hide_global_catalog(tmp_path: Path) -> None:
@@ -65,3 +65,18 @@ def test_global_component_skills_are_visible(tmp_path: Path, monkeypatch) -> Non
 
     assert any(skill["name"] == "base-builder" and skill["source"] == "component" for skill in skills)
     assert "Build bases." in (loader.load_skill("base-builder") or "")
+
+
+def test_cowdy_studio_cli_is_builtin_and_loadable(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    loader = SkillsLoader(workspace)
+    skills = loader.list_skills(filter_unavailable=False)
+
+    assert (BUILTIN_SKILLS_DIR / "cowdy-studio-cli" / "SKILL.md").exists()
+    assert any(
+        skill["name"] == "cowdy-studio-cli" and skill["source"] in {"builtin", "component"}
+        for skill in skills
+    )
+    assert "cowdy ext describe" in (loader.load_skill("cowdy-studio-cli") or "")

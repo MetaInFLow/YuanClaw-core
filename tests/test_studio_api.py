@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -25,6 +25,8 @@ class _RuntimeStub:
         self.port = 18789
         self.started_at = 0.0
         self.provider = SimpleNamespace(chat=AsyncMock())
+        self.applied_configs = []
+        self.prepared_configs = []
 
     async def start(self) -> None:
         return None
@@ -38,6 +40,16 @@ class _RuntimeStub:
 
     def status_payload(self) -> dict[str, object]:
         return {}
+
+    def prepare_config(self, config: Config) -> dict[str, object]:
+        self.prepared_configs.append(config)
+        return {}
+
+    async def apply_config(
+        self, config: Config, prepared_components: dict[str, object] | None = None
+    ) -> None:
+        self.applied_configs.append((config, prepared_components))
+        self.config = config
 
     async def generate_thread_summary(
         self,
@@ -213,6 +225,57 @@ def test_build_request_runtime_override_uses_per_request_model_pool_config() -> 
     assert provider.api_key == "new-key"
     assert provider.api_base == "https://override.example.com/v1"
     assert provider.adapter == "openai_chat_stream_aggregate"
+
+
+def test_write_config_api_rejects_incomplete_present_channel_payload(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    payload = runtime.config.model_dump(by_alias=True)
+    payload["studio"] = {
+        "channelRows": {
+            "telegram": {
+                "present": True,
+            }
+        },
+        "channels": {
+            "telegram": {
+                "enabled": False,
+                "token": "",
+            }
+        },
+    }
+    payload["channels"]["telegram"] = {
+        "enabled": False,
+        "token": "",
+    }
+
+    with patch("yuanclaw.api.server.save_config") as mock_save_config:
+        with TestClient(create_app(runtime)) as client:
+            response = client.put("/api/config", json=payload)
+
+    assert response.status_code == 400
+    assert "telegram" in response.json()["detail"]
+    assert "token" in response.json()["detail"]
+    mock_save_config.assert_not_called()
+    assert runtime.prepared_configs == []
+    assert runtime.applied_configs == []
+
+
+def test_write_config_api_rejects_enabled_runtime_channel_without_required_fields(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    payload = runtime.config.model_dump(by_alias=True)
+    payload["channels"]["telegram"]["enabled"] = True
+    payload["channels"]["telegram"]["token"] = ""
+
+    with patch("yuanclaw.api.server.save_config") as mock_save_config:
+        with TestClient(create_app(runtime)) as client:
+            response = client.put("/api/config", json=payload)
+
+    assert response.status_code == 400
+    assert "telegram" in response.json()["detail"]
+    assert "token" in response.json()["detail"]
+    mock_save_config.assert_not_called()
+    assert runtime.prepared_configs == []
+    assert runtime.applied_configs == []
 
 
 def test_usage_api_aggregates_session_usage(tmp_path) -> None:
