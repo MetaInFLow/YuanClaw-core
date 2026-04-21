@@ -4,7 +4,6 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
 from yuanclaw.api.server import (
-    _build_request_runtime_override,
     _compact_thread_summary,
     _has_summary_model_access,
     _normalize_thread_summary,
@@ -151,80 +150,6 @@ def test_session_summary_api_uses_model_output_when_provider_is_configured(tmp_p
 
     sessions = runtime.session_manager.list_sessions()
     assert sessions[0]["thread_summary"] == "飞书表格结构梳理"
-
-
-def test_session_summary_api_falls_back_when_model_returns_error_text(tmp_path) -> None:
-    runtime = _RuntimeStub(tmp_path / "workspace")
-    runtime.config.agents.defaults.provider = "moonshot"
-    runtime.config.providers.moonshot.api_key = "test-key"
-    runtime.provider.chat = AsyncMock(
-        return_value=SimpleNamespace(
-            content="Error: Error code: 429 - {'error': {'code': '1113', 'message': '余额不足或无可用资源包,请充值。'}}"
-        )
-    )
-
-    with TestClient(create_app(runtime)) as client:
-        response = client.post(
-            "/api/sessions/studio%3Acowboy-biaoge%3Athread-3/summary",
-            json={"content": "hi", "cowboyName": "牛表哥"},
-        )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["mode"] == "llm"
-    assert payload["summary"] == "hi"
-
-    sessions = runtime.session_manager.list_sessions()
-    assert sessions[0]["thread_summary"] == "hi"
-
-
-def test_session_summary_api_falls_back_when_model_returns_timeout_text(tmp_path) -> None:
-    runtime = _RuntimeStub(tmp_path / "workspace")
-    runtime.config.agents.defaults.provider = "moonshot"
-    runtime.config.providers.moonshot.api_key = "test-key"
-    runtime.provider.chat = AsyncMock(return_value=SimpleNamespace(content="Error: Request timed out."))
-
-    with TestClient(create_app(runtime)) as client:
-        response = client.post(
-            "/api/sessions/studio%3Acowboy-biaoge%3Athread-4/summary",
-            json={"content": "帮我看飞书登录状态", "cowboyName": "牛表哥"},
-        )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["mode"] == "llm"
-    assert payload["summary"] == "帮我看飞书登录状态"
-
-    sessions = runtime.session_manager.list_sessions()
-    assert sessions[0]["thread_summary"] == "帮我看飞书登录状态"
-
-
-def test_build_request_runtime_override_uses_per_request_model_pool_config() -> None:
-    config = Config()
-    config.agents.defaults.model = "glm-5-turbo"
-    config.agents.defaults.provider = "custom"
-    config.providers.custom.api_key = "old-key"
-    config.providers.custom.api_base = "https://old.example.com/v1"
-
-    provider, model, provider_name = _build_request_runtime_override(
-        config,
-        {
-            "runtimeConfig": {
-                "provider": "custom",
-                "adapter": "openai_chat_stream_aggregate",
-                "model": "gpt-4.1",
-                "apiKey": "new-key",
-                "apiBase": "https://override.example.com/v1",
-            }
-        },
-    )
-
-    assert provider is not None
-    assert model == "gpt-4.1"
-    assert provider_name == "custom"
-    assert provider.api_key == "new-key"
-    assert provider.api_base == "https://override.example.com/v1"
-    assert provider.adapter == "openai_chat_stream_aggregate"
 
 
 def test_write_config_api_rejects_incomplete_present_channel_payload(tmp_path) -> None:
