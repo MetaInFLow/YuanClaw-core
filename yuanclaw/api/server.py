@@ -31,6 +31,98 @@ from yuanclaw.providers.registry import PROVIDERS, find_by_name
 from yuanclaw.session.manager import SessionManager
 from yuanclaw.utils.helpers import sync_workspace_templates
 
+CHANNEL_REQUIRED_FIELDS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "telegram": (("token",),),
+    "discord": (("token",),),
+    "whatsapp": (("bridgeUrl",),),
+    "feishu": (("appId",), ("appSecret",)),
+    "slack": (("botToken",),),
+    "dingtalk": (("clientId",), ("clientSecret",)),
+    "qq": (("appId",), ("secret",)),
+    "matrix": (("homeserver",), ("userId",), ("accessToken",)),
+    "email": (
+        ("fromAddress",),
+        ("imapHost",),
+        ("imapUsername",),
+        ("imapPassword",),
+        ("smtpHost",),
+        ("smtpUsername",),
+        ("smtpPassword",),
+    ),
+    "mochat": (("baseUrl",), ("clawToken",)),
+}
+
+
+def _value_at_path(source: Any, path: tuple[str, ...]) -> Any:
+    cursor = source
+    for segment in path:
+        if not isinstance(cursor, dict):
+            return None
+        cursor = cursor.get(segment)
+    return cursor
+
+
+def _channel_field_has_value(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, list):
+        return any(_channel_field_has_value(item) for item in value)
+    if isinstance(value, dict):
+        return bool(value)
+    return value is not None
+
+
+def _channel_payload_config(payload: dict[str, Any], channel_id: str) -> dict[str, Any]:
+    studio = payload.get("studio") if isinstance(payload.get("studio"), dict) else {}
+    studio_channels = studio.get("channels") if isinstance(studio.get("channels"), dict) else {}
+    if isinstance(studio_channels.get(channel_id), dict):
+        return studio_channels[channel_id]
+
+    runtime_channels = payload.get("channels") if isinstance(payload.get("channels"), dict) else {}
+    if isinstance(runtime_channels.get(channel_id), dict):
+        return runtime_channels[channel_id]
+
+    return {}
+
+
+def _channel_payload_requires_validation(
+    payload: dict[str, Any], channel_id: str, channel_config: dict[str, Any]
+) -> bool:
+    studio = payload.get("studio") if isinstance(payload.get("studio"), dict) else {}
+    channel_rows = studio.get("channelRows") if isinstance(studio.get("channelRows"), dict) else {}
+    row_meta = channel_rows.get(channel_id) if isinstance(channel_rows.get(channel_id), dict) else {}
+    if isinstance(row_meta.get("present"), bool):
+        return bool(row_meta["present"])
+
+    return bool(channel_config.get("enabled"))
+
+
+def _channel_missing_required_fields(
+    channel_id: str, channel_config: dict[str, Any]
+) -> list[str]:
+    missing: list[str] = []
+    for path in CHANNEL_REQUIRED_FIELDS.get(channel_id, ()):
+        if not _channel_field_has_value(_value_at_path(channel_config, path)):
+            missing.append(".".join(path))
+    return missing
+
+
+def _validate_channel_payloads(payload: dict[str, Any]) -> None:
+    for channel_id in CHANNEL_REQUIRED_FIELDS:
+        channel_config = _channel_payload_config(payload, channel_id)
+        if not _channel_payload_requires_validation(payload, channel_id, channel_config):
+            continue
+
+        missing = _channel_missing_required_fields(channel_id, channel_config)
+        if missing:
+            raise ValueError(
+                f"channel `{channel_id}` is incomplete: missing required field(s): {', '.join(missing)}"
+            )
+
 
 @dataclass
 class OAuthLoginSession:
@@ -1056,6 +1148,11 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
 
     @app.put("/api/config")
     async def write_config(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            _validate_channel_payloads(payload)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"invalid config payload: {exc}") from exc
+
         try:
             next_config = Config.model_validate(payload)
         except Exception as exc:
