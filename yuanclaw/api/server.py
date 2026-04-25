@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import urllib.parse
 import time
@@ -51,6 +52,61 @@ CHANNEL_REQUIRED_FIELDS: dict[str, tuple[tuple[str, ...], ...]] = {
     ),
     "mochat": (("baseUrl",), ("clawToken",)),
 }
+
+_KNOWLEDGE_DISTILL_TOOL = [
+    {
+        "type": "function",
+        "function": {
+            "name": "deliver_knowledge_distill",
+            "description": "Return the structured run summary and durable insights for the Context Graph.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "headline": {
+                        "type": "string",
+                        "description": "Readable run headline shown directly on the summary node.",
+                    },
+                    "summaryPreview": {
+                        "type": "string",
+                        "description": "One-line preview shown before opening the modal.",
+                    },
+                    "summaryMarkdown": {
+                        "type": "string",
+                        "description": "Markdown body for the daily summary. Start with a heading and put key points before coverage/source sections.",
+                    },
+                    "insights": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "kind": {
+                                    "type": "string",
+                                    "enum": [
+                                        "project-context",
+                                        "technical",
+                                        "workflow",
+                                        "rule",
+                                        "preference",
+                                        "other",
+                                    ],
+                                },
+                                "summary": {"type": "string"},
+                                "sourceSessionKeys": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                                "sourceExcerpt": {"type": "string"},
+                            },
+                            "required": ["title", "kind", "summary", "sourceSessionKeys"],
+                        },
+                    },
+                },
+                "required": ["headline", "summaryMarkdown", "insights"],
+            },
+        },
+    }
+]
 
 
 def _value_at_path(source: Any, path: tuple[str, ...]) -> Any:
@@ -585,6 +641,167 @@ def _normalize_thread_summary(raw: str | None, fallback: str) -> str:
     return _compact_thread_summary(cleaned)
 
 
+def _clean_single_line(value: Any, *, limit: int | None = None) -> str:
+    cleaned = " ".join(str(value or "").split()).strip().strip("'\"`")
+    if limit and len(cleaned) > limit:
+        return cleaned[: limit - 1].rstrip() + "…"
+    return cleaned
+
+
+def _normalize_tool_arguments(arguments: Any) -> dict[str, Any]:
+    if isinstance(arguments, str):
+        arguments = json.loads(arguments)
+    if isinstance(arguments, list):
+        if arguments and isinstance(arguments[0], dict):
+            arguments = arguments[0]
+        else:
+            raise ValueError("knowledge distill tool returned invalid argument list")
+    if not isinstance(arguments, dict):
+        raise ValueError("knowledge distill tool returned non-object arguments")
+    return arguments
+
+
+def _classify_knowledge_insight_kind(text: str) -> str:
+    lowered = text.lower()
+    if any(token in lowered for token in ("偏好", "希望", "prefer", "preferred", "default")):
+        return "preference"
+    if any(token in lowered for token in ("必须", "需要", "should", "规则", "避免", "优先")):
+        return "rule"
+    if any(
+        token in lowered
+        for token in (
+            "tauri",
+            "reactflow",
+            "sqlite",
+            "schema",
+            "prompt",
+            "api",
+            "markdown",
+            "lark-cli",
+            "feishu",
+        )
+    ):
+        return "technical"
+    if any(
+        token in lowered
+        for token in (
+            "项目",
+            "workspace",
+            "obsidian",
+            "context graph",
+            "automation",
+            "backend",
+            "monorepo",
+            "turborepo",
+            "端口",
+        )
+    ):
+        return "project-context"
+    return "workflow"
+
+
+def _normalize_knowledge_insight_kind(kind: Any, title: str, summary: str) -> str:
+    normalized = _clean_single_line(kind)
+    if normalized in {"project-context", "technical", "workflow", "rule", "preference", "other"}:
+        return normalized
+    return _classify_knowledge_insight_kind(f"{title} {summary}")
+
+
+def _normalize_knowledge_source_keys(raw: Any, allowed_session_keys: set[str]) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    items: list[str] = []
+    for value in raw:
+        key = _clean_single_line(value)
+        if key and key in allowed_session_keys and key not in items:
+            items.append(key)
+    return items
+
+
+def _first_markdown_signal(markdown: str) -> str:
+    for raw_line in markdown.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("> "):
+            return line[2:].strip()
+        if line.startswith("- "):
+            return line[2:].strip()
+        return line
+    return ""
+
+
+def _normalize_knowledge_distill_output(
+    payload: dict[str, Any],
+    allowed_session_keys: set[str],
+) -> dict[str, Any]:
+    headline = _clean_single_line(payload.get("headline"), limit=96)
+    summary_preview = _clean_single_line(payload.get("summaryPreview"), limit=160) or None
+    summary_markdown = str(payload.get("summaryMarkdown") or "").strip()
+    if not summary_markdown:
+        raise ValueError("knowledge distill output is missing summaryMarkdown")
+
+    insights: list[dict[str, Any]] = []
+    for raw in payload.get("insights") or []:
+        if not isinstance(raw, dict):
+            continue
+        title = _clean_single_line(raw.get("title"), limit=64)
+        summary = _clean_single_line(raw.get("summary"), limit=220)
+        source_session_keys = _normalize_knowledge_source_keys(
+            raw.get("sourceSessionKeys"), allowed_session_keys
+        )
+        if not title or not summary or not source_session_keys:
+            continue
+        source_excerpt = _clean_single_line(raw.get("sourceExcerpt"), limit=160) or None
+        insights.append(
+            {
+                "title": title,
+                "kind": _normalize_knowledge_insight_kind(raw.get("kind"), title, summary),
+                "summary": summary,
+                "sourceSessionKeys": source_session_keys,
+                "sourceExcerpt": source_excerpt,
+            }
+        )
+
+    if not headline:
+        headline = summary_preview or (insights[0]["title"] if insights else "") or _first_markdown_signal(summary_markdown)
+    if not headline:
+        raise ValueError("knowledge distill output is missing headline")
+    if not summary_preview:
+        summary_preview = (insights[0]["summary"] if insights else "") or headline
+    if not summary_markdown.startswith("#"):
+        summary_markdown = f"# {headline}\n\n{summary_markdown}"
+
+    return {
+        "headline": headline,
+        "summaryPreview": summary_preview,
+        "summaryMarkdown": summary_markdown,
+        "insights": insights,
+    }
+
+
+def _render_message_content(content: Any) -> str:
+    if isinstance(content, str):
+        return _clean_single_line(content, limit=280)
+    if isinstance(content, list):
+        rendered = " ".join(_render_message_content(item) for item in content)
+        return _clean_single_line(rendered, limit=280)
+    if isinstance(content, dict):
+        return _clean_single_line(json.dumps(content, ensure_ascii=False), limit=280)
+    return _clean_single_line(content, limit=280)
+
+
+def _render_session_messages(messages: list[dict[str, Any]], limit: int = 10) -> str:
+    rendered: list[str] = []
+    for message in messages[-limit:]:
+        role = _clean_single_line(message.get("role")).upper() or "UNKNOWN"
+        content = _render_message_content(message.get("content"))
+        if not content:
+            continue
+        rendered.append(f"- {role}: {content}")
+    return "\n".join(rendered) if rendered else "- (no persisted messages)"
+
+
 def _channel_is_configured(channel_id: str, cfg: Any) -> bool:
     """Best-effort channel configuration check for UI display."""
     required: dict[str, list[str]] = {
@@ -1009,6 +1226,108 @@ class CoreRuntime:
             self.session_manager.set_thread_summary(session_key, fallback)
             return {"summary": fallback, "mode": "input"}
 
+    async def distill_knowledge(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Return structured daily knowledge distill output for Studio."""
+        if not _has_summary_model_access(self.config):
+            raise RuntimeError("summary model is unavailable")
+
+        sessions = payload.get("sessions") if isinstance(payload.get("sessions"), list) else []
+        if not sessions:
+            raise ValueError("sessions are required")
+
+        existing_insights = (
+            payload.get("existingInsights")
+            if isinstance(payload.get("existingInsights"), list)
+            else []
+        )
+        allowed_session_keys: set[str] = set()
+        session_sections: list[str] = []
+
+        for raw in sessions[:40]:
+            if not isinstance(raw, dict):
+                continue
+            session_key = _clean_single_line(raw.get("sessionKey"))
+            if not session_key:
+                continue
+            allowed_session_keys.add(session_key)
+            thread_summary = _clean_single_line(raw.get("threadSummary"), limit=180) or "(none)"
+            last_preview = _clean_single_line(raw.get("lastMessagePreview"), limit=220) or "(none)"
+            updated_at = _clean_single_line(raw.get("updatedAt")) or "(unknown)"
+            live_session = self.session_manager.get_or_create(session_key)
+            recent_turns = _render_session_messages(live_session.messages)
+            session_sections.append(
+                "\n".join(
+                    [
+                        f"## Session {session_key}",
+                        f"- Updated at: {updated_at}",
+                        f"- Thread summary: {thread_summary}",
+                        f"- Last preview: {last_preview}",
+                        "- Recent turns:",
+                        recent_turns,
+                    ]
+                )
+            )
+
+        if not allowed_session_keys:
+            raise ValueError("no valid session keys were supplied")
+
+        existing_lines: list[str] = []
+        for raw in existing_insights[:80]:
+            if not isinstance(raw, dict):
+                continue
+            title = _clean_single_line(raw.get("title"), limit=80)
+            if not title:
+                continue
+            kind = _clean_single_line(raw.get("kind"), limit=32) or "workflow"
+            summary = _clean_single_line(raw.get("summary"), limit=200)
+            merge_key = _clean_single_line(raw.get("mergeKey"), limit=120)
+            existing_lines.append(
+                f"- [{kind}] {title} :: {summary or '(no summary)'} :: mergeKey={merge_key or '(none)'}"
+            )
+
+        response = await self.provider.chat(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你在为 Studio Context Graph 提炼可复用知识。"
+                        "只调用 deliver_knowledge_distill 工具，不要输出自由文本。"
+                        "目标：产出一个可直接显示在图上的 run 级 headline/summary 和 durable insights。"
+                        "禁止输出这些低价值内容：确认词、编号残片、shell/file listing、权限串、路径或 ID dump、timeout/status-only 文本。"
+                        "只保留可跨会话复用的事实、约束、工作流、偏好、项目背景。"
+                        "summaryMarkdown 必须先给 headline/关键点，再放 coverage/source sessions。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Run date: {_clean_single_line(payload.get('runDate')) or '(unknown)'}\n\n"
+                        "Collection prompt:\n"
+                        f"{str(payload.get('collectionPrompt') or '').strip() or '(empty)'}\n\n"
+                        "System prompt:\n"
+                        f"{str(payload.get('systemPrompt') or '').strip() or '(empty)'}\n\n"
+                        "Archive prompt:\n"
+                        f"{str(payload.get('archivePrompt') or '').strip() or '(empty)'}\n\n"
+                        "Existing durable insights:\n"
+                        f"{chr(10).join(existing_lines) if existing_lines else '- (none)'}\n\n"
+                        "Eligible sessions:\n"
+                        f"{chr(10).join(session_sections)}"
+                    ),
+                },
+            ],
+            tools=_KNOWLEDGE_DISTILL_TOOL,
+            model=self.config.agents.defaults.model,
+            max_tokens=self.config.agents.defaults.max_tokens,
+            temperature=0.2,
+            reasoning_effort=self.config.agents.defaults.reasoning_effort,
+        )
+
+        if not response.has_tool_calls:
+            raise RuntimeError("model did not return structured knowledge distill output")
+
+        args = _normalize_tool_arguments(response.tool_calls[0].arguments)
+        return _normalize_knowledge_distill_output(args, allowed_session_keys)
+
 
 def create_app(runtime: CoreRuntime) -> FastAPI:
     """Create FastAPI application for local Studio runtime."""
@@ -1091,6 +1410,15 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
             content=content,
             cowboy_name=cowboy_name,
         )
+
+    @app.post("/api/internal/knowledge/distill")
+    async def knowledge_distill(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return await runtime.distill_knowledge(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.get("/api/sessions/{session_key:path}")
     async def session_detail(session_key: str) -> dict[str, Any]:

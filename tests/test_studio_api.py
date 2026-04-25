@@ -26,6 +26,22 @@ class _RuntimeStub:
         self.provider = SimpleNamespace(chat=AsyncMock())
         self.applied_configs = []
         self.prepared_configs = []
+        self.distill_payload = None
+        self.distill_response = {
+            "headline": "Workspace knowledge stays readable before opening the modal",
+            "summaryPreview": "Show distilled summaries instead of session tail fragments.",
+            "summaryMarkdown": "# Workspace knowledge stays readable before opening the modal",
+            "insights": [
+                {
+                    "title": "Obsidian CLI missing from PATH",
+                    "kind": "technical",
+                    "summary": "Obsidian CLI cannot be invoked until PATH is fixed.",
+                    "sourceSessionKeys": ["studio:test:1"],
+                    "sourceExcerpt": "Obsidian CLI 未注册到 PATH",
+                }
+            ],
+        }
+        self.distill_error = None
 
     async def start(self) -> None:
         return None
@@ -70,6 +86,12 @@ class _RuntimeStub:
         summary = _normalize_thread_summary(response.content, fallback)
         self.session_manager.set_thread_summary(session_key, summary)
         return {"summary": summary, "mode": "llm"}
+
+    async def distill_knowledge(self, payload: dict[str, object]) -> dict[str, object]:
+        self.distill_payload = payload
+        if self.distill_error:
+            raise self.distill_error
+        return self.distill_response
 
 
 def test_sessions_api_includes_message_summary_fields(tmp_path) -> None:
@@ -150,6 +172,67 @@ def test_session_summary_api_uses_model_output_when_provider_is_configured(tmp_p
 
     sessions = runtime.session_manager.list_sessions()
     assert sessions[0]["thread_summary"] == "飞书表格结构梳理"
+
+
+def test_internal_knowledge_distill_api_returns_structured_output(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    session = runtime.session_manager.get_or_create("studio:test:1")
+    session.add_message("user", "Obsidian CLI 为什么还不能用？")
+    session.add_message("assistant", "因为当前 PATH 里还没有注册 Obsidian CLI。")
+    runtime.session_manager.save(session)
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.post(
+            "/api/internal/knowledge/distill",
+            json={
+                "runDate": "2026-04-22",
+                "sessions": [
+                    {
+                        "sessionKey": "studio:test:1",
+                        "updatedAt": "2026-04-22T08:00:00Z",
+                        "threadSummary": "排查 Obsidian CLI",
+                        "lastMessagePreview": "Obsidian CLI 未注册到 PATH",
+                    }
+                ],
+                "existingInsights": [],
+                "collectionPrompt": "Collect relevant chats.",
+                "systemPrompt": "Summarize durable knowledge.",
+                "archivePrompt": "Archive durable insights.",
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["headline"] == "Workspace knowledge stays readable before opening the modal"
+    assert payload["insights"][0]["sourceSessionKeys"] == ["studio:test:1"]
+    assert runtime.distill_payload is not None
+    assert runtime.distill_payload["sessions"][0]["sessionKey"] == "studio:test:1"
+
+
+def test_internal_knowledge_distill_api_surfaces_runtime_failures(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    runtime.distill_error = RuntimeError("summary model is unavailable")
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.post(
+            "/api/internal/knowledge/distill",
+            json={
+                "runDate": "2026-04-22",
+                "sessions": [
+                    {
+                        "sessionKey": "studio:test:1",
+                        "updatedAt": "2026-04-22T08:00:00Z",
+                    }
+                ],
+                "existingInsights": [],
+                "collectionPrompt": "",
+                "systemPrompt": "",
+                "archivePrompt": "",
+            },
+        )
+
+    assert response.status_code == 500
+    assert "summary model is unavailable" in response.json()["detail"]
 
 
 def test_write_config_api_rejects_incomplete_present_channel_payload(tmp_path) -> None:
