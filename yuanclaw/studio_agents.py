@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 STUDIO_AGENT_FIXED_SKILLS: dict[str, list[str]] = {
-    "cowboy-shifu": ["neil-skills-creator"],
+    "cowboy-shifu": ["cowdy-studio-cli"],
 }
 
 
