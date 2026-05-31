@@ -3,6 +3,7 @@
 from typing import TYPE_CHECKING, Any
 
 from yuanclaw.agent.tools.base import Tool
+from yuanclaw.security.workspace_access import current_workspace_scope
 
 if TYPE_CHECKING:
     from yuanclaw.agent.subagent import SubagentManager
@@ -60,4 +61,5 @@ class SpawnTool(Tool):
             origin_channel=self._origin_channel,
             origin_chat_id=self._origin_chat_id,
             session_key=self._session_key,
+            workspace_scope=current_workspace_scope(),
         )

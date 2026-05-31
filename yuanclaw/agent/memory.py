@@ -238,6 +238,12 @@ class MemoryStore:
                 if not isinstance(entry, str):
                     entry = json.dumps(entry, ensure_ascii=False)
                 self.append_history(entry)
+                if old_messages:
+                    last_active = old_messages[-1].get("timestamp") or session.updated_at.isoformat()
+                    session.metadata["_last_summary"] = {
+                        "text": entry,
+                        "last_active": str(last_active),
+                    }
             if update := args.get("memory_update"):
                 if not isinstance(update, str):
                     update = json.dumps(update, ensure_ascii=False)
@@ -250,3 +256,33 @@ class MemoryStore:
         except Exception:
             logger.exception("Memory consolidation failed")
             return False
+
+    async def compact_idle_session(
+        self,
+        session: Session,
+        provider: LLMProvider,
+        model: str,
+        *,
+        keep_recent_messages: int = 8,
+    ) -> str:
+        """Compact an idle session and return the persisted summary text."""
+        old_messages = session.get_consolidation_messages(keep_count=keep_recent_messages)
+        if not old_messages:
+            return "(nothing)"
+
+        previous = session.metadata.get("_last_summary")
+        previous_text = previous.get("text") if isinstance(previous, dict) else None
+        ok = await self.consolidate(
+            session,
+            provider,
+            model,
+            archive_all=False,
+            memory_window=max(2, keep_recent_messages * 2),
+        )
+        if not ok:
+            return ""
+
+        meta = session.metadata.get("_last_summary")
+        if isinstance(meta, dict) and isinstance(meta.get("text"), str):
+            return meta["text"]
+        return previous_text if isinstance(previous_text, str) else "(nothing)"

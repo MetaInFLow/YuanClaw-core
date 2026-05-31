@@ -1,9 +1,9 @@
 """Configuration schema using Pydantic."""
 
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
@@ -216,6 +216,46 @@ class WeComConfig(ChannelBase):
     welcome_message: str = ""
 
 
+class SignalDMConfig(Base):
+    """Signal DM policy configuration."""
+
+    enabled: bool = False
+    policy: Literal["open", "allowlist"] = "allowlist"
+    allow_from: list[str] = Field(default_factory=list)
+    pairing_reply_enabled: bool = False
+    pairing_ttl_s: int = Field(default=600, ge=30)
+
+
+class SignalGroupConfig(Base):
+    """Signal group policy configuration."""
+
+    enabled: bool = False
+    policy: Literal["open", "allowlist"] = "allowlist"
+    allow_from: list[str] = Field(default_factory=list)
+    require_mention: bool = True
+
+
+class SignalConfig(ChannelBase):
+    """Signal channel configuration using signal-cli daemon JSON-RPC."""
+
+    enabled: bool = False
+    phone_number: str = ""
+    daemon_host: str = "localhost"
+    daemon_port: int = 8080
+    attachments_dir: str | None = None
+    health_check_enabled: bool = True
+    receive_events: bool = True
+    reconnect_delay_s: float = Field(default=1.0, ge=0)
+    max_reconnect_delay_s: float = Field(default=30.0, ge=0)
+    group_message_buffer_size: int = Field(default=20, ge=1)
+    dm: SignalDMConfig = Field(default_factory=SignalDMConfig)
+    group: SignalGroupConfig = Field(default_factory=SignalGroupConfig)
+
+    @property
+    def allow_from(self) -> list[str]:
+        return list(dict.fromkeys(self.dm.allow_from + self.group.allow_from))
+
+
 
 
 class ChannelsConfig(Base):
@@ -236,6 +276,7 @@ class ChannelsConfig(Base):
     qq: QQConfig = Field(default_factory=QQConfig)
     matrix: MatrixConfig = Field(default_factory=MatrixConfig)
     wecom: WeComConfig = Field(default_factory=WeComConfig)
+    signal: SignalConfig = Field(default_factory=SignalConfig)
 
 
 class MemoryConfig(Base):
@@ -260,12 +301,17 @@ class CompactionConfig(Base):
 
     reserve_tokens_floor: int = 12000
     memory_flush: MemoryFlushConfig = Field(default_factory=MemoryFlushConfig)
+    session_ttl_minutes: int = Field(
+        default=0,
+        ge=0,
+        validation_alias=AliasChoices("idleCompactAfterMinutes", "sessionTtlMinutes", "session_ttl_minutes"),
+        serialization_alias="idleCompactAfterMinutes",
+    )
 
 
-class AgentDefaults(Base):
-    """Default agent configuration."""
+class GenerationConfig(Base):
+    """Shared model generation settings."""
 
-    workspace: str = "~/.yuanclaw/workspace"
     model: str = "anthropic/claude-opus-4-5"
     provider: str = (
         "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
@@ -273,11 +319,53 @@ class AgentDefaults(Base):
     max_tokens: int = 8192
     context_window_tokens: int = 65536
     temperature: float = 0.1
+    reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
+
+
+class InlineFallbackConfig(Base):
+    """Inline fallback model configuration."""
+
+    model: str
+    provider: str = "auto"
+    max_tokens: int | None = None
+    context_window_tokens: int | None = None
+    temperature: float | None = None
+    reasoning_effort: str | None = None
+
+
+class ModelPresetConfig(GenerationConfig):
+    """Named model preset configuration."""
+
+    def to_generation_settings(self):
+        from yuanclaw.providers.base import GenerationSettings
+
+        return GenerationSettings(
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            reasoning_effort=self.reasoning_effort,
+        )
+
+
+class AgentDefaults(GenerationConfig):
+    """Default agent configuration."""
+
+    workspace: str = "~/.yuanclaw/workspace"
     max_tool_iterations: int = 40
+    max_concurrent_subagents: int = Field(default=1, ge=1)
     memory_window: int = 100
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
-    reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
+    fallback_models: list[str | InlineFallbackConfig] = Field(default_factory=list)
+
+    def to_model_preset(self) -> ModelPresetConfig:
+        return ModelPresetConfig(
+            model=self.model,
+            provider=self.provider,
+            max_tokens=self.max_tokens,
+            context_window_tokens=self.context_window_tokens,
+            temperature=self.temperature,
+            reasoning_effort=self.reasoning_effort,
+        )
 
 
 class AgentsConfig(Base):
@@ -292,6 +380,10 @@ class ProviderConfig(Base):
     api_key: str = ""
     api_base: str | None = None
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
+    extra_body: dict[str, Any] | None = None
+    api_type: str = "auto"
+    region: str | None = None
+    profile: str | None = None
 
 
 class ProvidersConfig(Base):
@@ -302,6 +394,9 @@ class ProvidersConfig(Base):
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
     openai: ProviderConfig = Field(default_factory=ProviderConfig)
     openrouter: ProviderConfig = Field(default_factory=ProviderConfig)
+    huggingface: ProviderConfig = Field(default_factory=ProviderConfig)
+    skywork: ProviderConfig = Field(default_factory=ProviderConfig)
+    bedrock: ProviderConfig = Field(default_factory=ProviderConfig)
     deepseek: ProviderConfig = Field(default_factory=ProviderConfig)
     groq: ProviderConfig = Field(default_factory=ProviderConfig)
     zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -312,13 +407,23 @@ class ProvidersConfig(Base):
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
+    minimax_anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
     mistral: ProviderConfig = Field(default_factory=ProviderConfig)
+    stepfun: ProviderConfig = Field(default_factory=ProviderConfig)
+    xiaomi_mimo: ProviderConfig = Field(default_factory=ProviderConfig)
+    longcat: ProviderConfig = Field(default_factory=ProviderConfig)
+    ant_ling: ProviderConfig = Field(default_factory=ProviderConfig)
     aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
     siliconflow: ProviderConfig = Field(default_factory=ProviderConfig)  # SiliconFlow (硅基流动)
+    novita: ProviderConfig = Field(default_factory=ProviderConfig)
     volcengine: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine (火山引擎)
     volcengine_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)
     byteplus: ProviderConfig = Field(default_factory=ProviderConfig)
     byteplus_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)
+    lm_studio: ProviderConfig = Field(default_factory=ProviderConfig)
+    atomic_chat: ProviderConfig = Field(default_factory=ProviderConfig)
+    nvidia: ProviderConfig = Field(default_factory=ProviderConfig)
+    qianfan: ProviderConfig = Field(default_factory=ProviderConfig)
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenAI Codex (OAuth)
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig)  # Github Copilot (OAuth)
 
@@ -335,7 +440,23 @@ class GatewayConfig(Base):
 
     host: str = "0.0.0.0"
     port: int = 18790
+    token: str = ""
+    token_issue_path: str = "/api/auth/token"
+    token_issue_secret: str = ""
+    token_ttl_s: int = Field(default=300, ge=30, le=86_400)
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
+
+    @field_validator("token_issue_path")
+    @classmethod
+    def token_issue_path_format(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            return ""
+        if not value.startswith("/"):
+            raise ValueError('token_issue_path must start with "/"')
+        if len(value) > 1 and value.endswith("/"):
+            return value.rstrip("/")
+        return value
 
 
 class WebSearchConfig(Base):
@@ -356,6 +477,25 @@ class WebToolsConfig(Base):
     search: WebSearchConfig = Field(default_factory=WebSearchConfig)
 
 
+class ImageGenerationToolConfig(Base):
+    """Image generation tool configuration."""
+
+    enabled: bool = False
+    provider: str = "openrouter"
+    model: str = "openai/gpt-5.4-image-2"
+    default_aspect_ratio: str = "1:1"
+    default_image_size: str = "1K"
+    max_images_per_turn: int = Field(default=4, ge=1, le=8)
+    save_dir: str = "generated"
+
+
+class CliAppsToolConfig(Base):
+    """CLI Apps tool configuration."""
+
+    enabled: bool = False
+    run_timeout: int = Field(default=60, ge=1, le=600)
+
+
 class ExecToolConfig(Base):
     """Shell exec tool configuration."""
 
@@ -370,8 +510,10 @@ class MCPServerConfig(Base):
     command: str = ""  # Stdio: command to run (e.g. "npx")
     args: list[str] = Field(default_factory=list)  # Stdio: command arguments
     env: dict[str, str] = Field(default_factory=dict)  # Stdio: extra env vars
+    cwd: str = ""  # Stdio: working directory
     url: str = ""  # HTTP/SSE: endpoint URL
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
+    enabled_tools: list[str] = Field(default_factory=list)
     tool_timeout: int = 30  # seconds before a tool call is cancelled
 
 
@@ -379,6 +521,8 @@ class ToolsConfig(Base):
     """Tools configuration."""
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
+    image_generation: ImageGenerationToolConfig = Field(default_factory=ImageGenerationToolConfig)
+    cli_apps: CliAppsToolConfig = Field(default_factory=CliAppsToolConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
@@ -392,24 +536,35 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    model_presets: dict[str, ModelPresetConfig] = Field(default_factory=dict)
 
     @property
     def workspace_path(self) -> Path:
         """Get expanded workspace path."""
         return Path(self.agents.defaults.workspace).expanduser()
 
+    def resolve_preset(self, preset_name: str | None = None) -> ModelPresetConfig:
+        """Resolve a named model preset or the defaults as a preset object."""
+        if not preset_name:
+            return self.agents.defaults.to_model_preset()
+        try:
+            return self.model_presets[preset_name]
+        except KeyError as exc:
+            raise KeyError(f"Unknown model preset: {preset_name}") from exc
+
     def _match_provider(
-        self, model: str | None = None
+        self, model: str | None = None, preset: ModelPresetConfig | None = None
     ) -> tuple["ProviderConfig | None", str | None]:
         """Match provider config and its registry name. Returns (config, spec_name)."""
         from yuanclaw.providers.registry import PROVIDERS
 
-        forced = self.agents.defaults.provider
+        preset = preset or self.resolve_preset()
+        forced = preset.provider
         if forced != "auto":
             p = getattr(self.providers, forced, None)
             return (p, forced) if p else (None, None)
 
-        model_lower = (model or self.agents.defaults.model).lower()
+        model_lower = (model or preset.model).lower()
         model_normalized = model_lower.replace("-", "_")
         model_prefix = model_lower.split("/", 1)[0] if "/" in model_lower else ""
         normalized_prefix = model_prefix.replace("-", "_")
@@ -418,18 +573,32 @@ class Config(BaseSettings):
             kw = kw.lower()
             return kw in model_lower or kw.replace("-", "_") in model_normalized
 
+        def _provider_is_configured(
+            p: ProviderConfig,
+            spec_name: str,
+            *,
+            explicit_model_prefix: bool = False,
+        ) -> bool:
+            if spec_name == "bedrock":
+                return explicit_model_prefix or bool(p.api_key or p.api_base or p.region or p.profile)
+            return bool(p.api_key)
+
         # Explicit provider prefix wins — prevents `github-copilot/...codex` matching openai_codex.
         for spec in PROVIDERS:
             p = getattr(self.providers, spec.name, None)
             if p and model_prefix and normalized_prefix == spec.name:
-                if spec.is_oauth or spec.is_local or p.api_key:
+                if (
+                    spec.is_oauth
+                    or spec.is_local
+                    or _provider_is_configured(p, spec.name, explicit_model_prefix=True)
+                ):
                     return p, spec.name
 
         # Match by keyword (order follows PROVIDERS registry)
         for spec in PROVIDERS:
             p = getattr(self.providers, spec.name, None)
             if p and any(_kw_matches(kw) for kw in spec.keywords):
-                if spec.is_oauth or spec.is_local or p.api_key:
+                if spec.is_oauth or spec.is_local or _provider_is_configured(p, spec.name):
                     return p, spec.name
 
         # Local providers can route plain model names when api_base is configured.
@@ -453,38 +622,46 @@ class Config(BaseSettings):
             if spec.is_oauth:
                 continue
             p = getattr(self.providers, spec.name, None)
-            if p and (p.api_key or (spec.is_local and p.api_base)):
+            if p and (
+                _provider_is_configured(p, spec.name)
+                or (spec.is_local and p.api_base)
+            ):
                 return p, spec.name
         return None, None
 
-    def get_provider(self, model: str | None = None) -> ProviderConfig | None:
+    def get_provider(
+        self, model: str | None = None, preset: ModelPresetConfig | None = None
+    ) -> ProviderConfig | None:
         """Get matched provider config (api_key, api_base, extra_headers). Falls back to first available."""
-        p, _ = self._match_provider(model)
+        p, _ = self._match_provider(model, preset=preset)
         return p
 
-    def get_provider_name(self, model: str | None = None) -> str | None:
+    def get_provider_name(
+        self, model: str | None = None, preset: ModelPresetConfig | None = None
+    ) -> str | None:
         """Get the registry name of the matched provider (e.g. "deepseek", "openrouter")."""
-        _, name = self._match_provider(model)
+        _, name = self._match_provider(model, preset=preset)
         return name
 
-    def get_api_key(self, model: str | None = None) -> str | None:
+    def get_api_key(
+        self, model: str | None = None, preset: ModelPresetConfig | None = None
+    ) -> str | None:
         """Get API key for the given model. Falls back to first available key."""
-        p = self.get_provider(model)
+        p = self.get_provider(model, preset=preset)
         return p.api_key if p else None
 
-    def get_api_base(self, model: str | None = None) -> str | None:
+    def get_api_base(
+        self, model: str | None = None, preset: ModelPresetConfig | None = None
+    ) -> str | None:
         """Get API base URL for the given model. Applies default URLs for known routed providers."""
         from yuanclaw.providers.registry import find_by_name
 
-        p, name = self._match_provider(model)
+        p, name = self._match_provider(model, preset=preset)
         if p and p.api_base:
             return p.api_base
-        # Routed providers (gateways/local/direct OpenAI-compatible backends)
-        # can safely use a default api_base here. Standard cloud providers
-        # still rely on provider-specific env setup in LiteLLM.
         if name:
             spec = find_by_name(name)
-            if spec and spec.default_api_base and (spec.is_gateway or spec.is_local or spec.is_direct):
+            if spec and spec.default_api_base:
                 return spec.default_api_base
         return None
 

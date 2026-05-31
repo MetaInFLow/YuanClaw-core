@@ -288,64 +288,9 @@ def onboard():
 
 def _make_provider(config: Config):
     """Create the appropriate LLM provider from config."""
-    from yuanclaw.providers.azure_openai_provider import AzureOpenAIProvider
-    from yuanclaw.providers.custom_provider import CustomProvider
-    from yuanclaw.providers.openai_codex_provider import OpenAICodexProvider
+    from yuanclaw.providers.factory import make_provider
 
-    model = config.agents.defaults.model
-    provider_name = config.get_provider_name(model)
-    p = config.get_provider(model)
-
-    # OpenAI Codex (OAuth)
-    if provider_name == "openai_codex" or model.startswith("openai-codex/"):
-        return OpenAICodexProvider(default_model=model)
-
-    # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
-    if provider_name == "custom":
-        return CustomProvider(
-            api_key=p.api_key if p else "no-key",
-            api_base=config.get_api_base(model) or "http://localhost:8000/v1",
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-        )
-
-    # Azure OpenAI: direct Azure OpenAI endpoint with deployment name
-    if provider_name == "azure_openai":
-        if not p or not p.api_key or not p.api_base:
-            console.print("[red]Error: Azure OpenAI requires api_key and api_base.[/red]")
-            console.print("Set them in ~/.yuanclaw/config.json under providers.azure_openai section")
-            console.print("Use the model field to specify the deployment name.")
-            raise typer.Exit(1)
-
-        return AzureOpenAIProvider(
-            api_key=p.api_key,
-            api_base=p.api_base,
-            default_model=model,
-        )
-
-    if provider_name == "ovms":
-        return CustomProvider(
-            api_key=p.api_key if p else "no-key",
-            api_base=config.get_api_base(model) or "http://localhost:8000/v3",
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-        )
-
-    from yuanclaw.providers.litellm_provider import LiteLLMProvider
-    from yuanclaw.providers.registry import find_by_name
-    spec = find_by_name(provider_name)
-    if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and (spec.is_oauth or spec.is_local)):
-        console.print("[red]Error: No API key configured.[/red]")
-        console.print("Set one in ~/.yuanclaw/config.json under providers section")
-        raise typer.Exit(1)
-
-    return LiteLLMProvider(
-        api_key=p.api_key if p else None,
-        api_base=config.get_api_base(model),
-        default_model=model,
-        extra_headers=p.extra_headers if p else None,
-        provider_name=provider_name,
-    )
+    return make_provider(config)
 
 
 def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
@@ -421,6 +366,7 @@ def gateway(
     from yuanclaw.cron.service import CronService
     from yuanclaw.cron.types import CronJob
     from yuanclaw.heartbeat.service import HeartbeatService
+    from yuanclaw.providers.image_generation import image_gen_provider_configs
     from yuanclaw.session.manager import SessionManager
 
     if verbose:
@@ -465,6 +411,9 @@ def gateway(
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        image_generation_config=config.tools.image_generation,
+        image_generation_provider_configs=image_gen_provider_configs(config),
+        max_concurrent_subagents=config.agents.defaults.max_concurrent_subagents,
     )
 
     # Set cron callback (needs agent)
@@ -616,6 +565,7 @@ def agent(
     from yuanclaw.bus.queue import MessageBus
     from yuanclaw.config.paths import get_cron_dir
     from yuanclaw.cron.service import CronService
+    from yuanclaw.providers.image_generation import image_gen_provider_configs
 
     config = _load_runtime_config(config, workspace)
     sync_workspace_templates(config.workspace_path)
@@ -655,6 +605,9 @@ def agent(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        image_generation_config=config.tools.image_generation,
+        image_generation_provider_configs=image_gen_provider_configs(config),
+        max_concurrent_subagents=config.agents.defaults.max_concurrent_subagents,
     )
 
     async def _cli_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -999,6 +952,64 @@ def channels_login():
         console.print(f"[red]Bridge failed: {e}[/red]")
     except FileNotFoundError:
         console.print("[red]npm not found. Please install Node.js.[/red]")
+
+
+@channels_app.command("pairings")
+def channels_pairings():
+    """List pending channel pairing codes."""
+    from yuanclaw.pairing import list_pending
+
+    pending = list_pending()
+    table = Table(title="Pending Pairings")
+    table.add_column("Code", style="cyan")
+    table.add_column("Channel", style="green")
+    table.add_column("Sender", style="yellow")
+    table.add_column("Expires At", style="dim")
+
+    for item in pending:
+        table.add_row(
+            str(item.get("code") or ""),
+            str(item.get("channel") or ""),
+            str(item.get("sender_id") or ""),
+            str(item.get("expires_at") or ""),
+        )
+
+    console.print(table)
+
+
+@channels_app.command("approve-pairing")
+def channels_approve_pairing(code: str):
+    """Approve a pending channel pairing code."""
+    from yuanclaw.pairing import approve_code
+
+    approved = approve_code(code)
+    if approved is None:
+        console.print(f"[red]Pairing code not found or expired: {code}[/red]")
+        raise typer.Exit(1)
+    channel, sender_id = approved
+    console.print(f"[green]Approved[/green] {channel}:{sender_id}")
+
+
+@channels_app.command("deny-pairing")
+def channels_deny_pairing(code: str):
+    """Deny and remove a pending channel pairing code."""
+    from yuanclaw.pairing import deny_code
+
+    if not deny_code(code):
+        console.print(f"[red]Pairing code not found or expired: {code}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[yellow]Denied[/yellow] {code}")
+
+
+@channels_app.command("revoke-pairing")
+def channels_revoke_pairing(channel: str, sender_id: str):
+    """Revoke an approved channel sender."""
+    from yuanclaw.pairing import revoke
+
+    if not revoke(channel, sender_id):
+        console.print(f"[red]Approved sender not found: {channel}:{sender_id}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[yellow]Revoked[/yellow] {channel}:{sender_id}")
 
 
 # ============================================================================

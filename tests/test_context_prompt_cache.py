@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import datetime as datetime_module
 from datetime import datetime as real_datetime
 from importlib.resources import files as pkg_files
 from pathlib import Path
-import datetime as datetime_module
 
 from yuanclaw.agent.context import ContextBuilder
 
@@ -71,3 +71,63 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     assert "Channel: cli" in user_content
     assert "Chat ID: direct" in user_content
     assert "Return exactly: OK" in user_content
+
+
+def test_runtime_context_includes_active_goal_metadata(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="Continue.",
+        channel="cli",
+        chat_id="direct",
+        session_metadata={
+            "goal_state": {
+                "status": "active",
+                "objective": "Finish the core-only feature sync.",
+                "ui_summary": "core sync",
+            }
+        },
+    )
+
+    user_content = messages[-1]["content"]
+    assert isinstance(user_content, str)
+    assert "Goal (active):" in user_content
+    assert "Finish the core-only feature sync." in user_content
+    assert "Summary: core sync" in user_content
+
+
+def test_runtime_context_includes_cli_apps_and_mcp_presets(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="Use the attached integrations.",
+        channel="studio",
+        chat_id="thread",
+        session_metadata={
+            "cli_apps": [
+                {
+                    "name": "obsidian",
+                    "entry_point": "obsidian-cli",
+                }
+            ],
+            "mcp_presets": [
+                {
+                    "name": "github",
+                    "display_name": "GitHub",
+                    "transport": "stdio",
+                }
+            ],
+        },
+    )
+
+    user_content = messages[-1]["content"]
+    assert isinstance(user_content, str)
+    assert "CLI App Attachment: @obsidian" in user_content
+    assert "tool=run_cli_app" in user_content
+    assert "entry_point=obsidian-cli" in user_content
+    assert "MCP Preset Attachment: @github" in user_content
+    assert "tool_prefix=mcp_github_" in user_content

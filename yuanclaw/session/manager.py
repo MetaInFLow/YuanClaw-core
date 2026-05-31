@@ -79,6 +79,38 @@ def _assistant_usage_snapshot(message: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _attachment_breadcrumbs(message: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    cli_apps = message.get("cli_apps")
+    if isinstance(cli_apps, list):
+        for item in cli_apps[:8]:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip().lower()
+            if not name:
+                continue
+            entry_point = str(item.get("entry_point") or "unknown").strip() or "unknown"
+            lines.append(
+                "CLI App Attachment: "
+                f"@{name} (tool=run_cli_app; entry_point={entry_point})."
+            )
+
+    mcp_presets = message.get("mcp_presets")
+    if isinstance(mcp_presets, list):
+        for item in mcp_presets[:8]:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip().lower()
+            if not name:
+                continue
+            transport = str(item.get("transport") or "mcp").strip() or "mcp"
+            lines.append(
+                "MCP Preset Attachment: "
+                f"@{name} (transport={transport}; tool_prefix=mcp_{name}_)."
+            )
+    return lines
+
+
 @dataclass
 class Session:
     """
@@ -123,6 +155,10 @@ class Session:
         out: list[dict[str, Any]] = []
         for m in sliced:
             entry: dict[str, Any] = {"role": m["role"], "content": m.get("content", "")}
+            if m.get("role") == "user" and isinstance(entry["content"], str):
+                breadcrumbs = _attachment_breadcrumbs(m)
+                if breadcrumbs:
+                    entry["content"] = "\n".join(breadcrumbs + ["", entry["content"]])
             for k in ("tool_calls", "tool_call_id", "name"):
                 if k in m:
                     entry[k] = m[k]
@@ -260,6 +296,32 @@ class SessionManager:
                 f.write(json.dumps(msg, ensure_ascii=False) + "\n")
 
         self._cache[session.key] = session
+
+    def read_session_file(self, key: str) -> dict[str, Any] | None:
+        """Read a session without creating it when missing."""
+        session = self._cache.get(key)
+        if session is not None:
+            return {
+                "key": session.key,
+                "created_at": session.created_at.isoformat(),
+                "updated_at": session.updated_at.isoformat(),
+                "metadata": dict(session.metadata),
+                "last_consolidated": session.last_consolidated,
+                "messages": [dict(message) for message in session.messages],
+            }
+
+        loaded = self._load(key)
+        if loaded is None:
+            return None
+        self._cache[key] = loaded
+        return {
+            "key": loaded.key,
+            "created_at": loaded.created_at.isoformat(),
+            "updated_at": loaded.updated_at.isoformat(),
+            "metadata": dict(loaded.metadata),
+            "last_consolidated": loaded.last_consolidated,
+            "messages": [dict(message) for message in loaded.messages],
+        }
 
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""

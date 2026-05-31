@@ -24,3 +24,5 @@ The skill format and metadata structure follow OpenClaw's conventions to maintai
 | `clawhub` | Search and install skills from ClawHub registry |
 | `skill-creator` | Create new skills |
 | `cowdy-studio-cli` | Operate Cowdy Studio through bundled CLI and backend surfaces |
+| `long-goal` | Manage sustained long-running objectives with `long_task` and `complete_goal` |
+| `image-generation` | Generate images and iteratively edit saved image artifacts |

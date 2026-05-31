@@ -115,6 +115,171 @@ class TestMessageToolSuppressLogic:
             ('read_file("foo.txt")', True),
         ]
 
+    async def test_progress_includes_structured_tool_start_and_finish_events(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(id="call1", name="read_file", arguments={"path": "foo.txt"})
+        calls = iter([
+            LLMResponse(content="Checking", tool_calls=[tool_call]),
+            LLMResponse(content="Done", tool_calls=[]),
+        ])
+        loop.provider.chat = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.execute = AsyncMock(return_value="file contents")
+
+        progress: list[dict] = []
+
+        async def on_progress(
+            content: str,
+            *,
+            tool_hint: bool = False,
+            tool_events: list[dict] | None = None,
+        ) -> None:
+            progress.append(
+                {
+                    "content": content,
+                    "tool_hint": tool_hint,
+                    "tool_events": tool_events,
+                }
+            )
+
+        final_content, _, _, _ = await loop._run_agent_loop([], on_progress=on_progress)
+
+        assert final_content == "Done"
+        assert progress[1]["tool_hint"] is True
+        assert progress[1]["tool_events"] == [
+            {
+                "version": 1,
+                "phase": "start",
+                "call_id": "call1",
+                "name": "read_file",
+                "arguments": {"path": "foo.txt"},
+                "result": None,
+                "error": None,
+                "files": [],
+                "embeds": [],
+            }
+        ]
+        assert progress[2]["tool_events"] == [
+            {
+                "version": 1,
+                "phase": "end",
+                "call_id": "call1",
+                "name": "read_file",
+                "arguments": {"path": "foo.txt"},
+                "result": "file contents",
+                "error": None,
+                "files": [],
+                "embeds": [],
+            }
+        ]
+
+    async def test_progress_includes_apply_patch_file_edit_events(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(
+            id="call1",
+            name="apply_patch",
+            arguments={
+                "edits": [
+                    {
+                        "path": "demo.txt",
+                        "action": "replace",
+                        "old_text": "old",
+                        "new_text": "new",
+                    }
+                ]
+            },
+        )
+        calls = iter([
+            LLMResponse(content="Editing", tool_calls=[tool_call]),
+            LLMResponse(content="Done", tool_calls=[]),
+        ])
+        loop.provider.chat = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.execute = AsyncMock(return_value="Patch applied:\n- update demo.txt (+1/-1)")
+
+        progress: list[dict] = []
+
+        async def on_progress(
+            content: str,
+            *,
+            tool_hint: bool = False,
+            tool_events: list[dict] | None = None,
+            file_edit_events: list[dict] | None = None,
+        ) -> None:
+            progress.append(
+                {
+                    "content": content,
+                    "tool_hint": tool_hint,
+                    "tool_events": tool_events,
+                    "file_edit_events": file_edit_events,
+                }
+            )
+
+        final_content, _, _, _ = await loop._run_agent_loop([], on_progress=on_progress)
+
+        assert final_content == "Done"
+        assert progress[1]["file_edit_events"] == [
+            {
+                "version": 1,
+                "phase": "start",
+                "call_id": "call1",
+                "tool": "apply_patch",
+                "path": "demo.txt",
+                "action": "replace",
+                "error": None,
+            }
+        ]
+        assert progress[2]["file_edit_events"] == [
+            {
+                "version": 1,
+                "phase": "end",
+                "call_id": "call1",
+                "tool": "apply_patch",
+                "path": "demo.txt",
+                "action": "replace",
+                "error": None,
+            }
+        ]
+
+    async def test_progress_marks_apply_patch_file_edit_errors(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(
+            id="call1",
+            name="apply_patch",
+            arguments={"edits": [{"path": "demo.txt", "action": "replace"}]},
+        )
+        calls = iter([
+            LLMResponse(content="", tool_calls=[tool_call]),
+            LLMResponse(content="Done", tool_calls=[]),
+        ])
+        loop.provider.chat = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.execute = AsyncMock(return_value="Error: old_text required")
+
+        progress: list[list[dict] | None] = []
+
+        async def on_progress(
+            content: str,
+            *,
+            tool_hint: bool = False,
+            file_edit_events: list[dict] | None = None,
+        ) -> None:
+            progress.append(file_edit_events)
+
+        await loop._run_agent_loop([], on_progress=on_progress)
+
+        assert progress[-1] == [
+            {
+                "version": 1,
+                "phase": "error",
+                "call_id": "call1",
+                "tool": "apply_patch",
+                "path": "demo.txt",
+                "action": "replace",
+                "error": "Error: old_text required",
+            }
+        ]
+
 
 class TestMessageToolTurnTracking:
 

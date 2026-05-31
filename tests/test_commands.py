@@ -7,6 +7,7 @@ from typer.testing import CliRunner
 
 from yuanclaw.cli.commands import app
 from yuanclaw.config.schema import Config
+from yuanclaw.pairing import generate_code, is_approved
 from yuanclaw.providers.litellm_provider import LiteLLMProvider
 from yuanclaw.providers.openai_codex_provider import _strip_model_prefix
 from yuanclaw.providers.registry import find_by_model
@@ -14,7 +15,7 @@ from yuanclaw.providers.registry import find_by_model
 runner = CliRunner()
 
 
-class _StopGateway(RuntimeError):
+class _StopGatewayError(RuntimeError):
     pass
 
 
@@ -23,7 +24,7 @@ def mock_paths():
     """Mock config/workspace paths for test isolation."""
     with patch("yuanclaw.config.loader.get_config_path") as mock_cp, \
          patch("yuanclaw.config.loader.save_config") as mock_sc, \
-         patch("yuanclaw.config.loader.load_config") as mock_lc, \
+         patch("yuanclaw.config.loader.load_config"), \
          patch("yuanclaw.cli.commands.get_workspace_path") as mock_ws:
 
         base_dir = Path("./test_onboard_data")
@@ -132,6 +133,42 @@ def test_litellm_provider_canonicalizes_github_copilot_hyphen_prefix():
 def test_openai_codex_strip_prefix_supports_hyphen_and_underscore():
     assert _strip_model_prefix("openai-codex/gpt-5.1-codex") == "gpt-5.1-codex"
     assert _strip_model_prefix("openai_codex/gpt-5.1-codex") == "gpt-5.1-codex"
+
+
+def test_channels_pairings_list_and_approve(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("yuanclaw.config.paths.get_config_path", lambda: tmp_path / "config.json")
+    code = generate_code("signal", "+15550002222", ttl=60)
+
+    result = runner.invoke(app, ["channels", "pairings"])
+
+    assert result.exit_code == 0
+    assert code in result.stdout
+    assert "+15550002222" in result.stdout
+
+    result = runner.invoke(app, ["channels", "approve-pairing", code])
+
+    assert result.exit_code == 0
+    assert "Approved" in result.stdout
+    assert is_approved("signal", "+15550002222") is True
+
+
+def test_channels_pairings_deny_and_revoke(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("yuanclaw.config.paths.get_config_path", lambda: tmp_path / "config.json")
+    code = generate_code("signal", "+15550003333", ttl=60)
+
+    result = runner.invoke(app, ["channels", "deny-pairing", code])
+
+    assert result.exit_code == 0
+    assert "Denied" in result.stdout
+
+    code = generate_code("signal", "+15550004444", ttl=60)
+    assert runner.invoke(app, ["channels", "approve-pairing", code]).exit_code == 0
+
+    result = runner.invoke(app, ["channels", "revoke-pairing", "signal", "+15550004444"])
+
+    assert result.exit_code == 0
+    assert "Revoked" in result.stdout
+    assert is_approved("signal", "+15550004444") is False
 
 
 @pytest.fixture
@@ -287,12 +324,12 @@ def test_gateway_uses_workspace_from_config_by_default(monkeypatch, tmp_path: Pa
     )
     monkeypatch.setattr(
         "yuanclaw.cli.commands._make_provider",
-        lambda _config: (_ for _ in ()).throw(_StopGateway("stop")),
+        lambda _config: (_ for _ in ()).throw(_StopGatewayError("stop")),
     )
 
     result = runner.invoke(app, ["gateway", "--config", str(config_file)])
 
-    assert isinstance(result.exception, _StopGateway)
+    assert isinstance(result.exception, _StopGatewayError)
     assert seen["config_path"] == config_file.resolve()
     assert seen["workspace"] == Path(config.agents.defaults.workspace)
 
@@ -315,7 +352,7 @@ def test_gateway_workspace_option_overrides_config(monkeypatch, tmp_path: Path) 
     )
     monkeypatch.setattr(
         "yuanclaw.cli.commands._make_provider",
-        lambda _config: (_ for _ in ()).throw(_StopGateway("stop")),
+        lambda _config: (_ for _ in ()).throw(_StopGatewayError("stop")),
     )
 
     result = runner.invoke(
@@ -323,7 +360,7 @@ def test_gateway_workspace_option_overrides_config(monkeypatch, tmp_path: Path) 
         ["gateway", "--config", str(config_file), "--workspace", str(override)],
     )
 
-    assert isinstance(result.exception, _StopGateway)
+    assert isinstance(result.exception, _StopGatewayError)
     assert seen["workspace"] == override
     assert config.workspace_path == override
 
@@ -347,13 +384,13 @@ def test_gateway_uses_config_directory_for_cron_store(monkeypatch, tmp_path: Pat
     class _StopCron:
         def __init__(self, store_path: Path) -> None:
             seen["cron_store"] = store_path
-            raise _StopGateway("stop")
+            raise _StopGatewayError("stop")
 
     monkeypatch.setattr("yuanclaw.cron.service.CronService", _StopCron)
 
     result = runner.invoke(app, ["gateway", "--config", str(config_file)])
 
-    assert isinstance(result.exception, _StopGateway)
+    assert isinstance(result.exception, _StopGatewayError)
     assert seen["cron_store"] == config_file.parent / "cron" / "jobs.json"
 
 
@@ -370,12 +407,12 @@ def test_gateway_uses_configured_port_when_cli_flag_is_missing(monkeypatch, tmp_
     monkeypatch.setattr("yuanclaw.cli.commands.sync_workspace_templates", lambda _path: None)
     monkeypatch.setattr(
         "yuanclaw.cli.commands._make_provider",
-        lambda _config: (_ for _ in ()).throw(_StopGateway("stop")),
+        lambda _config: (_ for _ in ()).throw(_StopGatewayError("stop")),
     )
 
     result = runner.invoke(app, ["gateway", "--config", str(config_file)])
 
-    assert isinstance(result.exception, _StopGateway)
+    assert isinstance(result.exception, _StopGatewayError)
     assert "port 18791" in result.stdout
 
 
@@ -392,10 +429,10 @@ def test_gateway_cli_port_overrides_configured_port(monkeypatch, tmp_path: Path)
     monkeypatch.setattr("yuanclaw.cli.commands.sync_workspace_templates", lambda _path: None)
     monkeypatch.setattr(
         "yuanclaw.cli.commands._make_provider",
-        lambda _config: (_ for _ in ()).throw(_StopGateway("stop")),
+        lambda _config: (_ for _ in ()).throw(_StopGatewayError("stop")),
     )
 
     result = runner.invoke(app, ["gateway", "--config", str(config_file), "--port", "18792"])
 
-    assert isinstance(result.exception, _StopGateway)
+    assert isinstance(result.exception, _StopGatewayError)
     assert "port 18792" in result.stdout

@@ -8,6 +8,11 @@ from typing import Any
 
 from yuanclaw.agent.memory import MemoryStore
 from yuanclaw.agent.skills import SkillsLoader
+from yuanclaw.apps.cli import cli_app_runtime_lines
+from yuanclaw.apps.mcp_presets import mcp_preset_runtime_lines
+from yuanclaw.security.workspace_access import current_tool_workspace
+from yuanclaw.security.workspace_policy import WorkspaceBoundaryError, resolve_allowed_path
+from yuanclaw.session.goal_state import goal_state_runtime_lines
 from yuanclaw.utils.helpers import build_assistant_message, current_time_str, detect_image_mime
 
 
@@ -99,11 +104,21 @@ Your workspace is at: {workspace_path}
 Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel."""
 
     @staticmethod
-    def _build_runtime_context(channel: str | None, chat_id: str | None) -> str:
+    def _build_runtime_context(
+        channel: str | None,
+        chat_id: str | None,
+        session_metadata: dict[str, Any] | None = None,
+        session_summary: str | None = None,
+    ) -> str:
         """Build untrusted runtime metadata block for injection before the user message."""
         lines = [f"Current Time: {current_time_str()}"]
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
+        if session_summary:
+            lines.extend(["", session_summary])
+        lines.extend(goal_state_runtime_lines(session_metadata))
+        lines.extend(cli_app_runtime_lines(session_metadata))
+        lines.extend(mcp_preset_runtime_lines(session_metadata))
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
     def _load_bootstrap_files(self) -> str:
@@ -127,9 +142,11 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         channel: str | None = None,
         chat_id: str | None = None,
         memory_context: str | None = None,
+        session_metadata: dict[str, Any] | None = None,
+        session_summary: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
-        runtime_ctx = self._build_runtime_context(channel, chat_id)
+        runtime_ctx = self._build_runtime_context(channel, chat_id, session_metadata, session_summary)
         user_content = self._build_user_content(current_message, media)
 
         # Merge runtime context and user content into a single user message
@@ -152,7 +169,15 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
         images = []
         for path in media:
-            p = Path(path)
+            try:
+                tool_workspace = current_tool_workspace(self.workspace)
+                p = resolve_allowed_path(
+                    path,
+                    workspace=tool_workspace.project_path or self.workspace,
+                    allowed_root=tool_workspace.allowed_root,
+                )
+            except WorkspaceBoundaryError:
+                continue
             if not p.is_file():
                 continue
             raw = p.read_bytes()

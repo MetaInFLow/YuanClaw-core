@@ -42,7 +42,11 @@ class MessageTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Send a message to the user. Use this when you want to communicate something."
+        return (
+            "Send a message to the user. Use this when you want to communicate something. "
+            "When generate_image creates images in the current chat, use the artifact paths "
+            "in media to deliver the images to the user."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:

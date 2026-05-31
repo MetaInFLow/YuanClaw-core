@@ -6,6 +6,15 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+@dataclass(frozen=True)
+class GenerationSettings:
+    """Default generation settings for provider factories."""
+
+    temperature: float = 0.7
+    max_tokens: int = 4096
+    reasoning_effort: str | None = None
+
+
 @dataclass
 class ToolCallRequest:
     """A tool call request from the LLM."""
@@ -23,17 +32,28 @@ class LLMResponse:
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None  # Kimi, DeepSeek-R1 etc.
     thinking_blocks: list[dict] | None = None  # Anthropic extended thinking
-    
+    error_status_code: int | None = None
+    error_kind: str | None = None
+    error_type: str | None = None
+    error_code: str | None = None
+    error_retry_after_s: float | None = None
+    error_should_retry: bool | None = None
+
     @property
     def has_tool_calls(self) -> bool:
         """Check if response contains tool calls."""
         return len(self.tool_calls) > 0
 
+    @property
+    def should_execute_tools(self) -> bool:
+        """Only execute model tool calls for tool-capable finish reasons."""
+        return self.has_tool_calls and self.finish_reason in ("tool_calls", "function_call", "stop")
+
 
 class LLMProvider(ABC):
     """
     Abstract base class for LLM providers.
-    
+
     Implementations should handle the specifics of each provider's API
     while maintaining a consistent interface.
     """
@@ -41,6 +61,7 @@ class LLMProvider(ABC):
     def __init__(self, api_key: str | None = None, api_base: str | None = None):
         self.api_key = api_key
         self.api_base = api_base
+        self.generation: GenerationSettings = GenerationSettings()
 
     @staticmethod
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -115,14 +136,14 @@ class LLMProvider(ABC):
     ) -> LLMResponse:
         """
         Send a chat completion request.
-        
+
         Args:
             messages: List of message dicts with 'role' and 'content'.
             tools: Optional list of tool definitions.
             model: Model identifier (provider-specific).
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
-        
+
         Returns:
             LLMResponse with content and/or tool calls.
         """

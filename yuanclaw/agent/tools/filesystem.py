@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from yuanclaw.agent.tools.base import Tool
+from yuanclaw.security.workspace_access import current_tool_workspace
+from yuanclaw.security.workspace_policy import resolve_allowed_path
 from yuanclaw.utils.helpers import build_image_content_blocks, detect_image_mime
 
 
@@ -13,16 +15,15 @@ def _resolve_path(
     path: str, workspace: Path | None = None, allowed_dir: Path | None = None
 ) -> Path:
     """Resolve path against workspace (if relative) and enforce directory restriction."""
-    p = Path(path).expanduser()
-    if not p.is_absolute() and workspace:
-        p = workspace / p
-    resolved = p.resolve()
-    if allowed_dir:
-        try:
-            resolved.relative_to(allowed_dir.resolve())
-        except ValueError:
-            raise PermissionError(f"Path {path} is outside allowed directory {allowed_dir}")
-    return resolved
+    tool_workspace = current_tool_workspace(
+        workspace,
+        restrict_to_workspace=allowed_dir is not None,
+    )
+    return resolve_allowed_path(
+        path,
+        workspace=tool_workspace.project_path or workspace,
+        allowed_root=tool_workspace.allowed_root,
+    )
 
 
 class ReadFileTool(Tool):

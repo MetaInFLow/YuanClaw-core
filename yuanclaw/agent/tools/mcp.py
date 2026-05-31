@@ -158,7 +158,10 @@ async def connect_mcp_servers(
 
             if transport_type == "stdio":
                 params = StdioServerParameters(
-                    command=cfg.command, args=cfg.args, env=cfg.env or None
+                    command=cfg.command,
+                    args=cfg.args,
+                    env=cfg.env or None,
+                    cwd=cfg.cwd or None,
                 )
                 read, write = await stack.enter_async_context(stdio_client(params))
             elif transport_type == "sse":

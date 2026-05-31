@@ -3,31 +3,56 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 import weakref
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
+from yuanclaw.agent.autocompact import AutoCompact
 from yuanclaw.agent.context import ContextBuilder
 from yuanclaw.agent.memory import MemoryStore
 from yuanclaw.agent.subagent import SubagentManager
+from yuanclaw.agent.tools.apply_patch import ApplyPatchTool
+from yuanclaw.agent.tools.cli_apps import CliAppsTool
 from yuanclaw.agent.tools.cron import CronTool
+from yuanclaw.agent.tools.exec_session import (
+    ExecSessionManager,
+    ListExecSessionsTool,
+    WriteStdinTool,
+)
 from yuanclaw.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from yuanclaw.agent.tools.image_generation import ImageGenerationTool
+from yuanclaw.agent.tools.long_task import CompleteGoalTool, LongTaskTool
 from yuanclaw.agent.tools.memory import MemoryGetTool, MemorySearchTool
 from yuanclaw.agent.tools.message import MessageTool
 from yuanclaw.agent.tools.registry import ToolRegistry
 from yuanclaw.agent.tools.shell import ExecTool
 from yuanclaw.agent.tools.spawn import SpawnTool
 from yuanclaw.agent.tools.web import WebFetchTool, WebSearchTool
+from yuanclaw.apps.cli import normalize_cli_app_mentions
+from yuanclaw.apps.cli import session_extra as cli_app_session_extra
+from yuanclaw.apps.mcp_presets import (
+    normalize_mcp_preset_mentions,
+)
+from yuanclaw.apps.mcp_presets import (
+    session_extra as mcp_preset_session_extra,
+)
 from yuanclaw.bus.events import InboundMessage, OutboundMessage
 from yuanclaw.bus.queue import MessageBus
 from yuanclaw.command import CommandContext, CommandRouter, register_builtin_commands
 from yuanclaw.memory import CoreMemoryBackend, LegacyMemoryBackend, MemoryBackend
-from yuanclaw.providers.base import LLMProvider
+from yuanclaw.providers.base import LLMProvider, LLMResponse
+from yuanclaw.security.workspace_access import (
+    WorkspaceScopeResolver,
+    bind_workspace_scope,
+    reset_workspace_scope,
+)
+from yuanclaw.session.goal_state import runner_wall_llm_timeout_s, sustained_goal_active
 from yuanclaw.session.manager import Session, SessionManager
 from yuanclaw.studio_agents import get_fixed_skills_for_session
 from yuanclaw.utils.helpers import strip_think
@@ -35,11 +60,34 @@ from yuanclaw.utils.helpers import strip_think
 if TYPE_CHECKING:
     from yuanclaw.config.schema import (
         ChannelsConfig,
+        CliAppsToolConfig,
         CompactionConfig,
         ExecToolConfig,
+        ImageGenerationToolConfig,
         MemoryConfig,
+        ProviderConfig,
     )
     from yuanclaw.cron.service import CronService
+
+
+class _LoopIdleConsolidator:
+    """Adapter that lets AutoCompact use the loop's existing memory consolidation stack."""
+
+    def __init__(self, loop: "AgentLoop") -> None:
+        self.loop = loop
+
+    async def compact_idle_session(self, key: str, keep_recent_messages: int) -> str:
+        lock = self.loop._consolidation_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            session = self.loop.sessions.get_or_create(key)
+            summary = await MemoryStore(self.loop.workspace).compact_idle_session(
+                session,
+                self.loop.provider,
+                self.loop.model,
+                keep_recent_messages=keep_recent_messages,
+            )
+            self.loop.sessions.save(session)
+            return summary
 
 
 class AgentLoop:
@@ -67,6 +115,7 @@ class AgentLoop:
         temperature: float = 0.1,
         max_tokens: int = 4096,
         context_window_tokens: int | None = None,
+        llm_timeout_s: float | None = 300.0,
         memory_window: int = 100,
         memory_config: MemoryConfig | None = None,
         compaction_config: CompactionConfig | None = None,
@@ -82,8 +131,18 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        image_generation_config: ImageGenerationToolConfig | None = None,
+        image_generation_provider_configs: dict[str, ProviderConfig] | None = None,
+        cli_apps_config: CliAppsToolConfig | None = None,
+        max_concurrent_subagents: int | None = None,
     ):
-        from yuanclaw.config.schema import CompactionConfig, ExecToolConfig, MemoryConfig
+        from yuanclaw.config.schema import (
+            CliAppsToolConfig,
+            CompactionConfig,
+            ExecToolConfig,
+            ImageGenerationToolConfig,
+            MemoryConfig,
+        )
         self.bus = bus
         self.channels_config = channels_config
         self.provider = provider
@@ -94,6 +153,7 @@ class AgentLoop:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.context_window_tokens = context_window_tokens or max_tokens
+        self.llm_timeout_s = llm_timeout_s
         self.memory_window = memory_window
         self.memory_config = memory_config or MemoryConfig()
         self.compaction_config = compaction_config or CompactionConfig()
@@ -104,6 +164,9 @@ class AgentLoop:
         self.web_search_max_results = web_search_max_results
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
+        self.image_generation_config = image_generation_config or ImageGenerationToolConfig()
+        self.image_generation_provider_configs = dict(image_generation_provider_configs or {})
+        self.cli_apps_config = cli_apps_config or CliAppsToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         self._start_time = time.time()
@@ -112,6 +175,10 @@ class AgentLoop:
         self.context = ContextBuilder(workspace)
         self.memory_backend = self._build_memory_backend(self.memory_config)
         self.sessions = session_manager or SessionManager(workspace)
+        self.workspace_scope_resolver = WorkspaceScopeResolver(
+            workspace,
+            default_restrict_to_workspace=restrict_to_workspace,
+        )
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
             provider=provider,
@@ -128,6 +195,11 @@ class AgentLoop:
             web_proxy=web_proxy,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
+            llm_wall_timeout_for_session=lambda session_key: runner_wall_llm_timeout_s(
+                self.sessions,
+                session_key,
+            ),
+            max_concurrent_subagents=max_concurrent_subagents,
         )
 
         self._running = False
@@ -140,7 +212,14 @@ class AgentLoop:
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
+        self._background_tasks: set[asyncio.Task] = set()
         self._processing_lock = asyncio.Lock()
+        self._exec_session_manager = ExecSessionManager()
+        self.auto_compact = AutoCompact(
+            self.sessions,
+            _LoopIdleConsolidator(self),
+            session_ttl_minutes=self.compaction_config.session_ttl_minutes,
+        )
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
         self._register_default_tools()
@@ -162,12 +241,16 @@ class AgentLoop:
         allowed_dir = self.workspace if self.restrict_to_workspace else None
         for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
             self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
+        self.tools.register(ApplyPatchTool(workspace=self.workspace, allowed_dir=allowed_dir))
         self.tools.register(ExecTool(
             working_dir=str(self.workspace),
             timeout=self.exec_config.timeout,
             restrict_to_workspace=self.restrict_to_workspace,
             path_append=self.exec_config.path_append,
+            session_manager=self._exec_session_manager,
         ))
+        self.tools.register(WriteStdinTool(manager=self._exec_session_manager))
+        self.tools.register(ListExecSessionsTool(manager=self._exec_session_manager))
         self.tools.register(
             WebSearchTool(
                 api_key=self.brave_api_key,
@@ -181,7 +264,25 @@ class AgentLoop:
         self.tools.register(MemorySearchTool(workspace=self.workspace, backend=self.memory_backend))
         self.tools.register(MemoryGetTool(workspace=self.workspace, backend=self.memory_backend))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
+        self.tools.register(LongTaskTool(self.sessions))
+        self.tools.register(CompleteGoalTool(self.sessions))
         self.tools.register(SpawnTool(manager=self.subagents))
+        if self.image_generation_config.enabled:
+            self.tools.register(
+                ImageGenerationTool(
+                    workspace=self.workspace,
+                    config=self.image_generation_config,
+                    provider_configs=self.image_generation_provider_configs,
+                )
+            )
+        if self.cli_apps_config.enabled:
+            self.tools.register(
+                CliAppsTool(
+                    workspace=self.workspace,
+                    timeout=self.cli_apps_config.run_timeout,
+                    restrict_to_workspace=self.restrict_to_workspace,
+                )
+            )
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
 
@@ -209,7 +310,16 @@ class AgentLoop:
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
-        for name in ("message", "spawn", "cron"):
+        for name in (
+            "message",
+            "spawn",
+            "cron",
+            "long_task",
+            "complete_goal",
+            "exec",
+            "write_stdin",
+            "list_exec_sessions",
+        ):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
@@ -232,6 +342,97 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    @staticmethod
+    def _progress_accepts_kwarg(callback: Callable[..., Any], name: str) -> bool:
+        try:
+            signature = inspect.signature(callback)
+        except (TypeError, ValueError):
+            return False
+        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+            return True
+        return name in signature.parameters
+
+    @classmethod
+    async def _invoke_progress(
+        cls,
+        callback: Callable[..., Awaitable[None]],
+        content: str,
+        *,
+        tool_hint: bool = False,
+        tool_events: list[dict[str, Any]] | None = None,
+        file_edit_events: list[dict[str, Any]] | None = None,
+    ) -> None:
+        has_structured_events = bool(tool_events or file_edit_events)
+        if has_structured_events:
+            kwargs: dict[str, Any] = {"tool_hint": tool_hint}
+            if cls._progress_accepts_kwarg(callback, "tool_events"):
+                kwargs["tool_events"] = tool_events
+            if cls._progress_accepts_kwarg(callback, "file_edit_events"):
+                kwargs["file_edit_events"] = file_edit_events
+            if len(kwargs) > 1:
+                await callback(content, **kwargs)
+                return
+            if not content:
+                return
+        await callback(content, tool_hint=tool_hint)
+
+    @staticmethod
+    def _tool_event_start(tool_call: Any) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "phase": "start",
+            "call_id": str(getattr(tool_call, "id", "") or ""),
+            "name": getattr(tool_call, "name", ""),
+            "arguments": getattr(tool_call, "arguments", {}) or {},
+            "result": None,
+            "error": None,
+            "files": [],
+            "embeds": [],
+        }
+
+    @classmethod
+    def _tool_event_finish(cls, tool_call: Any, result: Any) -> dict[str, Any]:
+        start = cls._tool_event_start(tool_call)
+        is_error = isinstance(result, str) and result.startswith("Error")
+        start["phase"] = "error" if is_error else "end"
+        start["result"] = None if is_error else result
+        start["error"] = result if is_error else None
+        if isinstance(result, dict):
+            start["files"] = result.get("files") if isinstance(result.get("files"), list) else []
+            start["embeds"] = result.get("embeds") if isinstance(result.get("embeds"), list) else []
+        return start
+
+    @staticmethod
+    def _file_edit_events(tool_call: Any, *, phase: str, result: Any = None) -> list[dict[str, Any]]:
+        if getattr(tool_call, "name", "") != "apply_patch":
+            return []
+        arguments = getattr(tool_call, "arguments", {}) or {}
+        edits = arguments.get("edits") if isinstance(arguments, dict) else None
+        if not isinstance(edits, list):
+            return []
+        is_error = isinstance(result, str) and result.startswith("Error")
+        effective_phase = "error" if phase == "end" and is_error else phase
+        events: list[dict[str, Any]] = []
+        for edit in edits:
+            if not isinstance(edit, dict):
+                continue
+            path = edit.get("path")
+            action = edit.get("action")
+            if not isinstance(path, str) or not isinstance(action, str):
+                continue
+            events.append(
+                {
+                    "version": 1,
+                    "phase": effective_phase,
+                    "call_id": str(getattr(tool_call, "id", "") or ""),
+                    "tool": "apply_patch",
+                    "path": path,
+                    "action": action,
+                    "error": result if effective_phase == "error" else None,
+                }
+            )
+        return events
+
     def _get_session_lock(self, session_key: str) -> asyncio.Lock:
         """Get or create a per-session dispatch lock."""
         lock = self._session_locks.get(session_key)
@@ -239,6 +440,20 @@ class AgentLoop:
             lock = asyncio.Lock()
             self._session_locks[session_key] = lock
         return lock
+
+    def _schedule_background(self, awaitable: Awaitable[Any]) -> None:
+        task = asyncio.create_task(awaitable)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    def _check_idle_sessions(self, *extra_active_keys: str) -> None:
+        active_keys = {
+            key
+            for key, tasks in self._active_tasks.items()
+            if any(not task.done() for task in tasks)
+        }
+        active_keys.update(key for key in extra_active_keys if key)
+        self.auto_compact.check_expired(self._schedule_background, active_session_keys=active_keys)
 
     @staticmethod
     def _parse_command(content: str) -> tuple[str, str] | None:
@@ -290,12 +505,18 @@ class AgentLoop:
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        goal_active_predicate: Callable[[], bool] | None = None,
+        goal_continue_message: str | None = None,
+        llm_timeout_s: float | None = None,
     ) -> tuple[str | None, list[str], list[dict], dict[str, int]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages, usage)."""
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        empty_content_retries = 0
+        length_recovery_count = 0
+        length_recovered_content = ""
         usage_totals = {
             "requests": 0,
             "prompt_tokens": 0,
@@ -308,14 +529,18 @@ class AgentLoop:
 
             tool_defs = self.tools.get_definitions()
             if on_stream and hasattr(self.provider, "chat_stream"):
-                response = await self.provider.chat_stream(  # type: ignore[attr-defined]
-                    messages=messages,
-                    tools=tool_defs,
-                    model=self.model,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                    reasoning_effort=self.reasoning_effort,
-                    on_content_delta=on_stream,
+                response = await self._await_llm_response(
+                    self.provider.chat_stream(  # type: ignore[attr-defined]
+                        messages=messages,
+                        tools=tool_defs,
+                        model=self.model,
+                        temperature=self.temperature,
+                        max_tokens=self.max_tokens,
+                        reasoning_effort=self.reasoning_effort,
+                        on_content_delta=on_stream,
+                    ),
+                    llm_timeout_s=llm_timeout_s,
+                    streaming=True,
                 )
             else:
                 streamed_via_chat = False
@@ -326,14 +551,18 @@ class AgentLoop:
                     if on_stream:
                         await on_stream(text)
 
-                response = await self.provider.chat(
-                    messages=messages,
-                    tools=tool_defs,
-                    model=self.model,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                    reasoning_effort=self.reasoning_effort,
-                    on_text_delta=_on_chat_delta if on_stream else None,
+                response = await self._await_llm_response(
+                    self.provider.chat(
+                        messages=messages,
+                        tools=tool_defs,
+                        model=self.model,
+                        temperature=self.temperature,
+                        max_tokens=self.max_tokens,
+                        reasoning_effort=self.reasoning_effort,
+                        on_text_delta=_on_chat_delta if on_stream else None,
+                    ),
+                    llm_timeout_s=llm_timeout_s,
+                    streaming=bool(on_stream),
                 )
                 if on_stream and response.content and not streamed_via_chat:
                     await on_stream(response.content)
@@ -349,16 +578,29 @@ class AgentLoop:
                 "total_tokens": int(usage.get("total_tokens", 0) or 0),
             }
 
-            if response.has_tool_calls:
+            if response.should_execute_tools:
                 if on_stream and on_stream_end:
                     await on_stream_end(resuming=True)
                 if on_progress:
                     if not on_stream:
                         thought = self._strip_think(response.content)
                         if thought:
-                            await on_progress(thought)
+                            await self._invoke_progress(on_progress, thought)
                     tool_hint = self._strip_think(self._tool_hint(response.tool_calls))
-                    await on_progress(tool_hint, tool_hint=True)
+                    await self._invoke_progress(
+                        on_progress,
+                        tool_hint,
+                        tool_hint=True,
+                        tool_events=[
+                            self._tool_event_start(tool_call)
+                            for tool_call in response.tool_calls
+                        ],
+                        file_edit_events=[
+                            event
+                            for tool_call in response.tool_calls
+                            for event in self._file_edit_events(tool_call, phase="start")
+                        ],
+                    )
 
                 tool_call_dicts = [
                     {
@@ -385,6 +627,17 @@ class AgentLoop:
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    if on_progress:
+                        await self._invoke_progress(
+                            on_progress,
+                            "",
+                            tool_events=[self._tool_event_finish(tool_call, result)],
+                            file_edit_events=self._file_edit_events(
+                                tool_call,
+                                phase="end",
+                                result=result,
+                            ),
+                        )
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -398,6 +651,20 @@ class AgentLoop:
                     logger.error("LLM returned error: {}", (clean or "")[:200])
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
                     break
+                if not (clean or "").strip():
+                    empty_content_retries += 1
+                    if empty_content_retries < 2:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Your previous response was an empty response. Please provide a non-empty "
+                                    "answer to the user's request."
+                                ),
+                            }
+                        )
+                        final_content = None
+                        continue
                 messages = self.context.add_assistant_message(
                     messages, clean, reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
@@ -405,7 +672,41 @@ class AgentLoop:
                     model=self.model,
                     provider=self.provider_name,
                 )
-                final_content = clean
+                if response.finish_reason == "length" and (clean or "").strip():
+                    empty_content_retries = 0
+                    length_recovery_count += 1
+                    length_recovered_content += response.content or clean or ""
+                    if length_recovery_count <= 2:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Continue exactly where you left off. Do not restart or repeat "
+                                    "previous content."
+                                ),
+                            }
+                        )
+                        final_content = None
+                        continue
+
+                final_content = (
+                    f"{length_recovered_content}{response.content or clean or ''}"
+                    if length_recovered_content
+                    else clean
+                )
+                if goal_active_predicate is not None and goal_active_predicate():
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": goal_continue_message
+                            or (
+                                "You still have an active sustained goal. Continue working toward it "
+                                "using tools or call complete_goal if the objective is fully verified."
+                            ),
+                        }
+                    )
+                    final_content = None
+                    continue
                 break
 
         if final_content is None and iteration >= self.max_iterations:
@@ -417,6 +718,31 @@ class AgentLoop:
 
         return final_content, tools_used, messages, usage_totals
 
+    async def _await_llm_response(
+        self,
+        coro: Awaitable[LLMResponse],
+        *,
+        llm_timeout_s: float | None,
+        streaming: bool,
+    ) -> LLMResponse:
+        """Await an LLM call with the runner wall timeout when applicable."""
+        timeout_s = self.llm_timeout_s if llm_timeout_s is None else llm_timeout_s
+        if streaming:
+            timeout_s = None
+        if timeout_s is not None and timeout_s <= 0:
+            timeout_s = None
+        try:
+            if timeout_s is None:
+                return await coro
+            return await asyncio.wait_for(coro, timeout=timeout_s)
+        except asyncio.TimeoutError:
+            return LLMResponse(
+                content=f"Error calling LLM: timed out after {timeout_s:g}s",
+                finish_reason="error",
+                error_kind="timeout",
+                error_should_retry=True,
+            )
+
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
@@ -427,6 +753,7 @@ class AgentLoop:
             try:
                 msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
             except asyncio.TimeoutError:
+                self._check_idle_sessions()
                 continue
             except asyncio.CancelledError:
                 if not self._running or asyncio.current_task().cancelling():
@@ -550,6 +877,7 @@ class AgentLoop:
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
+            session, pending_summary = self.auto_compact.prepare_session(session, key)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=self.memory_window)
             memory_context = self._build_memory_context(
@@ -562,12 +890,20 @@ class AgentLoop:
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 memory_context=memory_context,
+                session_metadata=session.metadata,
+                session_summary=pending_summary,
             )
             final_content, _, all_msgs, usage = await self._run_agent_loop(
                 messages,
                 on_progress=on_progress,
                 on_stream=on_stream,
                 on_stream_end=on_stream_end,
+                goal_active_predicate=lambda: sustained_goal_active(session.metadata),
+                llm_timeout_s=runner_wall_llm_timeout_s(
+                    self.sessions,
+                    key,
+                    metadata=session.metadata,
+                ),
             )
             self.sessions.record_usage(
                 session,
@@ -584,8 +920,37 @@ class AgentLoop:
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         key = session_key or msg.session_key
+        self._check_idle_sessions(key)
         session = self.sessions.get_or_create(key)
+        session, pending_summary = self.auto_compact.prepare_session(session, key)
+        self._persist_runtime_attachments(session, msg.metadata)
+        workspace_scope = self.workspace_scope_resolver.for_message(msg, session.metadata)
+        self.workspace_scope_resolver.persist_message_scope(session, msg)
+        scope_token = bind_workspace_scope(workspace_scope)
+        try:
+            return await self._process_message_in_scope(
+                msg,
+                session,
+                key,
+                pending_summary=pending_summary,
+                on_progress=on_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+            )
+        finally:
+            reset_workspace_scope(scope_token)
 
+    async def _process_message_in_scope(
+        self,
+        msg: InboundMessage,
+        session: Session,
+        key: str,
+        pending_summary: str | None = None,
+        on_progress: Callable[..., Awaitable[None]] | None = None,
+        on_stream: Callable[[str], Awaitable[None]] | None = None,
+        on_stream_end: Callable[..., Awaitable[None]] | None = None,
+    ) -> OutboundMessage | None:
+        """Process a normal channel message with workspace scope already bound."""
         parsed = self._parse_command(msg.content)
         if parsed:
             response = await self._dispatch_command(msg, session, key)
@@ -639,6 +1004,8 @@ class AgentLoop:
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
             memory_context=memory_context,
+            session_metadata=session.metadata,
+            session_summary=pending_summary,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -654,6 +1021,12 @@ class AgentLoop:
             on_progress=on_progress or _bus_progress,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
+            goal_active_predicate=lambda: sustained_goal_active(session.metadata),
+            llm_timeout_s=runner_wall_llm_timeout_s(
+                self.sessions,
+                key,
+                metadata=session.metadata,
+            ),
         )
 
         if final_content is None:
@@ -665,7 +1038,7 @@ class AgentLoop:
             model=self.model,
             usage=usage,
         )
-        self._save_turn(session, all_msgs, 1 + len(history))
+        self._save_turn(session, all_msgs, 1 + len(history), turn_metadata=msg.metadata)
         self.sessions.save(session)
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
@@ -682,7 +1055,13 @@ class AgentLoop:
             metadata=metadata,
         )
 
-    def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
+    def _save_turn(
+        self,
+        session: Session,
+        messages: list[dict],
+        skip: int,
+        turn_metadata: dict[str, Any] | None = None,
+    ) -> None:
         """Save new-turn messages into session, truncating large tool results."""
         from datetime import datetime
         for m in messages[skip:]:
@@ -713,9 +1092,34 @@ class AgentLoop:
                     if not filtered:
                         continue
                     entry["content"] = filtered
+                if isinstance(turn_metadata, dict):
+                    cli_apps = normalize_cli_app_mentions(
+                        turn_metadata.get("cli_apps") or turn_metadata.get("cliApps")
+                    )
+                    mcp_presets = normalize_mcp_preset_mentions(
+                        turn_metadata.get("mcp_presets") or turn_metadata.get("mcpPresets")
+                    )
+                    if cli_apps:
+                        entry["cli_apps"] = cli_apps
+                    if mcp_presets:
+                        entry["mcp_presets"] = mcp_presets
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
         session.updated_at = datetime.now()
+
+    def _persist_runtime_attachments(self, session: Session, metadata: dict[str, Any]) -> None:
+        cli_apps = normalize_cli_app_mentions(
+            metadata.get("cli_apps") or metadata.get("cliApps")
+        )
+        mcp_presets = normalize_mcp_preset_mentions(
+            metadata.get("mcp_presets") or metadata.get("mcpPresets")
+        )
+        if cli_apps:
+            metadata["cli_apps"] = cli_apps
+            session.metadata.update(cli_app_session_extra(metadata))
+        if mcp_presets:
+            metadata["mcp_presets"] = mcp_presets
+            session.metadata.update(mcp_preset_session_extra(metadata))
 
     async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
         """Delegate to MemoryStore.consolidate(). Returns True on success."""
@@ -734,22 +1138,26 @@ class AgentLoop:
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         skill_names: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> str:
         """Process a message directly (for CLI or cron usage)."""
         await self._connect_mcp()
-        metadata = {"skill_names": skill_names} if skill_names else {}
-        msg = InboundMessage(
-            channel=channel,
-            sender_id="user",
-            chat_id=chat_id,
-            content=content,
-            metadata=metadata,
-        )
-        response = await self._process_message(
-            msg,
-            session_key=session_key,
-            on_progress=on_progress,
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
-        )
+        async with self._get_session_lock(session_key):
+            metadata = dict(metadata or {})
+            if skill_names:
+                metadata["skill_names"] = skill_names
+            msg = InboundMessage(
+                channel=channel,
+                sender_id="user",
+                chat_id=chat_id,
+                content=content,
+                metadata=metadata,
+            )
+            response = await self._process_message(
+                msg,
+                session_key=session_key,
+                on_progress=on_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+            )
         return response.content if response else ""

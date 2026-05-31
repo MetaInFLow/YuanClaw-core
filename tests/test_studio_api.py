@@ -1,15 +1,22 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from urllib.parse import quote
 
+import pytest
 from fastapi.testclient import TestClient
 
 from yuanclaw.api.server import (
+    CoreRuntime,
+    RuntimeEventBroker,
     _compact_thread_summary,
     _has_summary_model_access,
     _normalize_thread_summary,
+    _validate_public_bind_auth,
     create_app,
 )
+from yuanclaw.config.paths import get_media_dir
 from yuanclaw.config.schema import Config
+from yuanclaw.providers.openai_compatible_provider import OpenAICompatibleProvider
 from yuanclaw.session.manager import SessionManager
 
 
@@ -19,11 +26,13 @@ class _RuntimeStub:
         self.config.agents.defaults.workspace = str(workspace)
         self.session_manager = SessionManager(workspace)
         self.channels = None
+        self.events = RuntimeEventBroker()
         self.cron = SimpleNamespace(list_jobs=lambda include_disabled=True: [])
         self.host = "127.0.0.1"
         self.port = 18789
         self.started_at = 0.0
         self.provider = SimpleNamespace(chat=AsyncMock())
+        self.agent = SimpleNamespace(process_direct=AsyncMock(return_value="stub reply"))
         self.applied_configs = []
         self.prepared_configs = []
         self.distill_payload = None
@@ -133,6 +142,295 @@ def test_sessions_api_uses_null_preview_for_empty_sessions(tmp_path) -> None:
     assert item["message_count"] == 0
     assert item["last_role"] is None
     assert item["last_message_preview"] is None
+
+
+def test_session_messages_api_replays_metadata_and_signed_media_urls(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "yuanclaw.config.paths.get_config_path",
+        lambda: tmp_path / "instance" / "config.json",
+    )
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    media_dir = get_media_dir("api")
+    media_path = media_dir / "sample.png"
+    media_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    session = runtime.session_manager.get_or_create("studio:cowboy-manong:thread-media")
+    session.metadata["goal_state"] = {
+        "status": "active",
+        "objective": "finish the replay route",
+        "ui_summary": "replay route",
+    }
+    session.add_message("user", "see image", media=[str(media_path)])
+    runtime.session_manager.save(session)
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.get(
+            f"/api/sessions/{quote(session.key, safe='')}/messages",
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        media_url = payload["messages"][0]["media_urls"][0]["url"]
+        media_response = client.get(media_url)
+
+    assert payload["key"] == session.key
+    assert payload["metadata"]["goal_state"]["objective"] == "finish the replay route"
+    assert payload["messages"][0]["content"] == "see image"
+    assert "media" not in payload["messages"][0]
+    assert payload["messages"][0]["media_urls"][0]["name"] == "sample.png"
+    assert media_url.startswith("/api/media/")
+    assert media_response.status_code == 200
+    assert media_response.content == b"\x89PNG\r\n\x1a\nfake"
+    assert media_response.headers["x-content-type-options"] == "nosniff"
+
+
+def test_session_messages_api_strips_unservable_media_paths(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "yuanclaw.config.paths.get_config_path",
+        lambda: tmp_path / "instance" / "config.json",
+    )
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"outside")
+    session = runtime.session_manager.get_or_create("studio:cowboy-manong:thread-outside-media")
+    session.add_message("user", "outside", media=[str(outside)])
+    runtime.session_manager.save(session)
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.get(f"/api/sessions/{quote(session.key, safe='')}/messages")
+
+    assert response.status_code == 200
+    message = response.json()["messages"][0]
+    assert "media" not in message
+    assert "media_urls" not in message
+
+
+def test_signed_media_route_rejects_tampered_signature(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "yuanclaw.config.paths.get_config_path",
+        lambda: tmp_path / "instance" / "config.json",
+    )
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    media_path = get_media_dir("api") / "tamper.png"
+    media_path.write_bytes(b"image")
+    session = runtime.session_manager.get_or_create("studio:cowboy-manong:thread-tamper")
+    session.add_message("user", "tamper", media=[str(media_path)])
+    runtime.session_manager.save(session)
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.get(f"/api/sessions/{quote(session.key, safe='')}/messages")
+        media_url = response.json()["messages"][0]["media_urls"][0]["url"]
+        tampered = media_url.replace("/api/media/", "/api/media/invalid", 1)
+        tampered_response = client.get(tampered)
+
+    assert tampered_response.status_code == 401
+
+
+def test_signed_media_route_requires_gateway_token_when_configured(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "yuanclaw.config.paths.get_config_path",
+        lambda: tmp_path / "instance" / "config.json",
+    )
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    runtime.config.gateway.token = "static-token"
+    media_path = get_media_dir("api") / "protected.png"
+    media_path.write_bytes(b"image")
+    session = runtime.session_manager.get_or_create("studio:cowboy-manong:thread-protected")
+    session.add_message("user", "protected", media=[str(media_path)])
+    runtime.session_manager.save(session)
+
+    with TestClient(create_app(runtime)) as client:
+        replay = client.get(
+            f"/api/sessions/{quote(session.key, safe='')}/messages",
+            headers={"Authorization": "Bearer static-token"},
+        )
+        media_url = replay.json()["messages"][0]["media_urls"][0]["url"]
+        unauthorized = client.get(media_url)
+        authorized = client.get(
+            media_url,
+            headers={"Authorization": "Bearer static-token"},
+        )
+
+    assert unauthorized.status_code == 401
+    assert authorized.status_code == 200
+
+
+def test_signed_media_route_supports_single_byte_range(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "yuanclaw.config.paths.get_config_path",
+        lambda: tmp_path / "instance" / "config.json",
+    )
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    media_path = get_media_dir("api") / "clip.mp4"
+    media_path.write_bytes(b"0123456789")
+    session = runtime.session_manager.get_or_create("studio:cowboy-manong:thread-range")
+    session.add_message("user", "clip", media=[str(media_path)])
+    runtime.session_manager.save(session)
+
+    with TestClient(create_app(runtime)) as client:
+        replay = client.get(f"/api/sessions/{quote(session.key, safe='')}/messages")
+        media_url = replay.json()["messages"][0]["media_urls"][0]["url"]
+        partial = client.get(media_url, headers={"Range": "bytes=2-5"})
+        invalid = client.get(media_url, headers={"Range": "bytes=20-30"})
+
+    assert partial.status_code == 206
+    assert partial.content == b"2345"
+    assert partial.headers["content-range"] == "bytes 2-5/10"
+    assert partial.headers["accept-ranges"] == "bytes"
+    assert invalid.status_code == 416
+    assert invalid.headers["content-range"] == "bytes */10"
+
+
+def test_session_messages_api_does_not_create_missing_session(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.get("/api/sessions/studio%3Amissing/messages")
+        listed = client.get("/api/sessions")
+
+    assert response.status_code == 404
+    assert listed.json()["total"] == 0
+
+
+def test_ws_chat_done_frame_and_runtime_event_include_goal_state(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+
+    async def _process_direct(**kwargs):
+        session = runtime.session_manager.get_or_create(kwargs["session_key"])
+        session.metadata["goal_state"] = {
+            "status": "active",
+            "objective": "continue core API work",
+            "ui_summary": "core API",
+        }
+        runtime.session_manager.save(session)
+        return "working"
+
+    runtime.agent.process_direct = AsyncMock(side_effect=_process_direct)
+    event_queue = runtime.events.subscribe()
+
+    async def _noop_progress(*args, **kwargs):
+        return None
+
+    with TestClient(create_app(runtime)) as client:
+        with client.websocket_connect("/ws/chat") as websocket:
+            assert websocket.receive_json()["type"] == "ready"
+            websocket.send_json(
+                {
+                    "type": "chat",
+                    "content": "continue",
+                    "sessionKey": "studio:cowboy-manong:thread-goal",
+                }
+            )
+            running = websocket.receive_json()
+            done = websocket.receive_json()
+            turn_end = websocket.receive_json()
+
+    assert running["type"] == "goal_status"
+    assert running["status"] == "running"
+    assert done["type"] == "done"
+    assert done["goalState"]["active"] is True
+    assert done["goalState"]["objective"] == "continue core API work"
+    assert turn_end["type"] == "turn_end"
+    assert turn_end["sessionKey"] == "studio:cowboy-manong:thread-goal"
+    assert turn_end["goalState"]["active"] is True
+
+    events = []
+    while not event_queue.empty():
+        events.append(event_queue.get_nowait())
+    reply_events = [event for event in events if event.get("type") == "agent.reply_done"]
+    assert reply_events
+    assert reply_events[-1]["goal_state"]["active"] is True
+    assert any(event.get("type") == "agent.goal_status" and event.get("status") == "running" for event in events)
+    assert any(event.get("type") == "agent.turn_end" for event in events)
+
+
+def test_ws_chat_forwards_structured_progress_fields(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+
+    async def _process_direct(**kwargs):
+        await kwargs["on_progress"](
+            "edited files",
+            tool_hint=True,
+            tool_events=[{"name": "apply_patch", "status": "ok"}],
+            file_edit_events=[{"path": "demo.txt", "action": "update"}],
+        )
+        return "done"
+
+    runtime.agent.process_direct = AsyncMock(side_effect=_process_direct)
+
+    with TestClient(create_app(runtime)) as client:
+        with client.websocket_connect("/ws/chat") as websocket:
+            assert websocket.receive_json()["type"] == "ready"
+            websocket.send_json(
+                {
+                    "type": "chat",
+                    "content": "edit",
+                    "sessionKey": "studio:cowboy-manong:thread-progress",
+                }
+            )
+            assert websocket.receive_json()["type"] == "goal_status"
+            progress = websocket.receive_json()
+
+    assert progress["type"] == "progress"
+    assert progress["toolHint"] is True
+    assert progress["toolEvents"] == [{"name": "apply_patch", "status": "ok"}]
+    assert progress["fileEditEvents"] == [{"path": "demo.txt", "action": "update"}]
+
+
+def test_ws_chat_forwards_cli_apps_and_mcp_presets_to_agent(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+
+    with TestClient(create_app(runtime)) as client:
+        with client.websocket_connect("/ws/chat") as websocket:
+            assert websocket.receive_json()["type"] == "ready"
+            websocket.send_json(
+                {
+                    "type": "chat",
+                    "content": "use apps",
+                    "sessionKey": "studio:cowboy-manong:thread-apps",
+                    "cliApps": [{"name": "Obsidian", "entryPoint": "obsidian-cli"}],
+                    "mcpPresets": [{"name": "GitHub", "transport": "stdio"}],
+                }
+            )
+            assert websocket.receive_json()["type"] == "goal_status"
+            assert websocket.receive_json()["type"] == "done"
+
+    kwargs = runtime.agent.process_direct.await_args.kwargs
+    assert kwargs["metadata"]["cliApps"] == [
+        {"name": "Obsidian", "entryPoint": "obsidian-cli"}
+    ]
+    assert kwargs["metadata"]["mcpPresets"] == [{"name": "GitHub", "transport": "stdio"}]
+
+
+def test_ws_chat_forwards_workspace_scope_to_agent_metadata(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    project = tmp_path / "project"
+    project.mkdir()
+
+    with TestClient(create_app(runtime)) as client:
+        with client.websocket_connect("/ws/chat") as websocket:
+            assert websocket.receive_json()["type"] == "ready"
+            websocket.send_json(
+                {
+                    "type": "chat",
+                    "content": "use project scope",
+                    "sessionKey": "studio:cowboy-manong:thread-workspace",
+                    "workspaceScope": {
+                        "projectPath": str(project),
+                        "accessMode": "restricted",
+                    },
+                }
+            )
+            assert websocket.receive_json()["type"] == "goal_status"
+            assert websocket.receive_json()["type"] == "done"
+
+    kwargs = runtime.agent.process_direct.await_args.kwargs
+    assert kwargs["metadata"]["workspace_scope"] == {
+        "project_path": str(project),
+        "access_mode": "restricted",
+    }
 
 
 def test_session_summary_api_falls_back_to_input_without_api_key(tmp_path) -> None:
@@ -355,3 +653,144 @@ def test_usage_api_counts_assistant_requests_without_metadata_usage(tmp_path) ->
     assert payload["providers"][0]["requests"] == 1
     assert payload["models"][0]["key"] == "openai-codex/gpt-5.1-codex"
     assert payload["models"][0]["requests"] == 1
+
+
+def test_public_bind_requires_gateway_token_or_issue_secret() -> None:
+    config = Config()
+
+    for host in ("0.0.0.0", "::"):
+        try:
+            _validate_public_bind_auth(host, config.gateway)
+        except RuntimeError as exc:
+            assert "neither token nor token_issue_secret is set" in str(exc)
+        else:
+            raise AssertionError(f"expected public bind guard for {host}")
+
+
+def test_local_bind_allows_empty_gateway_auth() -> None:
+    config = Config()
+
+    _validate_public_bind_auth("127.0.0.1", config.gateway)
+    _validate_public_bind_auth("localhost", config.gateway)
+
+
+def test_public_bind_allows_static_token_or_issue_secret() -> None:
+    config = Config()
+    config.gateway.token = "static-token"
+    _validate_public_bind_auth("0.0.0.0", config.gateway)
+
+    config.gateway.token = ""
+    config.gateway.token_issue_secret = "issue-secret"
+    _validate_public_bind_auth("::", config.gateway)
+
+
+def test_config_accepts_gateway_auth_camel_case() -> None:
+    config = Config.model_validate(
+        {
+            "gateway": {
+                "token": "static-token",
+                "tokenIssueSecret": "issue-secret",
+                "tokenIssuePath": "/api/token",
+                "tokenTtlS": 60,
+            }
+        }
+    )
+
+    assert config.gateway.token == "static-token"
+    assert config.gateway.token_issue_secret == "issue-secret"
+    assert config.gateway.token_issue_path == "/api/token"
+    assert config.gateway.token_ttl_s == 60
+
+
+@pytest.mark.asyncio
+async def test_core_runtime_apply_config_refreshes_provider_and_tool_snapshot(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "yuanclaw.config.paths.get_config_path",
+        lambda: tmp_path / "instance" / "config.json",
+    )
+    initial = Config()
+    initial.gateway.host = "127.0.0.1"
+    initial.agents.defaults.workspace = str(tmp_path / "workspace-a")
+    runtime = CoreRuntime(initial, host="127.0.0.1", port=18789, with_channels=False)
+
+    updated = Config.model_validate(initial.model_dump(by_alias=True))
+    updated.agents.defaults.workspace = str(tmp_path / "workspace-b")
+    updated.agents.defaults.provider = "longcat"
+    updated.agents.defaults.model = "longcat/LongCat-Flash"
+    updated.providers.longcat.api_key = "longcat-key"
+    updated.tools.cli_apps.enabled = True
+    updated.tools.image_generation.enabled = True
+
+    old_agent = runtime.agent
+    old_session_manager = runtime.session_manager
+    await runtime.apply_config(updated)
+
+    assert runtime.agent is not old_agent
+    assert runtime.session_manager is not old_session_manager
+    assert runtime.config.agents.defaults.model == "longcat/LongCat-Flash"
+    assert runtime.agent.model == "longcat/LongCat-Flash"
+    assert isinstance(runtime.provider, OpenAICompatibleProvider)
+    assert isinstance(runtime.agent.provider, OpenAICompatibleProvider)
+    assert runtime.agent.workspace == tmp_path / "workspace-b"
+    assert runtime.agent.tools.get("run_cli_app") is not None
+    assert runtime.agent.tools.get("generate_image") is not None
+    assert runtime.agent.tools.get("run_cli_app") is not old_agent.tools.get("run_cli_app")
+
+
+def test_api_requires_gateway_token_when_configured(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    runtime.config.gateway.token = "static-token"
+
+    with TestClient(create_app(runtime)) as client:
+        unauthorized = client.get("/api/status")
+        authorized = client.get(
+            "/api/status",
+            headers={"Authorization": "Bearer static-token"},
+        )
+
+    assert unauthorized.status_code == 401
+    assert authorized.status_code == 200
+
+
+def test_gateway_token_issue_endpoint_mints_short_lived_api_token(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    runtime.config.gateway.token_issue_secret = "issue-secret"
+    runtime.config.gateway.token_ttl_s = 60
+
+    with TestClient(create_app(runtime)) as client:
+        denied = client.get(runtime.config.gateway.token_issue_path)
+        issued = client.get(
+            runtime.config.gateway.token_issue_path,
+            headers={"Authorization": "Bearer issue-secret"},
+        )
+        token = issued.json()["token"]
+        authorized = client.get(
+            "/api/status",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert denied.status_code == 401
+    assert issued.status_code == 200
+    assert issued.json()["expires_in"] == 60
+    assert isinstance(token, str) and len(token) >= 24
+    assert authorized.status_code == 200
+
+
+def test_websocket_requires_gateway_token_when_configured(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    runtime.config.gateway.token = "static-token"
+
+    with TestClient(create_app(runtime)) as client:
+        missing_token_rejected = False
+        try:
+            with client.websocket_connect("/ws/events"):
+                pass
+        except Exception:
+            missing_token_rejected = True
+        assert missing_token_rejected is True
+
+        with client.websocket_connect("/ws/events?token=static-token") as websocket:
+            assert websocket.receive_json()["type"] == "ready"

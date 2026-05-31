@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import hashlib
+import hmac
 import json
+import mimetypes
 import os
-import urllib.parse
+import re
 import time
+import urllib.parse
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -15,8 +21,9 @@ from typing import Any
 from urllib.parse import unquote
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
 from loguru import logger
 
 from yuanclaw import __version__
@@ -24,11 +31,12 @@ from yuanclaw.agent.loop import AgentLoop
 from yuanclaw.bus.queue import MessageBus
 from yuanclaw.channels.manager import ChannelManager
 from yuanclaw.config.loader import save_config
-from yuanclaw.config.paths import get_cron_dir
+from yuanclaw.config.paths import get_cron_dir, get_media_dir
 from yuanclaw.config.schema import Config
 from yuanclaw.cron.service import CronService
 from yuanclaw.cron.types import CronJob
 from yuanclaw.providers.registry import PROVIDERS, find_by_name
+from yuanclaw.session.goal_state import goal_state_ws_blob
 from yuanclaw.session.manager import SessionManager
 from yuanclaw.utils.helpers import sync_workspace_templates
 
@@ -178,6 +186,19 @@ def _validate_channel_payloads(payload: dict[str, Any]) -> None:
             raise ValueError(
                 f"channel `{channel_id}` is incomplete: missing required field(s): {', '.join(missing)}"
             )
+
+
+_MEDIA_ALLOWED_MIMES = {
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+    "image/svg+xml",
+    "video/mp4",
+    "video/webm",
+    "video/quicktime",
+}
+_BYTE_RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 
 
 @dataclass
@@ -452,64 +473,15 @@ class OAuthLoginManager:
 
 def _make_provider(config: Config):
     """Create provider object from config (same behavior as CLI gateway path)."""
-    from yuanclaw.providers.azure_openai_provider import AzureOpenAIProvider
-    from yuanclaw.providers.custom_provider import CustomProvider
-    from yuanclaw.providers.litellm_provider import LiteLLMProvider
-    from yuanclaw.providers.openai_codex_provider import OpenAICodexProvider
+    from yuanclaw.providers.factory import make_provider
 
-    model = config.agents.defaults.model
-    provider_name = config.get_provider_name(model)
-    p = config.get_provider(model)
+    return make_provider(config)
 
-    if provider_name == "openai_codex" or model.startswith("openai-codex/"):
-        return OpenAICodexProvider(default_model=model)
 
-    if provider_name == "custom":
-        return CustomProvider(
-            api_key=p.api_key if p else "no-key",
-            api_base=config.get_api_base(model) or "http://localhost:8000/v1",
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-        )
+def _image_gen_provider_configs(config: Config):
+    from yuanclaw.providers.image_generation import image_gen_provider_configs
 
-    if provider_name == "azure_openai":
-        if not p or not p.api_key or not p.api_base:
-            logger.warning("Azure OpenAI config incomplete, falling back to local custom provider")
-            return CustomProvider(
-                api_key="no-key",
-                api_base="http://localhost:8000/v1",
-                default_model=model,
-            )
-        return AzureOpenAIProvider(
-            api_key=p.api_key,
-            api_base=p.api_base,
-            default_model=model,
-        )
-
-    if provider_name == "ovms":
-        return CustomProvider(
-            api_key=p.api_key if p else "no-key",
-            api_base=config.get_api_base(model) or "http://localhost:8000/v3",
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-        )
-
-    spec = find_by_name(provider_name)
-    if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and (spec.is_oauth or spec.is_local)):
-        logger.warning("No API key configured, chat responses may fail until provider is configured")
-        return CustomProvider(
-            api_key="no-key",
-            api_base=config.get_api_base(model) or "http://localhost:8000/v1",
-            default_model=model,
-        )
-
-    return LiteLLMProvider(
-        api_key=p.api_key if p else None,
-        api_base=config.get_api_base(model),
-        default_model=model,
-        extra_headers=p.extra_headers if p else None,
-        provider_name=provider_name,
-    )
+    return image_gen_provider_configs(config)
 
 
 def _mask_secret(value: str) -> str:
@@ -519,6 +491,216 @@ def _mask_secret(value: str) -> str:
     if len(value) <= 6:
         return "*" * len(value)
     return f"{value[:4]}...{value[-2:]}"
+
+
+def _is_public_bind_host(host: str) -> bool:
+    return host.strip() in {"0.0.0.0", "::"}
+
+
+def _validate_public_bind_auth(host: str, gateway: Any) -> None:
+    """Require auth material before binding the local API to all interfaces."""
+    if not _is_public_bind_host(host):
+        return
+    if str(getattr(gateway, "token", "") or "").strip():
+        return
+    if str(getattr(gateway, "token_issue_secret", "") or "").strip():
+        return
+    raise RuntimeError(
+        "host is 0.0.0.0 (all interfaces) but neither token nor "
+        "token_issue_secret is set - set one to prevent unauthenticated access"
+    )
+
+
+def _gateway_auth_enabled(gateway: Any) -> bool:
+    return bool(
+        str(getattr(gateway, "token", "") or "").strip()
+        or str(getattr(gateway, "token_issue_secret", "") or "").strip()
+    )
+
+
+def _request_token(connection: Request | WebSocket) -> str:
+    auth = str(connection.headers.get("authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    header_token = str(connection.headers.get("x-yuanclaw-auth") or "").strip()
+    if header_token:
+        return header_token
+    return str(connection.query_params.get("token") or "").strip()
+
+
+def _issued_token_is_valid(
+    token: str,
+    issued_tokens: dict[str, float],
+    *,
+    now: float | None = None,
+) -> bool:
+    if not token:
+        return False
+    now = time.time() if now is None else now
+    expires_at = issued_tokens.get(token)
+    if expires_at is None:
+        return False
+    if expires_at <= now:
+        issued_tokens.pop(token, None)
+        return False
+    return True
+
+
+def _gateway_token_is_valid(
+    token: str,
+    gateway: Any,
+    issued_tokens: dict[str, float],
+) -> bool:
+    static_token = str(getattr(gateway, "token", "") or "").strip()
+    if static_token and hmac.compare_digest(token, static_token):
+        return True
+    return _issued_token_is_valid(token, issued_tokens)
+
+
+def _token_issue_secret_is_valid(connection: Request, gateway: Any) -> bool:
+    secret = str(getattr(gateway, "token_issue_secret", "") or "").strip()
+    if not secret:
+        return False
+    provided = _request_token(connection)
+    return bool(provided and hmac.compare_digest(provided, secret))
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value + padding)
+
+
+def _sign_media_path(abs_path: Path, *, secret: bytes) -> str | None:
+    try:
+        media_root = get_media_dir(None).resolve()
+        rel = abs_path.resolve().relative_to(media_root)
+    except (OSError, ValueError):
+        return None
+    payload = _b64url_encode(rel.as_posix().encode("utf-8"))
+    mac = hmac.new(secret, payload.encode("ascii"), hashlib.sha256).digest()[:16]
+    return f"/api/media/{_b64url_encode(mac)}/{payload}"
+
+
+def _augment_session_media_urls(payload: dict[str, Any], *, secret: bytes) -> None:
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        media = message.get("media")
+        if not isinstance(media, list) or not media:
+            continue
+        urls: list[dict[str, str]] = []
+        for entry in media:
+            if not isinstance(entry, str) or not entry:
+                continue
+            path = Path(entry)
+            signed = _sign_media_path(path, secret=secret)
+            if signed is not None:
+                urls.append({"url": signed, "name": path.name})
+        if urls:
+            message["media_urls"] = urls
+        message.pop("media", None)
+
+
+def _parse_single_byte_range(range_header: str, size: int) -> tuple[int, int]:
+    if size <= 0 or "," in range_header:
+        raise ValueError("invalid byte range")
+    match = _BYTE_RANGE_RE.fullmatch(range_header.strip())
+    if match is None:
+        raise ValueError("invalid byte range")
+    start_text, end_text = match.groups()
+    if not start_text and not end_text:
+        raise ValueError("invalid byte range")
+    if not start_text:
+        suffix_length = int(end_text)
+        if suffix_length <= 0:
+            raise ValueError("invalid byte range")
+        return max(size - suffix_length, 0), size - 1
+    start = int(start_text)
+    end = int(end_text) if end_text else size - 1
+    if start >= size or start > end:
+        raise ValueError("invalid byte range")
+    return start, min(end, size - 1)
+
+
+def _serve_signed_media(
+    sig: str,
+    payload: str,
+    *,
+    secret: bytes,
+    range_header: str | None = None,
+) -> Response:
+    try:
+        provided_mac = _b64url_decode(sig)
+    except (ValueError, binascii.Error):
+        return Response("invalid signature", status_code=401)
+
+    expected_mac = hmac.new(secret, payload.encode("ascii"), hashlib.sha256).digest()[:16]
+    if not hmac.compare_digest(expected_mac, provided_mac):
+        return Response("invalid signature", status_code=401)
+
+    try:
+        rel = _b64url_decode(payload).decode("utf-8")
+        media_root = get_media_dir(None).resolve()
+        candidate = (media_root / rel).resolve()
+        candidate.relative_to(media_root)
+    except (OSError, ValueError, binascii.Error, UnicodeDecodeError):
+        return Response("not found", status_code=404)
+
+    if not candidate.is_file():
+        return Response("not found", status_code=404)
+
+    mime, _ = mimetypes.guess_type(candidate.name)
+    if mime not in _MEDIA_ALLOWED_MIMES:
+        mime = "application/octet-stream"
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "private, max-age=31536000, immutable",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if mime == "image/svg+xml":
+        headers["Content-Security-Policy"] = (
+            "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox"
+        )
+
+    try:
+        size = candidate.stat().st_size
+    except OSError:
+        return Response("read error", status_code=500)
+
+    if range_header:
+        try:
+            start, end = _parse_single_byte_range(range_header, size)
+        except ValueError:
+            return Response(
+                "range not satisfiable",
+                status_code=416,
+                headers={
+                    "Accept-Ranges": "bytes",
+                    "Content-Range": f"bytes */{size}",
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
+        try:
+            with candidate.open("rb") as handle:
+                handle.seek(start)
+                body = handle.read(end - start + 1)
+        except OSError:
+            return Response("read error", status_code=500)
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+        return Response(body, status_code=206, media_type=mime, headers=headers)
+
+    try:
+        body = candidate.read_bytes()
+    except OSError:
+        return Response("read error", status_code=500)
+    return Response(body, media_type=mime, headers=headers)
 
 
 def _extract_description(skill_file: Path) -> str:
@@ -898,6 +1080,7 @@ class CoreRuntime:
     """In-memory runtime used by the Studio API server."""
 
     def __init__(self, config: Config, host: str, port: int, with_channels: bool) -> None:
+        _validate_public_bind_auth(host, config.gateway)
         self.host = host
         self.port = port
         self.with_channels = with_channels
@@ -933,6 +1116,10 @@ class CoreRuntime:
             session_manager=self.session_manager,
             mcp_servers=config.tools.mcp_servers,
             channels_config=config.channels,
+            image_generation_config=config.tools.image_generation,
+            image_generation_provider_configs=_image_gen_provider_configs(config),
+            cli_apps_config=config.tools.cli_apps,
+            max_concurrent_subagents=config.agents.defaults.max_concurrent_subagents,
         )
         self.channels = None
         self._agent_task: asyncio.Task | None = None
@@ -978,6 +1165,10 @@ class CoreRuntime:
                 session_manager=session_manager,
                 mcp_servers=config.tools.mcp_servers,
                 channels_config=config.channels,
+                image_generation_config=config.tools.image_generation,
+                image_generation_provider_configs=_image_gen_provider_configs(config),
+                cli_apps_config=config.tools.cli_apps,
+                max_concurrent_subagents=config.agents.defaults.max_concurrent_subagents,
             )
             cron.on_job = self._on_cron_job
             channels = ChannelManager(config, bus) if self.with_channels else None
@@ -1007,6 +1198,7 @@ class CoreRuntime:
 
     def prepare_config(self, config: Config) -> dict[str, Any]:
         """Validate whether a config can be applied to the running Core."""
+        _validate_public_bind_auth(self.host, config.gateway)
         return self._create_components(config)
 
     def _on_bus_inbound(self, msg: Any) -> None:
@@ -1332,6 +1524,8 @@ class CoreRuntime:
 def create_app(runtime: CoreRuntime) -> FastAPI:
     """Create FastAPI application for local Studio runtime."""
     oauth_manager = OAuthLoginManager()
+    issued_tokens: dict[str, float] = {}
+    media_secret = token_urlsafe(32).encode("utf-8")
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -1354,6 +1548,22 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
         allow_headers=["*"],
     )
 
+    @app.middleware("http")
+    async def gateway_token_middleware(request: Request, call_next):
+        gateway = runtime.config.gateway
+        token_issue_path = str(gateway.token_issue_path or "").rstrip("/") or ""
+        request_path = request.url.path.rstrip("/") or "/"
+        if request.method == "OPTIONS" or request_path == "/health":
+            return await call_next(request)
+        if token_issue_path and request_path == token_issue_path:
+            return await call_next(request)
+        if not _gateway_auth_enabled(gateway):
+            return await call_next(request)
+        token = _request_token(request)
+        if not _gateway_token_is_valid(token, gateway, issued_tokens):
+            return JSONResponse({"detail": "gateway token is required"}, status_code=401)
+        return await call_next(request)
+
     @app.get("/health")
     async def health() -> dict[str, Any]:
         return {
@@ -1362,6 +1572,22 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
             "pid": os.getpid(),
             "version": __version__,
         }
+
+    @app.get(runtime.config.gateway.token_issue_path or "/api/auth/token")
+    async def issue_gateway_token(request: Request) -> dict[str, Any]:
+        gateway = runtime.config.gateway
+        if not _token_issue_secret_is_valid(request, gateway):
+            raise HTTPException(status_code=401, detail="token issue secret is required")
+
+        now = time.time()
+        for token, expires_at in list(issued_tokens.items()):
+            if expires_at <= now:
+                issued_tokens.pop(token, None)
+
+        token = token_urlsafe(32)
+        ttl = int(gateway.token_ttl_s)
+        issued_tokens[token] = now + ttl
+        return {"token": token, "expires_in": ttl}
 
     @app.get("/api/status")
     async def status() -> dict[str, Any]:
@@ -1420,20 +1646,38 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    @app.get("/api/sessions/{session_key:path}/messages")
+    async def session_messages(session_key: str) -> dict[str, Any]:
+        key = unquote(session_key)
+        if not key:
+            raise HTTPException(status_code=400, detail="session key is required")
+
+        data = runtime.session_manager.read_session_file(key)
+        if data is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        _augment_session_media_urls(data, secret=media_secret)
+        return data
+
     @app.get("/api/sessions/{session_key:path}")
     async def session_detail(session_key: str) -> dict[str, Any]:
         key = unquote(session_key)
         if not key:
             raise HTTPException(status_code=400, detail="session key is required")
 
-        session = runtime.session_manager.get_or_create(key)
-        return {
-            "key": session.key,
-            "created_at": session.created_at.isoformat(),
-            "updated_at": session.updated_at.isoformat(),
-            "last_consolidated": session.last_consolidated,
-            "messages": session.messages,
-        }
+        data = runtime.session_manager.read_session_file(key)
+        if data is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        _augment_session_media_urls(data, secret=media_secret)
+        return data
+
+    @app.get("/api/media/{sig}/{payload}")
+    async def signed_media(sig: str, payload: str, request: Request) -> Response:
+        return _serve_signed_media(
+            sig,
+            payload,
+            secret=media_secret,
+            range_header=request.headers.get("range"),
+        )
 
     @app.get("/api/config")
     async def read_config() -> dict[str, Any]:
@@ -1505,6 +1749,11 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
 
     @app.websocket("/ws/chat")
     async def ws_chat(websocket: WebSocket):
+        if _gateway_auth_enabled(runtime.config.gateway):
+            token = _request_token(websocket)
+            if not _gateway_token_is_valid(token, runtime.config.gateway, issued_tokens):
+                await websocket.close(code=1008)
+                return
         await websocket.accept()
         await websocket.send_json({"type": "ready"})
 
@@ -1536,6 +1785,22 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
                 for name in (payload.get("skillNames") or [])
                 if str(name).strip()
             ]
+            runtime_metadata: dict[str, Any] = {}
+            if payload.get("cliApps") is not None:
+                runtime_metadata["cliApps"] = payload.get("cliApps")
+            if payload.get("mcpPresets") is not None:
+                runtime_metadata["mcpPresets"] = payload.get("mcpPresets")
+            workspace_scope = payload.get("workspaceScope")
+            if workspace_scope is None:
+                workspace_scope = payload.get("workspace_scope")
+            if isinstance(workspace_scope, dict):
+                runtime_metadata["workspace_scope"] = {
+                    "project_path": workspace_scope.get("project_path")
+                    or workspace_scope.get("projectPath")
+                    or workspace_scope.get("path"),
+                    "access_mode": workspace_scope.get("access_mode")
+                    or workspace_scope.get("accessMode"),
+                }
             if ":" in session_key:
                 _, chat_id = session_key.split(":", 1)
             else:
@@ -1554,29 +1819,58 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
             progress_lines: list[str] = []
             started = time.time()
 
-            async def on_progress(text: str, *, tool_hint: bool = False) -> None:
+            async def on_progress(
+                text: str,
+                *,
+                tool_hint: bool = False,
+                tool_events: list[dict[str, Any]] | None = None,
+                file_edit_events: list[dict[str, Any]] | None = None,
+                **_kwargs: Any,
+            ) -> None:
                 progress_lines.append(text)
+                event = {
+                    "type": "agent.tool_hint" if tool_hint else "agent.progress",
+                    "channel": "studio",
+                    "chat_id": chat_id or "default",
+                    "session_key": session_key,
+                    "content": text[:280],
+                    "progress": True,
+                    "tool_hint": tool_hint,
+                }
+                frame = {
+                    "type": "progress",
+                    "content": text,
+                    "toolHint": tool_hint,
+                    "ts": int(time.time()),
+                }
+                if tool_events:
+                    event["tool_events"] = tool_events
+                    frame["toolEvents"] = tool_events
+                if file_edit_events:
+                    event["file_edit_events"] = file_edit_events
+                    frame["fileEditEvents"] = file_edit_events
+                runtime.events.publish(event)
+                await websocket.send_json(frame)
+
+            try:
+                await websocket.send_json(
+                    {
+                        "type": "goal_status",
+                        "status": "running",
+                        "startedAt": started,
+                        "sessionKey": session_key,
+                    }
+                )
                 runtime.events.publish(
                     {
-                        "type": "agent.tool_hint" if tool_hint else "agent.progress",
+                        "type": "agent.goal_status",
+                        "status": "running",
+                        "started_at": started,
                         "channel": "studio",
                         "chat_id": chat_id or "default",
                         "session_key": session_key,
-                        "content": text[:280],
-                        "progress": True,
-                        "tool_hint": tool_hint,
                     }
                 )
-                await websocket.send_json(
-                    {
-                        "type": "progress",
-                        "content": text,
-                        "toolHint": tool_hint,
-                        "ts": int(time.time()),
-                    }
-                )
-
-            try:
                 final = await runtime.agent.process_direct(
                     content=content,
                     session_key=session_key,
@@ -1584,17 +1878,29 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
                     chat_id=chat_id or "default",
                     skill_names=skill_names,
                     on_progress=on_progress,
+                    metadata=runtime_metadata,
                 )
                 if not final:
                     final = "\n".join(progress_lines).strip()
+                session_data = runtime.session_manager.read_session_file(session_key) or {}
+                goal_state = goal_state_ws_blob(session_data.get("metadata"))
                 await websocket.send_json(
                     {
                         "type": "done",
                         "content": final,
                         "latencyMs": int((time.time() - started) * 1000),
                         "sessionKey": session_key,
+                        "goalState": goal_state,
                     }
                 )
+                turn_end = {
+                    "type": "turn_end",
+                    "status": "idle",
+                    "latencyMs": int((time.time() - started) * 1000),
+                    "sessionKey": session_key,
+                    "goalState": goal_state,
+                }
+                await websocket.send_json(turn_end)
                 runtime.events.publish(
                     {
                         "type": "agent.reply_done",
@@ -1602,6 +1908,18 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
                         "chat_id": chat_id or "default",
                         "session_key": session_key,
                         "content": final[:280],
+                        "goal_state": goal_state,
+                    }
+                )
+                runtime.events.publish(
+                    {
+                        "type": "agent.turn_end",
+                        "status": "idle",
+                        "channel": "studio",
+                        "chat_id": chat_id or "default",
+                        "session_key": session_key,
+                        "latency_ms": turn_end["latencyMs"],
+                        "goal_state": goal_state,
                     }
                 )
             except WebSocketDisconnect:
@@ -1612,6 +1930,11 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
 
     @app.websocket("/ws/events")
     async def ws_events(websocket: WebSocket):
+        if _gateway_auth_enabled(runtime.config.gateway):
+            token = _request_token(websocket)
+            if not _gateway_token_is_valid(token, runtime.config.gateway, issued_tokens):
+                await websocket.close(code=1008)
+                return
         await websocket.accept()
         queue = runtime.events.subscribe()
         await websocket.send_json(

@@ -90,6 +90,29 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         litellm_prefix="",
         is_direct=True,
     ),
+    # === AWS Bedrock (native Converse provider) ==========================
+    ProviderSpec(
+        name="bedrock",
+        keywords=(
+            "bedrock",
+            "anthropic.claude",
+            "amazon.nova",
+            "meta.",
+            "mistral.",
+            "cohere.",
+            "qwen.",
+            "deepseek.",
+            "openai.gpt-oss",
+            "ai21.",
+            "moonshot.",
+            "writer.",
+            "zai.",
+        ),
+        env_key="AWS_BEARER_TOKEN_BEDROCK",
+        display_name="AWS Bedrock",
+        litellm_prefix="bedrock",
+        is_direct=True,
+    ),
     # === Gateways (detected by api_key / api_base, not model name) =========
     # Gateways can route any model, so they win in fallback.
     # OpenRouter: global gateway, keys start with "sk-or-"
@@ -109,6 +132,30 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(),
         supports_prompt_caching=True,
+    ),
+    # Hugging Face Inference Providers: OpenAI-compatible router.
+    ProviderSpec(
+        name="huggingface",
+        keywords=("huggingface", "hugging-face"),
+        env_key="HF_TOKEN",
+        display_name="Hugging Face",
+        litellm_prefix="openai",
+        is_gateway=True,
+        detect_by_key_prefix="hf_",
+        detect_by_base_keyword="huggingface",
+        default_api_base="https://router.huggingface.co/v1",
+    ),
+    # Skywork API platform (APIFree): OpenAI-compatible MaaS gateway.
+    ProviderSpec(
+        name="skywork",
+        keywords=("skywork", "skyclaw", "apifree"),
+        env_key="SKYWORK_API_KEY",
+        display_name="Skywork",
+        litellm_prefix="openai",
+        env_extras=(("APIFREE_API_KEY", "{api_key}"),),
+        is_gateway=True,
+        detect_by_base_keyword="apifree.ai",
+        default_api_base="https://api.apifree.ai/agent/v1",
     ),
     # AiHubMix: global gateway, OpenAI-compatible interface.
     # strip_model_prefix=True: it doesn't understand "anthropic/claude-3",
@@ -145,6 +192,17 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_api_base="https://api.siliconflow.cn/v1",
         strip_model_prefix=False,
         model_overrides=(),
+    ),
+    # Novita AI: OpenAI-compatible gateway for hosted model APIs.
+    ProviderSpec(
+        name="novita",
+        keywords=("novita",),
+        env_key="NOVITA_API_KEY",
+        display_name="Novita AI",
+        litellm_prefix="openai",
+        is_gateway=True,
+        detect_by_base_keyword="novita",
+        default_api_base="https://api.novita.ai/openai",
     ),
     # VolcEngine (火山引擎): OpenAI-compatible gateway
     ProviderSpec(
@@ -393,6 +451,14 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(),
     ),
+    ProviderSpec(
+        name="minimax_anthropic",
+        keywords=("minimax_anthropic",),
+        env_key="MINIMAX_API_KEY",
+        display_name="MiniMax (Anthropic)",
+        litellm_prefix="",
+        default_api_base="https://api.minimax.io/anthropic",
+    ),
     # Mistral AI: OpenAI-compatible API at api.mistral.ai/v1.
     ProviderSpec(
         name="mistral",
@@ -409,6 +475,39 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_api_base="https://api.mistral.ai/v1",
         strip_model_prefix=False,
         model_overrides=(),
+    ),
+    ProviderSpec(
+        name="stepfun",
+        keywords=("stepfun", "step"),
+        env_key="STEPFUN_API_KEY",
+        display_name="Step Fun",
+        litellm_prefix="openai",
+        default_api_base="https://api.stepfun.com/v1",
+    ),
+    ProviderSpec(
+        name="xiaomi_mimo",
+        keywords=("xiaomi_mimo", "mimo"),
+        env_key="XIAOMIMIMO_API_KEY",
+        display_name="Xiaomi MIMO",
+        litellm_prefix="openai",
+        default_api_base="https://api.xiaomimimo.com/v1",
+    ),
+    ProviderSpec(
+        name="longcat",
+        keywords=("longcat",),
+        env_key="LONGCAT_API_KEY",
+        display_name="LongCat",
+        litellm_prefix="openai",
+        default_api_base="https://api.longcat.chat/openai/v1",
+    ),
+    ProviderSpec(
+        name="ant_ling",
+        keywords=("ant_ling", "ant-ling", "ling-", "ring-"),
+        env_key="ANT_LING_API_KEY",
+        display_name="Ant Ling",
+        litellm_prefix="openai",
+        detect_by_base_keyword="ant-ling.com",
+        default_api_base="https://api.ant-ling.com/v1",
     ),
     # === Local deployment (matched by config key, NOT by api_base) =========
     # vLLM / any OpenAI-compatible local server.
@@ -446,6 +545,26 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(),
     ),
+    ProviderSpec(
+        name="lm_studio",
+        keywords=("lm-studio", "lmstudio", "lm_studio"),
+        env_key="LM_STUDIO_API_KEY",
+        display_name="LM Studio",
+        litellm_prefix="openai",
+        is_local=True,
+        detect_by_base_keyword="1234",
+        default_api_base="http://localhost:1234/v1",
+    ),
+    ProviderSpec(
+        name="atomic_chat",
+        keywords=("atomic-chat", "atomic_chat", "atomicchat"),
+        env_key="ATOMIC_CHAT_API_KEY",
+        display_name="Atomic Chat",
+        litellm_prefix="openai",
+        is_local=True,
+        detect_by_base_keyword="1337",
+        default_api_base="http://localhost:1337/v1",
+    ),
     # === OpenVINO Model Server (direct, local, OpenAI-compatible at /v3) ===
     ProviderSpec(
         name="ovms",
@@ -482,6 +601,24 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_api_base="",
         strip_model_prefix=False,
         model_overrides=(),
+    ),
+    ProviderSpec(
+        name="nvidia",
+        keywords=("nvidia", "nemotron", "nvapi"),
+        env_key="NVIDIA_NIM_API_KEY",
+        display_name="NVIDIA NIM",
+        litellm_prefix="openai",
+        detect_by_key_prefix="nvapi-",
+        detect_by_base_keyword="nvidia.com",
+        default_api_base="https://integrate.api.nvidia.com/v1",
+    ),
+    ProviderSpec(
+        name="qianfan",
+        keywords=("qianfan", "ernie"),
+        env_key="QIANFAN_API_KEY",
+        display_name="Qianfan",
+        litellm_prefix="openai",
+        default_api_base="https://qianfan.baidubce.com/v2",
     ),
 )
 
