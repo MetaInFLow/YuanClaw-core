@@ -29,6 +29,15 @@ def test_is_allowed_requires_exact_match() -> None:
     assert channel.is_allowed("attacker|allow@email.com") is False
 
 
+def test_is_allowed_supports_plugin_dict_config() -> None:
+    snake_case = _DummyChannel({"allow_from": ["allowed"]}, MessageBus())
+    camel_case = _DummyChannel({"allowFrom": ["allowed"]}, MessageBus())
+
+    assert snake_case.is_allowed("allowed") is True
+    assert camel_case.is_allowed("allowed") is True
+    assert snake_case.is_allowed("blocked") is False
+
+
 @pytest.mark.asyncio
 async def test_whatsapp_send_reports_disconnected_bridge() -> None:
     channel = WhatsAppChannel(WhatsAppConfig(), MessageBus())

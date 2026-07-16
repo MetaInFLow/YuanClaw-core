@@ -116,6 +116,7 @@ def test_channels_config_preserves_plugin_sections(monkeypatch):
 
     manager = ChannelManager(config, MessageBus())
     assert "demo_plugin" in manager.channels
+    assert manager.channels["demo_plugin"].is_allowed("anything") is True
 
 
 def test_channel_sections_preserve_extra_runtime_flags():
