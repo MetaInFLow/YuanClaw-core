@@ -16,11 +16,14 @@ import makeWASocket, {
 import { Boom } from '@hapi/boom';
 import qrcode from 'qrcode-terminal';
 import pino from 'pino';
-import { writeFile, mkdir } from 'fs/promises';
+import { writeFile, mkdir, readdir, stat, unlink } from 'fs/promises';
 import { join } from 'path';
 import { randomBytes } from 'crypto';
 
 const VERSION = '0.1.0';
+const MAX_MEDIA_BYTES = 25 * 1024 * 1024;
+const MAX_MEDIA_FILES = 1000;
+const MEDIA_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface InboundMessage {
   id: string;
@@ -29,7 +32,87 @@ export interface InboundMessage {
   content: string;
   timestamp: number;
   isGroup: boolean;
+  participant?: string;
+  participantPn?: string;
   media?: string[];
+}
+
+export interface InboundMediaDescriptor {
+  fallbackContent: string;
+  mimetype?: string;
+  fileName?: string;
+  declaredBytes?: number;
+}
+
+function declaredByteLength(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'bigint') return Number(value);
+  if (value && typeof (value as { toNumber?: unknown }).toNumber === 'function') {
+    const converted = (value as { toNumber: () => number }).toNumber();
+    return Number.isFinite(converted) ? converted : undefined;
+  }
+  return undefined;
+}
+
+export function describeInboundMedia(message: any): InboundMediaDescriptor | null {
+  const candidates = [
+    ['imageMessage', '[Image]'],
+    ['documentMessage', '[Document]'],
+    ['videoMessage', '[Video]'],
+    ['audioMessage', '[Voice Message]'],
+  ] as const;
+  for (const [field, fallbackContent] of candidates) {
+    const media = message?.[field];
+    if (!media) continue;
+    return {
+      fallbackContent,
+      mimetype: media.mimetype ?? undefined,
+      fileName: field === 'documentMessage' ? media.fileName ?? undefined : undefined,
+      declaredBytes: declaredByteLength(media.fileLength),
+    };
+  }
+  return null;
+}
+
+export function inboundParticipant(key: any, isGroup: boolean): {
+  participant?: string;
+  participantPn?: string;
+} {
+  if (!isGroup) return {};
+  return {
+    ...(key?.participant ? { participant: String(key.participant) } : {}),
+    ...(key?.participantAlt ? { participantPn: String(key.participantAlt) } : {}),
+  };
+}
+
+export async function pruneMediaDirectory(
+  mediaDir: string,
+  preservePath: string,
+  maxFiles = MAX_MEDIA_FILES,
+  maxAgeMs = MEDIA_RETENTION_MS,
+  now = Date.now(),
+): Promise<void> {
+  const entries = await readdir(mediaDir, { withFileTypes: true });
+  const retained: Array<{ path: string; mtimeMs: number }> = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.startsWith('wa_')) continue;
+    const path = join(mediaDir, entry.name);
+    const info = await stat(path);
+    if (path !== preservePath && now - info.mtimeMs > maxAgeMs) {
+      await unlink(path);
+      continue;
+    }
+    retained.push({ path, mtimeMs: info.mtimeMs });
+  }
+  retained.sort((left, right) => right.mtimeMs - left.mtimeMs);
+  const keep = new Set<string>([preservePath]);
+  for (const item of retained) {
+    if (keep.size >= Math.max(1, maxFiles)) break;
+    keep.add(item.path);
+  }
+  for (const item of retained) {
+    if (!keep.has(item.path)) await unlink(item.path);
+  }
 }
 
 export interface WhatsAppClientOptions {
@@ -124,25 +207,21 @@ export class WhatsAppClient {
         if (!unwrapped) continue;
 
         const content = this.getTextContent(unwrapped);
-        let fallbackContent: string | null = null;
         const mediaPaths: string[] = [];
-
-        if (unwrapped.imageMessage) {
-          fallbackContent = '[Image]';
-          const path = await this.downloadMedia(msg, unwrapped.imageMessage.mimetype ?? undefined);
-          if (path) mediaPaths.push(path);
-        } else if (unwrapped.documentMessage) {
-          fallbackContent = '[Document]';
-          const path = await this.downloadMedia(msg, unwrapped.documentMessage.mimetype ?? undefined,
-            unwrapped.documentMessage.fileName ?? undefined);
-          if (path) mediaPaths.push(path);
-        } else if (unwrapped.videoMessage) {
-          fallbackContent = '[Video]';
-          const path = await this.downloadMedia(msg, unwrapped.videoMessage.mimetype ?? undefined);
+        const inboundMedia = describeInboundMedia(unwrapped);
+        if (inboundMedia) {
+          const path = await this.downloadMedia(
+            msg,
+            inboundMedia.mimetype,
+            inboundMedia.fileName,
+            inboundMedia.declaredBytes,
+          );
           if (path) mediaPaths.push(path);
         }
 
-        const finalContent = content || (mediaPaths.length === 0 ? fallbackContent : '') || '';
+        const finalContent = content
+          || (mediaPaths.length === 0 ? inboundMedia?.fallbackContent : '')
+          || '';
         if (!finalContent && mediaPaths.length === 0) continue;
 
         const isGroup = msg.key.remoteJid?.endsWith('@g.us') || false;
@@ -154,6 +233,7 @@ export class WhatsAppClient {
           content: finalContent,
           timestamp: msg.messageTimestamp as number,
           isGroup,
+          ...inboundParticipant(msg.key, isGroup),
           ...(mediaPaths.length > 0 ? { media: mediaPaths } : {}),
         });
       }
@@ -177,12 +257,25 @@ export class WhatsAppClient {
     }, 5000);
   }
 
-  private async downloadMedia(msg: any, mimetype?: string, fileName?: string): Promise<string | null> {
+  private async downloadMedia(
+    msg: any,
+    mimetype?: string,
+    fileName?: string,
+    declaredBytes?: number,
+  ): Promise<string | null> {
     try {
+      if (declaredBytes !== undefined && declaredBytes > MAX_MEDIA_BYTES) {
+        console.error('Media download rejected: declared size exceeds limit');
+        return null;
+      }
       const mediaDir = join(this.options.authDir, '..', 'media');
       await mkdir(mediaDir, { recursive: true });
 
       const buffer = await downloadMediaMessage(msg, 'buffer', {}) as Buffer;
+      if (buffer.byteLength > MAX_MEDIA_BYTES) {
+        console.error('Media download rejected: downloaded size exceeds limit');
+        return null;
+      }
 
       let outFilename: string;
       if (fileName) {
@@ -198,6 +291,11 @@ export class WhatsAppClient {
 
       const filepath = join(mediaDir, outFilename);
       await writeFile(filepath, buffer);
+      try {
+        await pruneMediaDirectory(mediaDir, filepath);
+      } catch (error) {
+        console.error('Failed to prune old media:', error);
+      }
 
       return filepath;
     } catch (err) {

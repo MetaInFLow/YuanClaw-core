@@ -74,7 +74,10 @@ class ChannelManager:
         """Instantiate a channel, injecting shared dependencies where needed."""
         if name in {"telegram", "feishu"}:
             return cls(section, self.bus, groq_api_key=self.config.providers.groq.api_key)
-        return cls(section, self.bus)
+        channel = cls(section, self.bus)
+        if name == "whatsapp":
+            channel.transcription_api_key = self.config.providers.groq.api_key
+        return channel
 
     def _init_channels(self) -> None:
         """Initialize channels discovered from built-ins and plugins."""

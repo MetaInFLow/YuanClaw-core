@@ -110,6 +110,9 @@ class WhatsAppChannel(BaseChannel):
             pn = data.get("pn", "")
             # New LID sytle typically:
             sender = data.get("sender", "")
+            is_group = bool(data.get("isGroup", False))
+            participant = data.get("participant", "")
+            participant_pn = data.get("participantPn", "")
             content = data.get("content", "")
             message_id = data.get("id", "")
 
@@ -120,18 +123,26 @@ class WhatsAppChannel(BaseChannel):
                 while len(self._processed_message_ids) > 1000:
                     self._processed_message_ids.popitem(last=False)
 
-            # Extract just the phone number or lid as chat_id
-            user_id = pn if pn else sender
+            # Replies stay on the group JID, while access control uses the real participant.
+            user_id = (participant_pn or participant) if is_group else (pn or sender)
+            if not user_id:
+                logger.warning("WhatsApp group message missing participant identity")
+                return
             sender_id = user_id.split("@")[0] if "@" in user_id else user_id
             logger.info("Sender {}", sender)
 
-            # Handle voice transcription if it's a voice message
-            if content == "[Voice Message]":
-                logger.info("Voice message received from {}, but direct download from bridge is not yet supported.", sender_id)
-                content = "[Voice Message: Transcription not available for WhatsApp yet]"
+            media_paths = [str(path) for path in (data.get("media") or []) if path]
 
-            # Extract media paths (images/documents/videos downloaded by the bridge)
-            media_paths = data.get("media") or []
+            if content == "[Voice Message]":
+                audio_path = next(
+                    (
+                        path for path in media_paths
+                        if (mimetypes.guess_type(path)[0] or "").startswith("audio/")
+                    ),
+                    None,
+                )
+                transcription = await self.transcribe_audio(audio_path) if audio_path else ""
+                content = transcription or "[Voice Message]"
 
             # Build content tags matching Telegram's pattern: [image: /path] or [file: /path]
             if media_paths:
@@ -149,7 +160,9 @@ class WhatsAppChannel(BaseChannel):
                 metadata={
                     "message_id": message_id,
                     "timestamp": data.get("timestamp"),
-                    "is_group": data.get("isGroup", False)
+                    "is_group": is_group,
+                    "participant": participant or None,
+                    "participant_pn": participant_pn or None,
                 }
             )
 
