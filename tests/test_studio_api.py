@@ -18,6 +18,7 @@ from yuanclaw.api.server import (
 )
 from yuanclaw.config.paths import get_media_dir
 from yuanclaw.config.schema import Config
+from yuanclaw.cron.types import CronJob, CronPayload
 from yuanclaw.providers.openai_compatible_provider import OpenAICompatibleProvider
 from yuanclaw.session.manager import SessionManager
 
@@ -938,6 +939,71 @@ def test_core_runtime_running_reflects_background_task_liveness(tmp_path, monkey
 
     runtime._channels_task = SimpleNamespace(done=lambda: True)
     assert runtime.running is False
+
+
+@pytest.mark.asyncio
+async def test_core_runtime_cron_delivers_final_response(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "yuanclaw.config.paths.get_config_path",
+        lambda: tmp_path / "instance" / "config.json",
+    )
+    config = Config()
+    config.agents.defaults.workspace = str(tmp_path / "workspace")
+    runtime = CoreRuntime(config, host="127.0.0.1", port=18789, with_channels=False)
+    runtime.agent.process_direct = AsyncMock(return_value="scheduled result")
+    job = CronJob(
+        id="job-1",
+        name="daily report",
+        payload=CronPayload(
+            message="prepare the report",
+            deliver=True,
+            channel="telegram",
+            to="chat-1",
+        ),
+    )
+
+    response = await runtime._on_cron_job(job)
+    delivered = await runtime.bus.consume_outbound()
+
+    assert response == "scheduled result"
+    assert delivered.channel == "telegram"
+    assert delivered.chat_id == "chat-1"
+    assert delivered.content == "scheduled result"
+    prompt = runtime.agent.process_direct.await_args.args[0]
+    assert "daily report" in prompt
+    assert "prepare the report" in prompt
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_core_runtime_cron_avoids_duplicate_message_delivery(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "yuanclaw.config.paths.get_config_path",
+        lambda: tmp_path / "instance" / "config.json",
+    )
+    config = Config()
+    config.agents.defaults.workspace = str(tmp_path / "workspace")
+    runtime = CoreRuntime(config, host="127.0.0.1", port=18789, with_channels=False)
+    runtime.agent.process_direct = AsyncMock(return_value="already sent")
+    runtime.agent.tools.get("message")._sent_in_turn = True
+    job = CronJob(
+        id="job-2",
+        name="notify",
+        payload=CronPayload(
+            message="send notification",
+            deliver=True,
+            channel="telegram",
+            to="chat-2",
+        ),
+    )
+
+    await runtime._on_cron_job(job)
+
+    assert runtime.bus.outbound_size == 0
+    await runtime.stop()
 
 
 def test_api_requires_gateway_token_when_configured(tmp_path) -> None:

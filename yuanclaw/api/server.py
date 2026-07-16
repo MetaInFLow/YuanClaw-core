@@ -1268,12 +1268,40 @@ class CoreRuntime:
 
     async def _on_cron_job(self, job: CronJob) -> str | None:
         """Execute a cron job with the same path used by direct chat."""
-        return await self.agent.process_direct(
-            job.payload.message,
-            session_key=f"cron:{job.id}",
-            channel=job.payload.channel or "cli",
-            chat_id=job.payload.to or "direct",
+        from yuanclaw.agent.tools.cron import CronTool
+        from yuanclaw.agent.tools.message import MessageTool
+        from yuanclaw.bus.events import OutboundMessage
+
+        channel = job.payload.channel or "cli"
+        chat_id = job.payload.to or "direct"
+        reminder_note = (
+            "[Scheduled Task] Timer finished.\n\n"
+            f"Task '{job.name}' has been triggered.\n"
+            f"Scheduled instruction: {job.payload.message}"
         )
+
+        cron_tool = self.agent.tools.get("cron")
+        cron_token = None
+        if isinstance(cron_tool, CronTool):
+            cron_token = cron_tool.set_cron_context(True)
+        try:
+            response = await self.agent.process_direct(
+                reminder_note,
+                session_key=f"cron:{job.id}",
+                channel=channel,
+                chat_id=chat_id,
+            )
+        finally:
+            if isinstance(cron_tool, CronTool) and cron_token is not None:
+                cron_tool.reset_cron_context(cron_token)
+
+        message_tool = self.agent.tools.get("message")
+        already_delivered = isinstance(message_tool, MessageTool) and message_tool._sent_in_turn
+        if job.payload.deliver and job.payload.to and response and not already_delivered:
+            await self.bus.publish_outbound(
+                OutboundMessage(channel=channel, chat_id=job.payload.to, content=response)
+            )
+        return response
 
     async def _start_locked(self) -> None:
         if self._started:
