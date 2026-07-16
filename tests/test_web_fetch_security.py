@@ -24,6 +24,11 @@ class _FakeResponse:
     async def aread(self) -> bytes:
         return self._body
 
+    async def aiter_bytes(self):
+        midpoint = max(1, len(self._body) // 2)
+        yield self._body[:midpoint]
+        yield self._body[midpoint:]
+
 
 class _FakeStream:
     def __init__(self, response: _FakeResponse) -> None:
@@ -84,3 +89,58 @@ async def test_web_fetch_blocks_private_redirect(monkeypatch: pytest.MonkeyPatch
     assert isinstance(result, str)
     payload = json.loads(result)
     assert payload["error"].startswith("Redirect blocked")
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_rejects_oversized_image_without_full_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _FakeResponse(
+        "https://example.com/image.png",
+        "image/png",
+        PNG_BYTES,
+    )
+    response.headers["content-length"] = str(web_tools.MAX_FETCH_IMAGE_BYTES + 1)
+
+    monkeypatch.setattr(web_tools, "_validate_url_target", lambda url: (True, ""))
+    monkeypatch.setattr(web_tools, "_validate_resolved_url", lambda url: (True, ""))
+    monkeypatch.setattr(
+        web_tools.httpx,
+        "AsyncClient",
+        lambda *a, **kw: _FakeAsyncClient(*a, response=response, **kw),
+    )
+
+    result = await WebFetchTool().execute("https://example.com/image.png")
+
+    assert isinstance(result, str)
+    assert "response exceeds" in json.loads(result)["error"]
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_stops_stream_when_document_exceeds_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _FakeResponse(
+        "https://example.com/page",
+        "text/plain",
+        b"x" * 32,
+    )
+    monkeypatch.setattr(web_tools, "MAX_FETCH_DOCUMENT_BYTES", 16)
+    monkeypatch.setattr(web_tools, "_validate_url_target", lambda url: (True, ""))
+    monkeypatch.setattr(web_tools, "_validate_resolved_url", lambda url: (True, ""))
+    monkeypatch.setattr(
+        web_tools.httpx,
+        "AsyncClient",
+        lambda *a, **kw: _FakeAsyncClient(*a, response=response, **kw),
+    )
+    tool = WebFetchTool()
+    monkeypatch.setattr(tool, "_fetch_jina", lambda *args: _async_none())
+
+    result = await tool.execute("https://example.com/page")
+
+    assert isinstance(result, str)
+    assert "response exceeds 16 bytes" in json.loads(result)["error"]
+
+
+async def _async_none():
+    return None
