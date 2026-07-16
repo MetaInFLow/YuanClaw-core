@@ -241,8 +241,16 @@ async def test_mcp_preset_service_tests_connection_and_reports_tools(
     service.enable("playwright", {})
 
     async def fake_connect(servers, registry, stack):
+        from yuanclaw.agent.tools.mcp import MCPConnectionResult
+
         assert list(servers) == ["playwright"]
         registry.register(_FakeMcpTool())
+        return {
+            "playwright": MCPConnectionResult(
+                connected=True,
+                tool_names=("mcp_playwright_browser_navigate",),
+            )
+        }
 
     monkeypatch.setattr("yuanclaw.apps.mcp_presets.connect_mcp_servers", fake_connect)
 
@@ -251,6 +259,35 @@ async def test_mcp_preset_service_tests_connection_and_reports_tools(
     assert payload["last_action"]["ok"] is True
     assert payload["last_action"]["tool_count"] == 1
     assert payload["last_action"]["tool_names"] == ["mcp_playwright_browser_navigate"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_preset_service_reports_connection_failure(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from yuanclaw.agent.tools.mcp import MCPConnectionResult
+
+    monkeypatch.setattr("yuanclaw.apps.mcp_presets.shutil.which", lambda command: f"/bin/{command}")
+    config = Config()
+    service = McpPresetService(config=config, runtime_root=tmp_path)
+    service.enable("playwright", {})
+
+    async def fake_connect(servers, registry, stack):
+        return {
+            "playwright": MCPConnectionResult(
+                connected=False,
+                error_type="ConnectionError",
+            )
+        }
+
+    monkeypatch.setattr("yuanclaw.apps.mcp_presets.connect_mcp_servers", fake_connect)
+
+    payload = await service.test("playwright")
+
+    assert payload["last_action"]["ok"] is False
+    assert payload["last_action"]["error"] == "ConnectionError"
+    assert payload["last_action"]["tool_count"] == 0
 
 
 def test_mcp_runtime_lines_distinguish_configured_and_connected_state() -> None:

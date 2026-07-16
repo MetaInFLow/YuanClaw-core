@@ -560,10 +560,20 @@ class McpPresetService:
         registry = ToolRegistry()
         async with AsyncExitStack() as stack:
             try:
-                await asyncio.wait_for(
+                results = await asyncio.wait_for(
                     connect_mcp_servers({safe: cfg}, registry, stack),
                     timeout=_test_timeout(cfg),
                 )
+                result = results.get(safe)
+                if result is None or not result.connected:
+                    error_type = result.error_type if result is not None else "ConnectionError"
+                    last_action = self._test_result(
+                        False,
+                        display,
+                        f"{display} could not connect.",
+                        error=error_type,
+                    )
+                    return self.payload(last_action=last_action)
                 tool_prefix = f"mcp_{safe}_"
                 tool_names = sorted(
                     name for name in registry.tool_names if name.startswith(tool_prefix)

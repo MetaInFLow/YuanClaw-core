@@ -518,7 +518,9 @@ class MCPServerConfig(Base):
     url: str = ""  # HTTP/SSE: endpoint URL
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
     enabled_tools: list[str] = Field(default_factory=list)
-    tool_timeout: int = 30  # seconds before a tool call is cancelled
+    connect_timeout: float = Field(default=15.0, gt=0, le=600)
+    discovery_timeout: float = Field(default=15.0, gt=0, le=600)
+    tool_timeout: float = Field(default=30.0, gt=0, le=86_400)
 
 
 class ToolsConfig(Base):

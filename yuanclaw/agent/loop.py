@@ -208,7 +208,9 @@ class AgentLoop:
         self._mcp_servers = mcp_servers or {}
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
-        self._mcp_connecting = False
+        self._mcp_connect_lock = asyncio.Lock()
+        self._mcp_connected_servers: set[str] = set()
+        self._mcp_tool_names: set[str] = set()
         self._consolidating: set[str] = set()  # Session keys with consolidation in progress
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
@@ -289,26 +291,43 @@ class AgentLoop:
             self.tools.register(CronTool(self.cron_service))
 
     async def _connect_mcp(self) -> None:
-        """Connect to configured MCP servers (one-time, lazy)."""
-        if self._mcp_connected or self._mcp_connecting or not self._mcp_servers:
+        """Connect configured MCP servers, retrying only servers that previously failed."""
+        if not self._mcp_servers:
             return
-        self._mcp_connecting = True
         from yuanclaw.agent.tools.mcp import connect_mcp_servers
-        try:
-            self._mcp_stack = AsyncExitStack()
-            await self._mcp_stack.__aenter__()
-            await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
-            self._mcp_connected = True
-        except Exception as e:
-            logger.error("Failed to connect MCP servers (will retry next message): {}", e)
-            if self._mcp_stack:
-                try:
-                    await self._mcp_stack.aclose()
-                except Exception:
-                    pass
-                self._mcp_stack = None
-        finally:
-            self._mcp_connecting = False
+
+        async with self._mcp_connect_lock:
+            pending = {
+                name: cfg
+                for name, cfg in self._mcp_servers.items()
+                if name not in self._mcp_connected_servers
+            }
+            if not pending:
+                self._mcp_connected = True
+                return
+
+            if self._mcp_stack is None:
+                self._mcp_stack = AsyncExitStack()
+                await self._mcp_stack.__aenter__()
+
+            try:
+                results = await connect_mcp_servers(pending, self.tools, self._mcp_stack)
+            except Exception as exc:
+                self._mcp_connected = False
+                logger.error(
+                    "Failed to connect MCP servers; pending servers will retry ({})",
+                    type(exc).__name__,
+                )
+                return
+
+            for name, result in results.items():
+                if result.connected:
+                    self._mcp_connected_servers.add(name)
+                    self._mcp_tool_names.update(result.tool_names)
+
+            self._mcp_connected = (
+                self._mcp_connected_servers == set(self._mcp_servers)
+            )
 
     def _set_tool_context(
         self,
@@ -890,12 +909,21 @@ class AgentLoop:
 
     async def close_mcp(self) -> None:
         """Close MCP connections."""
-        if self._mcp_stack:
+        async with self._mcp_connect_lock:
+            stack = self._mcp_stack
+            self._mcp_stack = None
+            self._mcp_connected = False
+            self._mcp_connected_servers.clear()
+            tool_names = tuple(self._mcp_tool_names)
+            self._mcp_tool_names.clear()
+            for name in tool_names:
+                self.tools.unregister(name)
+
+        if stack:
             try:
-                await self._mcp_stack.aclose()
+                await stack.aclose()
             except (RuntimeError, BaseExceptionGroup):
                 pass  # MCP SDK cancel scope cleanup is noisy but harmless
-            self._mcp_stack = None
 
     def stop(self) -> None:
         """Stop the agent loop."""
