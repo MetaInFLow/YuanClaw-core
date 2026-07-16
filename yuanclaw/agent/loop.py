@@ -780,6 +780,12 @@ class AgentLoop:
                 f"I reached the maximum number of tool call iterations ({self.max_iterations}) "
                 "without completing the task. You can try breaking the task into smaller steps."
             )
+            messages = self.context.add_assistant_message(
+                messages,
+                final_content,
+                model=self.model,
+                provider=self.provider_name,
+            )
 
         return final_content, tools_used, messages, usage_totals
 

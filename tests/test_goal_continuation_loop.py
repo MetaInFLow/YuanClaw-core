@@ -10,6 +10,7 @@ from yuanclaw.agent.loop import AgentLoop
 from yuanclaw.bus.queue import MessageBus
 from yuanclaw.providers.base import LLMProvider, LLMResponse
 from yuanclaw.session.goal_state import GOAL_STATE_KEY
+from yuanclaw.session.manager import SessionManager
 
 
 class _PlainProvider(LLMProvider):
@@ -157,6 +158,9 @@ async def test_active_goal_disables_runner_wall_llm_timeout_for_process_direct(t
     result = await loop.process_direct("continue")
 
     assert result == "I reached the maximum number of tool call iterations (1) without completing the task. You can try breaking the task into smaller steps."
+    persisted = SessionManager(tmp_path).get_or_create("cli:direct")
+    assert persisted.messages[-1]["role"] == "assistant"
+    assert persisted.messages[-1]["content"] == result
 
 
 @pytest.mark.asyncio
