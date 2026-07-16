@@ -314,6 +314,9 @@ async def test_chat_api_error():
         assert "Azure OpenAI API Error 401" in result.content
         assert "Invalid authentication credentials" in result.content
         assert result.finish_reason == "error"
+        assert result.error_status_code == 401
+        assert result.error_kind == "authentication"
+        assert result.error_should_retry is False
 
 
 @pytest.mark.asyncio
@@ -364,6 +367,53 @@ def test_get_default_model():
     )
 
     assert provider.get_default_model() == "my-custom-deployment"
+
+
+@pytest.mark.asyncio
+async def test_chat_uses_streaming_path_when_delta_callback_is_present() -> None:
+    provider = AzureOpenAIProvider(
+        api_key="test-key",
+        api_base="https://test-resource.openai.azure.com",
+    )
+    expected = LLMResponse(content="streamed")
+    provider.chat_stream = AsyncMock(return_value=expected)
+
+    result = await provider.chat(
+        [{"role": "user", "content": "hello"}],
+        on_text_delta=AsyncMock(),
+    )
+
+    assert result is expected
+    provider.chat_stream.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_azure_stream_keeps_usage_only_chunk() -> None:
+    provider = AzureOpenAIProvider(
+        api_key="test-key",
+        api_base="https://test-resource.openai.azure.com",
+    )
+
+    class Response:
+        async def aiter_lines(self):
+            yield 'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}'
+            yield 'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}'
+            yield "data: [DONE]"
+
+    deltas = []
+
+    async def on_delta(text: str) -> None:
+        deltas.append(text)
+
+    result = await provider._consume_stream(Response(), on_delta)
+
+    assert result.content == "ok"
+    assert result.usage == {
+        "prompt_tokens": 3,
+        "completion_tokens": 2,
+        "total_tokens": 5,
+    }
+    assert deltas == ["ok"]
 
 
 if __name__ == "__main__":

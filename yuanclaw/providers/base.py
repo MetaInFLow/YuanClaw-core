@@ -77,6 +77,52 @@ class LLMProvider(ABC):
             await result
 
     @staticmethod
+    def _error_response(
+        content: str,
+        *,
+        exc: Exception | None = None,
+        status_code: int | None = None,
+        error_type: str | None = None,
+        error_code: str | None = None,
+    ) -> LLMResponse:
+        """Build a structured provider error for fallback and diagnostics."""
+        if status_code is None and exc is not None:
+            candidate = getattr(exc, "status_code", None)
+            if candidate is None:
+                candidate = getattr(getattr(exc, "response", None), "status_code", None)
+            status_code = candidate if isinstance(candidate, int) else None
+
+        error_type = error_type or (type(exc).__name__ if exc is not None else None)
+        lowered = f"{error_type or ''} {error_code or ''} {content}".lower()
+        error_kind: str | None = None
+        should_retry: bool | None = None
+
+        if status_code == 401:
+            error_kind, should_retry = "authentication", False
+        elif status_code == 403:
+            error_kind, should_retry = "permission", False
+        elif status_code == 429:
+            error_kind, should_retry = "rate_limit", True
+        elif status_code is not None and status_code >= 500:
+            error_kind, should_retry = "server_error", True
+        elif status_code is not None and status_code >= 400:
+            error_kind, should_retry = "invalid_request", False
+        elif "timeout" in lowered or "timed out" in lowered:
+            error_kind, should_retry = "timeout", True
+        elif "connection" in lowered or "connecterror" in lowered:
+            error_kind, should_retry = "connection", True
+
+        return LLMResponse(
+            content=content,
+            finish_reason="error",
+            error_status_code=status_code,
+            error_kind=error_kind,
+            error_type=error_type,
+            error_code=error_code,
+            error_should_retry=should_retry,
+        )
+
+    @staticmethod
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Replace empty text content that causes provider 400 errors.
 
