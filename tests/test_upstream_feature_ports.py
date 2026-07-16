@@ -96,6 +96,22 @@ class _FailingChannel(_FakeStreamChannel):
         raise RuntimeError("send failed")
 
 
+class _FailingStartChannel(_FakeStreamChannel):
+    async def start(self) -> None:
+        raise RuntimeError("start failed")
+
+
+class _ListeningChannel(_FakeStreamChannel):
+    def __init__(self, config, bus):
+        super().__init__(config, bus)
+        self.listening = asyncio.Event()
+
+    async def start(self) -> None:
+        self._running = True
+        self.listening.set()
+        await asyncio.Event().wait()
+
+
 def test_channels_config_preserves_plugin_sections(monkeypatch):
     monkeypatch.setattr(
         "yuanclaw.channels.manager.discover_all",
@@ -133,6 +149,32 @@ def test_channel_sections_preserve_extra_runtime_flags():
     )
 
     assert getattr(config.channels.telegram, "streaming", False) is True
+
+
+@pytest.mark.asyncio
+async def test_channel_manager_propagates_start_failure_and_cancels_peers() -> None:
+    manager = ChannelManager(Config(), MessageBus())
+    listening = _ListeningChannel({"enabled": True, "allow_from": ["*"]}, manager.bus)
+    failing = _FailingStartChannel({"enabled": True, "allow_from": ["*"]}, manager.bus)
+    manager.channels = {"listening": listening, "failing": failing}
+
+    with pytest.raises(RuntimeError, match="start failed"):
+        await manager.start_all()
+
+    assert manager._dispatch_task is None
+
+
+@pytest.mark.asyncio
+async def test_channel_manager_without_enabled_channels_runs_until_stopped() -> None:
+    manager = ChannelManager(Config(), MessageBus())
+    manager.channels = {}
+    task = asyncio.create_task(manager.start_all())
+    await asyncio.sleep(0)
+
+    assert not task.done()
+
+    await manager.stop_all()
+    await asyncio.wait_for(task, timeout=1.0)
 
 
 def test_local_provider_fallback_routes_plain_model_to_ollama():

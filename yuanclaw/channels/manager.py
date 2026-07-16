@@ -43,6 +43,7 @@ class ChannelManager:
         self._channel_queues: dict[str, asyncio.Queue] = {}
         self._send_tasks: dict[str, asyncio.Task] = {}
         self._dead_letters: deque[OutboundFailure] = deque(maxlen=100)
+        self._stopping = False
 
         self._init_channels()
 
@@ -105,33 +106,47 @@ class ChannelManager:
                 )
 
     async def _start_channel(self, name: str, channel: BaseChannel) -> None:
-        """Start a channel and log any exceptions."""
+        """Start a channel and propagate failures to the manager lifecycle."""
         try:
             await channel.start()
-        except Exception as e:
-            logger.error("Failed to start channel {}: {}", name, e)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Channel {} failed ({})", name, type(exc).__name__)
+            raise
+        if not self._stopping:
+            raise RuntimeError(f"Channel {name} stopped unexpectedly")
 
     async def start_all(self) -> None:
         """Start all channels and the outbound dispatcher."""
+        self._stopping = False
         if not self.channels:
             logger.warning("No channels enabled")
-            return
 
-        # Start outbound dispatcher
         self._dispatch_task = asyncio.create_task(self._dispatch_outbound())
-
-        # Start channels
-        tasks = []
+        tasks = [self._dispatch_task]
         for name, channel in self.channels.items():
             logger.info("Starting {} channel...", name)
             tasks.append(asyncio.create_task(self._start_channel(name, channel)))
 
-        # Wait for all to complete (they should run forever)
-        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await asyncio.gather(*tasks)
+            if not self._stopping:
+                raise RuntimeError("Channel services stopped unexpectedly")
+        except asyncio.CancelledError:
+            if not self._stopping:
+                raise
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._dispatch_task = None
 
     async def stop_all(self) -> None:
         """Stop all channels and the dispatcher."""
         logger.info("Stopping all channels...")
+        self._stopping = True
 
         # Stop dispatcher
         if self._dispatch_task:

@@ -1289,6 +1289,12 @@ class CoreRuntime:
             self._channels_task = asyncio.create_task(
                 self.channels.start_all(), name="yuanclaw-channels"
             )
+            self._agent_task.add_done_callback(
+                lambda task: self._on_service_task_done("agent", task)
+            )
+            self._channels_task.add_done_callback(
+                lambda task: self._on_service_task_done("channels", task)
+            )
         self.started_at = time.time()
         self._started = True
         logger.info("Studio API runtime started on {}:{}", self.host, self.port)
@@ -1299,6 +1305,25 @@ class CoreRuntime:
                 "port": self.port,
                 "pid": os.getpid(),
                 "with_channels": self.with_channels,
+            }
+        )
+
+    def _on_service_task_done(self, service: str, task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is None:
+            if not self._started:
+                return
+            error_type = "UnexpectedExit"
+        else:
+            error_type = type(error).__name__
+        logger.error("Runtime {} service stopped ({})", service, error_type)
+        self.events.publish(
+            {
+                "type": "core.service_failed",
+                "service": service,
+                "error_type": error_type,
             }
         )
 
