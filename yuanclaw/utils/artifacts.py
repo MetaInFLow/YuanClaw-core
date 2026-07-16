@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import os
 import re
 import uuid
 from datetime import datetime
@@ -21,6 +22,7 @@ _MIME_EXTENSIONS = {
     "image/webp": ".webp",
     "image/gif": ".gif",
 }
+MAX_IMAGE_ARTIFACT_BYTES = 20 * 1024 * 1024
 
 
 class ArtifactError(ValueError):
@@ -34,10 +36,15 @@ def decode_image_data_url(data_url: str) -> tuple[bytes, str]:
         raise ArtifactError("expected a base64 image data URL")
 
     declared_mime, encoded = match.groups()
+    max_encoded_length = ((MAX_IMAGE_ARTIFACT_BYTES + 2) // 3) * 4
+    if len(encoded) > max_encoded_length:
+        raise ArtifactError(f"image artifact exceeds {MAX_IMAGE_ARTIFACT_BYTES} bytes")
     try:
         raw = base64.b64decode(encoded, validate=True)
     except binascii.Error as exc:
         raise ArtifactError("invalid base64 image payload") from exc
+    if len(raw) > MAX_IMAGE_ARTIFACT_BYTES:
+        raise ArtifactError(f"image artifact exceeds {MAX_IMAGE_ARTIFACT_BYTES} bytes")
 
     detected_mime = detect_image_mime(raw)
     if detected_mime is None:
@@ -89,7 +96,6 @@ def store_generated_image_artifact(
     image_path = day_dir / f"{artifact_id}{ext}"
     metadata_path = day_dir / f"{artifact_id}.json"
 
-    image_path.write_bytes(raw)
     metadata: dict[str, Any] = {
         "id": artifact_id,
         "path": str(image_path),
@@ -100,10 +106,25 @@ def store_generated_image_artifact(
         "source_images": list(source_images or []),
         "created_at": now.isoformat(),
     }
-    metadata_path.write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    image_temp = image_path.with_name(f".{image_path.name}.{uuid.uuid4().hex}.tmp")
+    metadata_temp = metadata_path.with_name(f".{metadata_path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(image_temp, "xb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        with open(metadata_temp, "x", encoding="utf-8") as handle:
+            handle.write(json.dumps(metadata, ensure_ascii=False, indent=2))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(image_temp, image_path)
+        os.replace(metadata_temp, metadata_path)
+    except BaseException:
+        image_temp.unlink(missing_ok=True)
+        metadata_temp.unlink(missing_ok=True)
+        image_path.unlink(missing_ok=True)
+        metadata_path.unlink(missing_ok=True)
+        raise
     return metadata
 
 

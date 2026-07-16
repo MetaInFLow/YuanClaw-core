@@ -9,6 +9,7 @@ from yuanclaw.agent.tools.base import Tool
 from yuanclaw.config.paths import get_media_dir
 from yuanclaw.config.schema import ImageGenerationToolConfig, ProviderConfig
 from yuanclaw.providers.image_generation import (
+    MAX_REFERENCE_IMAGE_BYTES,
     ImageGenerationError,
     get_image_gen_provider,
 )
@@ -123,7 +124,12 @@ class ImageGenerationTool(Tool):
             raise ImageGenerationError(f"reference image not found: {value}") from exc
         if not resolved.is_file():
             raise ImageGenerationError(f"reference image is not a file: {value}")
-        raw = resolved.read_bytes()
+        if resolved.stat().st_size > MAX_REFERENCE_IMAGE_BYTES:
+            raise ImageGenerationError(
+                f"reference image exceeds {MAX_REFERENCE_IMAGE_BYTES} bytes: {value}"
+            )
+        with open(resolved, "rb") as handle:
+            raw = handle.read(512)
         if detect_image_mime(raw) is None:
             raise ImageGenerationError(f"unsupported reference image: {value}")
         return str(resolved)
