@@ -730,6 +730,38 @@ def test_write_config_api_rejects_enabled_runtime_channel_without_required_field
     assert runtime.applied_configs == []
 
 
+def test_config_api_masks_secrets_and_preserves_masks_on_write(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    runtime.config.providers.custom.api_key = "provider-value"
+    runtime.config.providers.custom.extra_headers = {
+        "Authorization": "Bearer value",
+        "X-Trace": "trace-value",
+    }
+    runtime.config.channels.telegram.token = "telegram-value"
+
+    with patch("yuanclaw.api.server.save_config") as mock_save_config:
+        with TestClient(create_app(runtime)) as client:
+            read_response = client.get("/api/config")
+            raw = read_response.json()["raw"]
+            write_response = client.put("/api/config", json=raw)
+
+    assert read_response.status_code == 200
+    assert "provider-value" not in read_response.text
+    assert "Bearer value" not in read_response.text
+    assert "trace-value" not in read_response.text
+    assert "telegram-value" not in read_response.text
+    assert raw["providers"]["custom"]["apiKey"] == "prov...ue"
+    assert raw["providers"]["custom"]["extraHeaders"]["Authorization"] == "Bear...ue"
+    assert raw["providers"]["custom"]["extraHeaders"]["X-Trace"] == "trac...ue"
+    assert raw["channels"]["telegram"]["token"] == "tele...ue"
+    assert write_response.status_code == 200
+    saved = mock_save_config.call_args.args[0]
+    assert saved.providers.custom.api_key == "provider-value"
+    assert saved.providers.custom.extra_headers["Authorization"] == "Bearer value"
+    assert saved.providers.custom.extra_headers["X-Trace"] == "trace-value"
+    assert saved.channels.telegram.token == "telegram-value"
+
+
 def test_write_config_api_restores_disk_config_when_runtime_apply_fails(tmp_path) -> None:
     runtime = _RuntimeStub(tmp_path / "workspace")
     previous_model = runtime.config.agents.defaults.model

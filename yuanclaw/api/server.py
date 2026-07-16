@@ -497,6 +497,67 @@ def _mask_secret(value: str) -> str:
     return f"{value[:4]}...{value[-2:]}"
 
 
+def _is_secret_config_key(key: str, parent_key: str | None = None) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+    parent = re.sub(r"[^a-z0-9]", "", (parent_key or "").lower())
+    if parent == "extraheaders":
+        return True
+    return normalized.endswith(("apikey", "token", "secret", "password", "privatekey")) or normalized in {
+        "authorization",
+        "cookie",
+    }
+
+
+def _redact_config_secrets(value: Any, parent_key: str | None = None) -> Any:
+    """Return a JSON-compatible config copy with secret strings masked."""
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            if isinstance(item, str) and _is_secret_config_key(key, parent_key):
+                redacted[key] = _mask_secret(item)
+            else:
+                redacted[key] = _redact_config_secrets(item, key)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_config_secrets(item, parent_key) for item in value]
+    return value
+
+
+def _preserve_masked_config_secrets(
+    incoming: Any,
+    existing: Any,
+    parent_key: str | None = None,
+) -> Any:
+    """Keep existing secrets when clients submit an empty value or the current mask."""
+    if isinstance(incoming, dict):
+        existing_map = existing if isinstance(existing, dict) else {}
+        merged: dict[str, Any] = {}
+        for key, item in incoming.items():
+            current = existing_map.get(key)
+            if (
+                isinstance(item, str)
+                and isinstance(current, str)
+                and current
+                and _is_secret_config_key(key, parent_key)
+                and item in {"", _mask_secret(current)}
+            ):
+                merged[key] = current
+            else:
+                merged[key] = _preserve_masked_config_secrets(item, current, key)
+        return merged
+    if isinstance(incoming, list):
+        existing_items = existing if isinstance(existing, list) else []
+        return [
+            _preserve_masked_config_secrets(
+                item,
+                existing_items[index] if index < len(existing_items) else None,
+                parent_key,
+            )
+            for index, item in enumerate(incoming)
+        ]
+    return incoming
+
+
 def _is_public_bind_host(host: str) -> bool:
     return host.strip() in {"0.0.0.0", "::"}
 
@@ -1840,7 +1901,7 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
             "model": runtime.config.agents.defaults.model,
             "workspace": str(runtime.config.workspace_path),
             "providers": _provider_rows(runtime.config, oauth_statuses=oauth_statuses),
-            "raw": runtime.config.model_dump(by_alias=True),
+            "raw": _redact_config_secrets(runtime.config.model_dump(by_alias=True)),
         }
 
     @app.get("/api/usage")
@@ -1874,6 +1935,10 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
 
     @app.put("/api/config")
     async def write_config(payload: dict[str, Any]) -> dict[str, Any]:
+        payload = _preserve_masked_config_secrets(
+            payload,
+            runtime.config.model_dump(by_alias=True),
+        )
         try:
             _validate_channel_payloads(payload)
         except Exception as exc:
