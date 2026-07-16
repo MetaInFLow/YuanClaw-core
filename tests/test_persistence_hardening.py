@@ -96,6 +96,58 @@ def test_config_damage_without_valid_backup_is_explicit(tmp_path) -> None:
     assert path.exists()
 
 
+def test_config_file_values_are_overridden_by_nested_environment(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "config.json"
+    config = Config()
+    config.agents.defaults.model = "file-model"
+    config.agents.defaults.max_tool_iterations = 40
+    config.tools.restrict_to_workspace = False
+    save_config(config, path)
+    original = path.read_text(encoding="utf-8")
+    monkeypatch.setenv("YUANCLAW_AGENTS__DEFAULTS__MODEL", "environment-model")
+    monkeypatch.setenv("YUANCLAW_AGENTS__DEFAULTS__MAX_TOOL_ITERATIONS", "12")
+    monkeypatch.setenv("YUANCLAW_TOOLS__RESTRICT_TO_WORKSPACE", "true")
+
+    loaded = load_config(path)
+
+    assert loaded.agents.defaults.model == "environment-model"
+    assert loaded.agents.defaults.max_tool_iterations == 12
+    assert loaded.tools.restrict_to_workspace is True
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_yuanclaw_environment_prefix_overrides_legacy_prefix(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "config.json"
+    save_config(Config(), path)
+    monkeypatch.setenv("NANOBOT_AGENTS__DEFAULTS__MODEL", "legacy-model")
+    monkeypatch.setenv("YUANCLAW_AGENTS__DEFAULTS__MODEL", "canonical-model")
+
+    loaded = load_config(path)
+
+    assert loaded.agents.defaults.model == "canonical-model"
+
+
+def test_invalid_environment_override_does_not_quarantine_valid_file(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "config.json"
+    save_config(Config(), path)
+    monkeypatch.setenv("YUANCLAW_AGENTS__DEFAULTS__MAX_TOOL_ITERATIONS", "0")
+
+    with pytest.raises(ValueError):
+        load_config(path)
+
+    assert path.is_file()
+    assert list(tmp_path.glob("config.json.corrupt-*")) == []
+
+
 def test_session_hash_prevents_legacy_filename_collision(tmp_path) -> None:
     manager = SessionManager(tmp_path)
     first = Session(key="a:b_c")
