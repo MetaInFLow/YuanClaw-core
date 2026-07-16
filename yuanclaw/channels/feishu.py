@@ -16,8 +16,10 @@ from yuanclaw.bus.queue import MessageBus
 from yuanclaw.channels.base import BaseChannel
 from yuanclaw.config.paths import get_media_dir
 from yuanclaw.config.schema import FeishuConfig
+from yuanclaw.utils.helpers import safe_filename
 
 FEISHU_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 
 # Message type display mapping
 MSG_TYPE_MAP = {
@@ -770,10 +772,14 @@ class FeishuChannel(BaseChannel):
                     filename = f"{filename}.opus"
 
         if data and filename:
-            file_path = media_dir / filename
+            safe_name = safe_filename(os.path.basename(filename)) or f"{msg_type}.bin"
+            if len(data) > MAX_ATTACHMENT_BYTES:
+                return None, f"[{msg_type}: {safe_name} - too large]"
+            message_prefix = safe_filename(str(message_id or "message"))[:32] or "message"
+            file_path = media_dir / f"{message_prefix}_{safe_name}"
             file_path.write_bytes(data)
             logger.debug("Downloaded {} to {}", msg_type, file_path)
-            return str(file_path), f"[{msg_type}: {filename}]"
+            return str(file_path), f"[{msg_type}: {safe_name}]"
 
         return None, f"[{msg_type}: download failed]"
 
@@ -901,6 +907,9 @@ class FeishuChannel(BaseChannel):
                 return
 
             sender_id = sender.sender_id.open_id if sender.sender_id else "unknown"
+            if not self.is_allowed(sender_id):
+                return
+
             chat_id = message.chat_id
             chat_type = message.chat_type
             msg_type = message.message_type

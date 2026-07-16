@@ -14,17 +14,40 @@ from yuanclaw.bus.queue import MessageBus
 from yuanclaw.channels.base import BaseChannel
 from yuanclaw.config.paths import get_media_dir
 from yuanclaw.config.schema import DiscordConfig
-from yuanclaw.utils.helpers import split_message
+from yuanclaw.utils.helpers import safe_filename, split_message
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20MB
 MAX_MESSAGE_LEN = 2000  # Discord message character limit
 
 
+class AttachmentTooLargeError(ValueError):
+    """Raised when an inbound Discord attachment exceeds the local limit."""
+
+
 class DiscordChannel(BaseChannel):
     """Discord channel using Gateway websocket."""
 
     name = "discord"
+
+    @staticmethod
+    def _attachment_filename(attachment: dict[str, Any]) -> str:
+        attachment_id = safe_filename(str(attachment.get("id") or "file")) or "file"
+        filename = safe_filename(str(attachment.get("filename") or "attachment")) or "attachment"
+        return f"{attachment_id}_{filename}"
+
+    async def _download_attachment(self, url: str, file_path: Path) -> None:
+        if not self._http:
+            raise RuntimeError("Discord HTTP client is not available")
+
+        data = bytearray()
+        async with self._http.stream("GET", url) as response:
+            response.raise_for_status()
+            async for chunk in response.aiter_bytes():
+                if len(data) + len(chunk) > MAX_ATTACHMENT_BYTES:
+                    raise AttachmentTooLargeError
+                data.extend(chunk)
+        file_path.write_bytes(data)
 
     def __init__(self, config: DiscordConfig, bus: MessageBus):
         super().__init__(config, bus)
@@ -294,7 +317,7 @@ class DiscordChannel(BaseChannel):
 
         for attachment in payload.get("attachments") or []:
             url = attachment.get("url")
-            filename = attachment.get("filename") or "attachment"
+            filename = str(attachment.get("filename") or "attachment")
             size = attachment.get("size") or 0
             if not url or not self._http:
                 continue
@@ -303,12 +326,12 @@ class DiscordChannel(BaseChannel):
                 continue
             try:
                 media_dir.mkdir(parents=True, exist_ok=True)
-                file_path = media_dir / f"{attachment.get('id', 'file')}_{filename.replace('/', '_')}"
-                resp = await self._http.get(url)
-                resp.raise_for_status()
-                file_path.write_bytes(resp.content)
+                file_path = media_dir / self._attachment_filename(attachment)
+                await self._download_attachment(url, file_path)
                 media_paths.append(str(file_path))
                 content_parts.append(f"[attachment: {file_path}]")
+            except AttachmentTooLargeError:
+                content_parts.append(f"[attachment: {filename} - too large]")
             except Exception as e:
                 logger.warning("Failed to download Discord attachment: {}", e)
                 content_parts.append(f"[attachment: {filename} - download failed]")

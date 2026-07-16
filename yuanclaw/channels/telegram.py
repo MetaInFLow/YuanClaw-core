@@ -624,6 +624,9 @@ class TelegramChannel(BaseChannel):
         sender_id = self._sender_id(user)
         self._remember_thread_context(message)
 
+        if not self.is_allowed(sender_id):
+            return
+
         # Store chat_id for replies
         self._chat_ids[sender_id] = chat_id
 

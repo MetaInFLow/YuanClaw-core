@@ -28,6 +28,7 @@ class _FakeBot:
     def __init__(self) -> None:
         self.sent_messages: list[dict] = []
         self.get_me_calls = 0
+        self.get_file_calls = 0
 
     async def get_me(self):
         self.get_me_calls += 1
@@ -41,6 +42,10 @@ class _FakeBot:
 
     async def send_chat_action(self, **kwargs) -> None:
         pass
+
+    async def get_file(self, _file_id):
+        self.get_file_calls += 1
+        raise AssertionError("unauthorized media must not be downloaded")
 
 
 class _FakeApp:
@@ -336,3 +341,22 @@ async def test_group_policy_open_accepts_plain_group_message() -> None:
 
     assert len(handled) == 1
     assert channel._app.bot.get_me_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_media_is_rejected_before_download() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["other"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    update = _make_telegram_update(chat_type="private", text=None)
+    update.message.document = SimpleNamespace(
+        file_id="document-1",
+        mime_type="application/pdf",
+        file_name="report.pdf",
+    )
+
+    await channel._on_message(update, None)
+
+    assert channel._app.bot.get_file_calls == 0
