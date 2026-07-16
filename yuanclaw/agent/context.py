@@ -20,6 +20,12 @@ class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
+    _MAX_ACTIVE_SKILLS = 16
+    _MAX_SKILL_CONTEXT_CHARS = 24_000
+    _MAX_SKILL_CHARS = 12_000
+    _MAX_IMAGES = 4
+    _MAX_IMAGE_BYTES = 10 * 1024 * 1024
+    _MAX_TOTAL_IMAGE_BYTES = 20 * 1024 * 1024
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
 
     def __init__(self, workspace: Path):
@@ -43,9 +49,16 @@ class ContextBuilder:
         if memory:
             parts.append(f"# Memory\n\n{memory}")
 
-        always_skills = self.skills.get_always_skills()
-        if always_skills:
-            always_content = self.skills.load_skills_for_context(always_skills)
+        active_skills = list(dict.fromkeys([
+            *self.skills.get_always_skills(),
+            *(name for name in (skill_names or []) if isinstance(name, str)),
+        ]))[:self._MAX_ACTIVE_SKILLS]
+        if active_skills:
+            always_content = self.skills.load_skills_for_context(
+                active_skills,
+                max_total_chars=self._MAX_SKILL_CONTEXT_CHARS,
+                max_skill_chars=self._MAX_SKILL_CHARS,
+            )
             if always_content:
                 parts.append(f"# Active Skills\n\n{always_content}")
 
@@ -168,7 +181,10 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             return text
 
         images = []
+        total_image_bytes = 0
         for path in media:
+            if len(images) >= self._MAX_IMAGES:
+                break
             try:
                 tool_workspace = current_tool_workspace(self.workspace)
                 p = resolve_allowed_path(
@@ -180,6 +196,15 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
                 continue
             if not p.is_file():
                 continue
+            try:
+                size = p.stat().st_size
+            except OSError:
+                continue
+            if (
+                size > self._MAX_IMAGE_BYTES
+                or total_image_bytes + size > self._MAX_TOTAL_IMAGE_BYTES
+            ):
+                continue
             raw = p.read_bytes()
             # Detect real MIME type from magic bytes; fallback to filename guess
             mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
@@ -187,6 +212,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
                 continue
             b64 = base64.b64encode(raw).decode()
             images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+            total_image_bytes += len(raw)
 
         if not images:
             return text
