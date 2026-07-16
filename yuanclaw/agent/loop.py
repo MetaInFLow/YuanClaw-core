@@ -137,6 +137,7 @@ class AgentLoop:
         cli_apps_config: CliAppsToolConfig | None = None,
         max_concurrent_subagents: int | None = None,
         subagent_timeout_s: float | None = None,
+        restart_handler: Callable[[], bool | Awaitable[bool]] | None = None,
     ):
         from yuanclaw.config.schema import (
             CliAppsToolConfig,
@@ -160,6 +161,7 @@ class AgentLoop:
         self.memory_config = memory_config or MemoryConfig()
         self.compaction_config = compaction_config or CompactionConfig()
         self.reasoning_effort = reasoning_effort
+        self.restart_handler = restart_handler
         self.brave_api_key = brave_api_key
         self.web_search_provider = web_search_provider
         self.web_search_base_url = web_search_base_url

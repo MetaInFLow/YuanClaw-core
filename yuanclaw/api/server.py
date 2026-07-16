@@ -1115,6 +1115,8 @@ class RuntimeEventBroker:
 class CoreRuntime:
     """In-memory runtime used by the Studio API server."""
 
+    _RESTART_DELAY_S = 1.0
+
     def __init__(self, config: Config, host: str, port: int, with_channels: bool) -> None:
         _validate_public_bind_auth(host, config.gateway)
         self.host = host
@@ -1125,6 +1127,7 @@ class CoreRuntime:
         self.config = config
         self._agent_task: asyncio.Task | None = None
         self._channels_task: asyncio.Task | None = None
+        self._restart_task: asyncio.Task | None = None
         self._started = False
         self._lifecycle_lock = asyncio.Lock()
         self._install_components(config, self._create_components(config))
@@ -1171,6 +1174,7 @@ class CoreRuntime:
                 cli_apps_config=config.tools.cli_apps,
                 max_concurrent_subagents=config.agents.defaults.max_concurrent_subagents,
                 subagent_timeout_s=config.agents.defaults.subagent_timeout_s,
+                restart_handler=self.request_restart,
             )
             cron.on_job = self._on_cron_job
             channels = ChannelManager(config, bus) if self.with_channels else None
@@ -1202,6 +1206,37 @@ class CoreRuntime:
         """Validate whether a config can be applied to the running Core."""
         _validate_public_bind_auth(self.host, config.gateway)
         return self._create_components(config)
+
+    def request_restart(self) -> bool:
+        """Schedule a lifecycle-managed runtime restart after the command reply is delivered."""
+        if not self._started:
+            return False
+        if self._restart_task is not None and not self._restart_task.done():
+            return False
+        self._restart_task = asyncio.create_task(
+            self._restart_after_delivery(),
+            name="yuanclaw-runtime-restart",
+        )
+        self._restart_task.add_done_callback(self._on_restart_done)
+        return True
+
+    async def _restart_after_delivery(self) -> None:
+        await asyncio.sleep(self._RESTART_DELAY_S)
+        prepared = self.prepare_config(self.config)
+        await self.apply_config(self.config, prepared)
+        self.events.publish({"type": "core.restarted"})
+
+    def _on_restart_done(self, task: asyncio.Task) -> None:
+        if self._restart_task is task:
+            self._restart_task = None
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error("Runtime restart failed ({})", type(error).__name__)
+            self.events.publish(
+                {"type": "core.restart_failed", "error_type": type(error).__name__}
+            )
 
     def _on_bus_inbound(self, msg: Any) -> None:
         content = (msg.content or "").strip()
@@ -1367,6 +1402,14 @@ class CoreRuntime:
 
     async def stop(self) -> None:
         """Stop runtime services."""
+        restart_task = self._restart_task
+        if (
+            restart_task is not None
+            and restart_task is not asyncio.current_task()
+            and not restart_task.done()
+        ):
+            restart_task.cancel()
+            await asyncio.gather(restart_task, return_exceptions=True)
         async with self._lifecycle_lock:
             await self._stop_locked()
 

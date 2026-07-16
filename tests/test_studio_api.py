@@ -1,7 +1,7 @@
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import quote
 
 import pytest
@@ -966,6 +966,33 @@ def test_core_runtime_running_reflects_background_task_liveness(tmp_path, monkey
 
     runtime._channels_task = SimpleNamespace(done=lambda: True)
     assert runtime.running is False
+
+
+@pytest.mark.asyncio
+async def test_core_runtime_restart_request_uses_config_apply_lifecycle(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "yuanclaw.config.paths.get_config_path",
+        lambda: tmp_path / "instance" / "config.json",
+    )
+    config = Config()
+    config.agents.defaults.workspace = str(tmp_path / "workspace")
+    runtime = CoreRuntime(config, host="127.0.0.1", port=18789, with_channels=False)
+    runtime._started = True
+    runtime._RESTART_DELAY_S = 0
+    prepared = {"prepared": True}
+    runtime.prepare_config = MagicMock(return_value=prepared)
+    runtime.apply_config = AsyncMock()
+
+    assert runtime.request_restart() is True
+    restart_task = runtime._restart_task
+    assert restart_task is not None
+    await restart_task
+
+    runtime.prepare_config.assert_called_once_with(config)
+    runtime.apply_config.assert_awaited_once_with(config, prepared)
 
 
 @pytest.mark.asyncio
