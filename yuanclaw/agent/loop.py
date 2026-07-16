@@ -30,7 +30,7 @@ from yuanclaw.agent.tools.image_generation import ImageGenerationTool
 from yuanclaw.agent.tools.long_task import CompleteGoalTool, LongTaskTool
 from yuanclaw.agent.tools.memory import MemoryGetTool, MemorySearchTool
 from yuanclaw.agent.tools.message import MessageTool
-from yuanclaw.agent.tools.registry import ToolRegistry
+from yuanclaw.agent.tools.registry import ToolExecutionResult, ToolRegistry
 from yuanclaw.agent.tools.shell import ExecTool
 from yuanclaw.agent.tools.spawn import SpawnTool
 from yuanclaw.agent.tools.web import WebFetchTool, WebSearchTool
@@ -428,27 +428,35 @@ class AgentLoop:
         }
 
     @classmethod
-    def _tool_event_finish(cls, tool_call: Any, result: Any) -> dict[str, Any]:
+    def _tool_event_finish(
+        cls,
+        tool_call: Any,
+        execution: ToolExecutionResult,
+    ) -> dict[str, Any]:
         start = cls._tool_event_start(tool_call)
-        is_error = isinstance(result, str) and result.startswith("Error")
-        start["phase"] = "error" if is_error else "end"
-        start["result"] = None if is_error else result
-        start["error"] = result if is_error else None
+        result = execution.content
+        start["phase"] = "end" if execution.ok else "error"
+        start["result"] = result if execution.ok else None
+        start["error"] = execution.error
         if isinstance(result, dict):
             start["files"] = result.get("files") if isinstance(result.get("files"), list) else []
             start["embeds"] = result.get("embeds") if isinstance(result.get("embeds"), list) else []
         return start
 
     @staticmethod
-    def _file_edit_events(tool_call: Any, *, phase: str, result: Any = None) -> list[dict[str, Any]]:
+    def _file_edit_events(
+        tool_call: Any,
+        *,
+        phase: str,
+        execution: ToolExecutionResult | None = None,
+    ) -> list[dict[str, Any]]:
         if getattr(tool_call, "name", "") != "apply_patch":
             return []
         arguments = getattr(tool_call, "arguments", {}) or {}
         edits = arguments.get("edits") if isinstance(arguments, dict) else None
         if not isinstance(edits, list):
             return []
-        is_error = isinstance(result, str) and result.startswith("Error")
-        effective_phase = "error" if phase == "end" and is_error else phase
+        effective_phase = "error" if phase == "end" and execution and not execution.ok else phase
         events: list[dict[str, Any]] = []
         for edit in edits:
             if not isinstance(edit, dict):
@@ -465,7 +473,7 @@ class AgentLoop:
                     "tool": "apply_patch",
                     "path": path,
                     "action": action,
-                    "error": result if effective_phase == "error" else None,
+                    "error": execution.error if effective_phase == "error" and execution else None,
                 }
             )
         return events
@@ -678,16 +686,20 @@ class AgentLoop:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    execution = await self.tools.execute_result(
+                        tool_call.name,
+                        tool_call.arguments,
+                    )
+                    result = execution.content
                     if on_progress:
                         await self._invoke_progress(
                             on_progress,
                             "",
-                            tool_events=[self._tool_event_finish(tool_call, result)],
+                            tool_events=[self._tool_event_finish(tool_call, execution)],
                             file_edit_events=self._file_edit_events(
                                 tool_call,
                                 phase="end",
-                                result=result,
+                                execution=execution,
                             ),
                         )
                     messages = self.context.add_tool_result(
