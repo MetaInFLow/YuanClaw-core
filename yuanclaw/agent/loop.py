@@ -135,6 +135,7 @@ class AgentLoop:
         image_generation_provider_configs: dict[str, ProviderConfig] | None = None,
         cli_apps_config: CliAppsToolConfig | None = None,
         max_concurrent_subagents: int | None = None,
+        subagent_timeout_s: float | None = None,
     ):
         from yuanclaw.config.schema import (
             CliAppsToolConfig,
@@ -200,6 +201,7 @@ class AgentLoop:
                 session_key,
             ),
             max_concurrent_subagents=max_concurrent_subagents,
+            subagent_timeout_s=subagent_timeout_s,
         )
 
         self._running = False

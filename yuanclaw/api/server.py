@@ -1134,6 +1134,7 @@ class CoreRuntime:
                 image_generation_provider_configs=_image_gen_provider_configs(config),
                 cli_apps_config=config.tools.cli_apps,
                 max_concurrent_subagents=config.agents.defaults.max_concurrent_subagents,
+                subagent_timeout_s=config.agents.defaults.subagent_timeout_s,
             )
             cron.on_job = self._on_cron_job
             channels = ChannelManager(config, bus) if self.with_channels else None

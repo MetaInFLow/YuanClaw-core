@@ -414,6 +414,7 @@ def gateway(
         image_generation_config=config.tools.image_generation,
         image_generation_provider_configs=image_gen_provider_configs(config),
         max_concurrent_subagents=config.agents.defaults.max_concurrent_subagents,
+        subagent_timeout_s=config.agents.defaults.subagent_timeout_s,
     )
 
     # Set cron callback (needs agent)
@@ -509,6 +510,9 @@ def gateway(
         on_notify=on_heartbeat_notify,
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
+        decision_timeout_s=hb_cfg.decision_timeout_s,
+        execution_timeout_s=hb_cfg.execution_timeout_s,
+        notify_timeout_s=hb_cfg.notify_timeout_s,
     )
 
     if channels.enabled_channels:
@@ -533,7 +537,7 @@ def gateway(
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         finally:
-            heartbeat.stop()
+            await heartbeat.aclose()
             cron.stop()
             await agent.shutdown()
             await channels.stop_all()
@@ -607,6 +611,7 @@ def agent(
         image_generation_config=config.tools.image_generation,
         image_generation_provider_configs=image_gen_provider_configs(config),
         max_concurrent_subagents=config.agents.defaults.max_concurrent_subagents,
+        subagent_timeout_s=config.agents.defaults.subagent_timeout_s,
     )
 
     async def _cli_progress(content: str, *, tool_hint: bool = False) -> None:

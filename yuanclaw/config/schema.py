@@ -352,6 +352,7 @@ class AgentDefaults(GenerationConfig):
     workspace: str = "~/.yuanclaw/workspace"
     max_tool_iterations: int = 40
     max_concurrent_subagents: int = Field(default=1, ge=1)
+    subagent_timeout_s: float = Field(default=900.0, gt=0, le=86_400)
     memory_window: int = 100
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
@@ -432,7 +433,10 @@ class HeartbeatConfig(Base):
     """Heartbeat service configuration."""
 
     enabled: bool = True
-    interval_s: int = 30 * 60  # 30 minutes
+    interval_s: int = Field(default=30 * 60, ge=1, le=604_800)
+    decision_timeout_s: float = Field(default=60.0, gt=0, le=600)
+    execution_timeout_s: float = Field(default=600.0, gt=0, le=86_400)
+    notify_timeout_s: float = Field(default=30.0, gt=0, le=600)
 
 
 class GatewayConfig(Base):
