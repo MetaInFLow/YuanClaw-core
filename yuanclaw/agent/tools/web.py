@@ -9,6 +9,7 @@ import json
 import os
 import re
 import socket
+from functools import partial
 from typing import Any
 from urllib.parse import urlparse
 
@@ -197,6 +198,7 @@ class WebSearchTool(Tool):
         self._init_base_url = base_url
         self.max_results = max_results
         self.proxy = proxy
+        self._duckduckgo_slots = asyncio.Semaphore(2)
 
     @property
     def provider(self) -> str:
@@ -367,7 +369,17 @@ class WebSearchTool(Tool):
             from ddgs import DDGS
 
             ddgs = DDGS(timeout=10)
-            raw = await asyncio.to_thread(ddgs.text, query, max_results=n)
+            await self._duckduckgo_slots.acquire()
+            try:
+                future = asyncio.get_running_loop().run_in_executor(
+                    None,
+                    partial(ddgs.text, query, max_results=n),
+                )
+            except BaseException:
+                self._duckduckgo_slots.release()
+                raise
+            future.add_done_callback(lambda _done: self._duckduckgo_slots.release())
+            raw = await asyncio.shield(future)
             if not raw:
                 return f"No results for: {query}"
             items = [
@@ -420,17 +432,7 @@ class WebFetchTool(Tool):
         if not is_valid:
             return json.dumps({"error": f"URL validation failed: {error_msg}", "url": url}, ensure_ascii=False)
 
-        try:
-            image_payload = await self._fetch_image_payload(url)
-            if image_payload is not None:
-                return image_payload
-        except Exception as exc:
-            logger.debug("Pre-fetch image detection failed for {}: {}", url, exc)
-
-        result = await self._fetch_jina(url, max_chars)
-        if result is None:
-            result = await self._fetch_readability(url, extract_mode, max_chars)
-        return result
+        return await self._fetch_readability(url, extract_mode, max_chars)
 
     async def _fetch_image_payload(self, url: str) -> Any | None:
         """Fetch images directly and return native image blocks."""

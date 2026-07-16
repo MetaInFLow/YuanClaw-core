@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -69,6 +70,24 @@ async def test_web_fetch_returns_image_content_blocks(monkeypatch: pytest.Monkey
     assert isinstance(result, list)
     assert result[0]["type"] == "image_url"
     assert result[1]["text"] == "(Image fetched from: https://example.com/image.png)"
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_uses_one_direct_fetch_strategy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(web_tools, "_validate_url_target", lambda url: (True, ""))
+    tool = WebFetchTool()
+    tool._fetch_readability = AsyncMock(return_value="direct result")
+    tool._fetch_image_payload = AsyncMock(side_effect=AssertionError("duplicate image probe"))
+    tool._fetch_jina = AsyncMock(side_effect=AssertionError("unexpected intermediary fetch"))
+
+    result = await tool.execute("https://example.com/page")
+
+    assert result == "direct result"
+    tool._fetch_readability.assert_awaited_once_with(
+        "https://example.com/page",
+        "markdown",
+        tool.max_chars,
+    )
 
 
 @pytest.mark.asyncio
