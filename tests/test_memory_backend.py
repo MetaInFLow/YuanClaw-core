@@ -1,6 +1,8 @@
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from yuanclaw.memory import CoreMemoryBackend, LegacyMemoryBackend, MemoryHit
 
 
@@ -153,3 +155,22 @@ def test_memory_get_does_not_refresh_search_index(tmp_path: Path) -> None:
     doc = backend.get("MEMORY.md")
 
     assert "direct read" in doc.content
+
+
+def test_memory_get_rejects_existing_file_outside_inventory(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.txt"
+    outside.write_text("not memory", encoding="utf-8")
+    backend = CoreMemoryBackend(tmp_path)
+
+    with pytest.raises(PermissionError, match="outside the configured inventory"):
+        backend.get(str(outside))
+
+
+def test_memory_get_allows_explicit_extra_path(tmp_path: Path) -> None:
+    extra = tmp_path / "notes" / "project.md"
+    _write(extra, "# Project\n\nallowed context\n")
+    backend = CoreMemoryBackend(tmp_path, extra_paths=["notes"])
+
+    doc = backend.get("notes/project.md")
+
+    assert "allowed context" in doc.content

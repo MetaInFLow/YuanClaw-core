@@ -222,9 +222,13 @@ class CoreMemoryBackend:
         candidates = [raw if raw.is_absolute() else (self.workspace / raw)]
         if not raw.is_absolute():
             candidates.append(self.memory_dir / raw)
+        allowed = {candidate.resolve() for candidate in self._indexed_paths()}
         for candidate in candidates:
             if candidate.exists():
-                return candidate.resolve()
+                resolved = candidate.resolve()
+                if resolved not in allowed:
+                    raise PermissionError(f"memory document is outside the configured inventory: {path}")
+                return resolved
         return candidates[0].resolve()
 
     def _display_path(self, path: Path) -> str:
