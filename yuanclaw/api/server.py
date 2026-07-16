@@ -27,7 +27,6 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from loguru import logger
 
 from yuanclaw import __version__
-from yuanclaw.agent.loop import AgentLoop
 from yuanclaw.agent.skills import SkillsLoader
 from yuanclaw.bus.queue import MessageBus
 from yuanclaw.channels.manager import ChannelManager
@@ -37,6 +36,7 @@ from yuanclaw.config.schema import Config
 from yuanclaw.cron.service import CronService
 from yuanclaw.cron.types import CronJob
 from yuanclaw.providers.registry import PROVIDERS, find_by_name
+from yuanclaw.runtime import build_agent_loop
 from yuanclaw.session.goal_state import goal_state_ws_blob
 from yuanclaw.session.manager import SessionManager
 from yuanclaw.utils.helpers import sync_workspace_templates
@@ -486,12 +486,6 @@ def _make_provider(config: Config):
     from yuanclaw.providers.factory import make_provider
 
     return make_provider(config)
-
-
-def _image_gen_provider_configs(config: Config):
-    from yuanclaw.providers.image_generation import image_gen_provider_configs
-
-    return image_gen_provider_configs(config)
 
 
 def _mask_secret(value: str) -> str:
@@ -1144,36 +1138,12 @@ class CoreRuntime:
             provider = _make_provider(config)
             session_manager = SessionManager(config.workspace_path)
             cron = CronService(get_cron_dir() / "jobs.json")
-            agent = AgentLoop(
+            agent = build_agent_loop(
+                config,
                 bus=bus,
                 provider=provider,
-                workspace=config.workspace_path,
-                model=config.agents.defaults.model,
-                provider_name=config.get_provider_name(config.agents.defaults.model),
-                temperature=config.agents.defaults.temperature,
-                max_tokens=config.agents.defaults.max_tokens,
-                context_window_tokens=config.agents.defaults.context_window_tokens,
-                max_iterations=config.agents.defaults.max_tool_iterations,
-                memory_window=config.agents.defaults.memory_window,
-                memory_config=config.agents.defaults.memory,
-                compaction_config=config.agents.defaults.compaction,
-                reasoning_effort=config.agents.defaults.reasoning_effort,
-                brave_api_key=config.tools.web.search.api_key or None,
-                web_search_provider=config.tools.web.search.provider,
-                web_search_base_url=config.tools.web.search.base_url or None,
-                web_search_max_results=config.tools.web.search.max_results,
-                web_proxy=config.tools.web.proxy or None,
-                exec_config=config.tools.exec,
                 cron_service=cron,
-                restrict_to_workspace=config.tools.restrict_to_workspace,
                 session_manager=session_manager,
-                mcp_servers=config.tools.mcp_servers,
-                channels_config=config.channels,
-                image_generation_config=config.tools.image_generation,
-                image_generation_provider_configs=_image_gen_provider_configs(config),
-                cli_apps_config=config.tools.cli_apps,
-                max_concurrent_subagents=config.agents.defaults.max_concurrent_subagents,
-                subagent_timeout_s=config.agents.defaults.subagent_timeout_s,
                 restart_handler=self.request_restart,
             )
             cron.on_job = self._on_cron_job

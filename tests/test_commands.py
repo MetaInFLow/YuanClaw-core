@@ -225,6 +225,14 @@ def test_agent_uses_default_config_when_no_workspace_or_config_flags(mock_agent_
     assert mock_agent_runtime["agent_loop_cls"].call_args.kwargs["workspace"] == (
         mock_agent_runtime["config"].workspace_path
     )
+    assert mock_agent_runtime["agent_loop_cls"].call_args.kwargs["provider_name"] == (
+        mock_agent_runtime["config"].get_provider_name(
+            mock_agent_runtime["config"].agents.defaults.model
+        )
+    )
+    assert mock_agent_runtime["agent_loop_cls"].call_args.kwargs["cli_apps_config"] is (
+        mock_agent_runtime["config"].tools.cli_apps
+    )
     mock_agent_runtime["agent_loop"].process_direct.assert_awaited_once()
     mock_agent_runtime["agent_loop"].shutdown.assert_awaited_once()
     mock_agent_runtime["print_response"].assert_called_once_with("mock-response", render_markdown=True)
