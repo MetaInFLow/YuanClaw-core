@@ -1,10 +1,15 @@
 """CLI commands for yuanclaw."""
 
 import asyncio
+import hashlib
+import json
 import os
 import select
+import shutil
 import signal
+import subprocess
 import sys
+import uuid
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -872,22 +877,10 @@ def channels_status():
 
 def _get_bridge_dir() -> Path:
     """Get the bridge directory, setting it up if needed."""
-    import shutil
-    import subprocess
-
     # User's bridge location
     from yuanclaw.config.paths import get_bridge_install_dir
 
     user_bridge = get_bridge_install_dir()
-
-    # Check if already built
-    if (user_bridge / "dist" / "index.js").exists():
-        return user_bridge
-
-    # Check for npm
-    if not shutil.which("npm"):
-        console.print("[red]npm not found. Please install Node.js >= 18.[/red]")
-        raise typer.Exit(1)
 
     # Find source bridge: first check package data, then source dir
     pkg_bridge = Path(__file__).parent.parent / "bridge"  # yuanclaw/bridge (installed)
@@ -904,28 +897,87 @@ def _get_bridge_dir() -> Path:
         console.print("Try reinstalling: pip install --force-reinstall yuanclaw")
         raise typer.Exit(1)
 
+    package_data = json.loads((source / "package.json").read_text(encoding="utf-8"))
+    lock_path = source / "package-lock.json"
+    signature = {
+        "version": str(package_data.get("version") or "unknown"),
+        "lock_sha256": hashlib.sha256(lock_path.read_bytes()).hexdigest()
+        if lock_path.exists()
+        else "",
+    }
+    manifest_path = user_bridge / ".yuanclaw-bridge-install.json"
+    try:
+        installed_signature = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        installed_signature = None
+    if (user_bridge / "dist" / "index.js").is_file() and installed_signature == signature:
+        return user_bridge
+
+    npm = shutil.which("npm")
+    node = shutil.which("node")
+    if not npm or not node:
+        console.print("[red]npm/Node.js not found. Please install Node.js >= 20.[/red]")
+        raise typer.Exit(1)
+    try:
+        version_result = subprocess.run(
+            [node, "--version"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        major = int(version_result.stdout.strip().lstrip("v").split(".", 1)[0])
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        console.print(f"[red]Unable to verify Node.js version: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    if major < 20:
+        console.print(f"[red]Node.js >= 20 is required; found {version_result.stdout.strip()}.[/red]")
+        raise typer.Exit(1)
+
     console.print(f"{__logo__} Setting up bridge...")
 
-    # Copy to user directory
     user_bridge.parent.mkdir(parents=True, exist_ok=True)
-    if user_bridge.exists():
-        shutil.rmtree(user_bridge)
-    shutil.copytree(source, user_bridge, ignore=shutil.ignore_patterns("node_modules", "dist"))
+    staging = user_bridge.with_name(f".{user_bridge.name}.staging-{uuid.uuid4().hex}")
+    backup = user_bridge.with_name(f".{user_bridge.name}.backup-{uuid.uuid4().hex}")
 
-    # Install and build
     try:
+        shutil.copytree(
+            source,
+            staging,
+            ignore=shutil.ignore_patterns("node_modules", "dist"),
+        )
         console.print("  Installing dependencies...")
-        subprocess.run(["npm", "install"], cwd=user_bridge, check=True, capture_output=True)
+        subprocess.run([npm, "ci"], cwd=staging, check=True, capture_output=True)
 
         console.print("  Building...")
-        subprocess.run(["npm", "run", "build"], cwd=user_bridge, check=True, capture_output=True)
+        subprocess.run([npm, "run", "build"], cwd=staging, check=True, capture_output=True)
+        if not (staging / "dist" / "index.js").is_file():
+            raise RuntimeError("bridge build did not produce dist/index.js")
+        (staging / ".yuanclaw-bridge-install.json").write_text(
+            json.dumps(signature, indent=2),
+            encoding="utf-8",
+        )
+
+        if user_bridge.exists():
+            shutil.move(str(user_bridge), str(backup))
+        try:
+            shutil.move(str(staging), str(user_bridge))
+        except Exception:
+            if backup.exists() and not user_bridge.exists():
+                shutil.move(str(backup), str(user_bridge))
+            raise
+        if backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
 
         console.print("[green]✓[/green] Bridge ready\n")
-    except subprocess.CalledProcessError as e:
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as e:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
         console.print(f"[red]Build failed: {e}[/red]")
-        if e.stderr:
-            console.print(f"[dim]{e.stderr.decode()[:500]}[/dim]")
-        raise typer.Exit(1)
+        stderr = getattr(e, "stderr", None)
+        if stderr:
+            detail = stderr.decode(errors="replace") if isinstance(stderr, bytes) else str(stderr)
+            console.print(f"[dim]{detail[:500]}[/dim]")
+        raise typer.Exit(1) from e
 
     return user_bridge
 
@@ -933,8 +985,6 @@ def _get_bridge_dir() -> Path:
 @channels_app.command("login")
 def channels_login():
     """Link device via QR code."""
-    import subprocess
-
     from yuanclaw.config.loader import load_config
     from yuanclaw.config.paths import get_runtime_subdir
 
@@ -953,8 +1003,10 @@ def channels_login():
         subprocess.run(["npm", "start"], cwd=bridge_dir, check=True, env=env)
     except subprocess.CalledProcessError as e:
         console.print(f"[red]Bridge failed: {e}[/red]")
+        raise typer.Exit(e.returncode or 1) from e
     except FileNotFoundError:
         console.print("[red]npm not found. Please install Node.js.[/red]")
+        raise typer.Exit(1) from None
 
 
 @channels_app.command("pairings")
