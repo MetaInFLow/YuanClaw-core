@@ -1045,6 +1045,31 @@ def test_gateway_token_issue_endpoint_mints_short_lived_api_token(tmp_path) -> N
     assert authorized.status_code == 200
 
 
+def test_gateway_token_issue_path_tracks_hot_config(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    original_path = runtime.config.gateway.token_issue_path
+    app = create_app(runtime)
+
+    with TestClient(app) as client:
+        runtime.config.gateway.token_issue_path = "/api/token-after-hot-config"
+        runtime.config.gateway.token_issue_secret = "issue-secret"
+        issued = client.get(
+            runtime.config.gateway.token_issue_path,
+            headers={"Authorization": "Bearer issue-secret"},
+        )
+        old_path = client.get(original_path)
+        issued_token = issued.json()["token"]
+        unknown = client.get(
+            "/api/not-a-real-route",
+            headers={"Authorization": f"Bearer {issued_token}"},
+        )
+
+    assert issued.status_code == 200
+    assert isinstance(issued_token, str)
+    assert old_path.status_code == 401
+    assert unknown.status_code == 404
+
+
 def test_websocket_requires_gateway_token_when_configured(tmp_path) -> None:
     runtime = _RuntimeStub(tmp_path / "workspace")
     runtime.config.gateway.token = "static-token"

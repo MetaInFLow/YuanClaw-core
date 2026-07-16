@@ -2216,6 +2216,18 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
         finally:
             runtime.events.unsubscribe(queue)
 
+    @app.get("/{dynamic_path:path}")
+    async def dynamic_gateway_token_path(
+        dynamic_path: str,
+        request: Request,
+    ) -> dict[str, Any]:
+        """Serve a token path changed by hot config after static routes are checked."""
+        configured_path = str(runtime.config.gateway.token_issue_path or "").rstrip("/")
+        requested_path = f"/{dynamic_path}".rstrip("/") or "/"
+        if configured_path and requested_path == configured_path:
+            return await issue_gateway_token(request)
+        raise HTTPException(status_code=404, detail="not found")
+
     return app
 
 
