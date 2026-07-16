@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from urllib.parse import quote
@@ -332,6 +333,34 @@ def test_signed_media_route_supports_single_byte_range(tmp_path, monkeypatch) ->
     assert partial.headers["accept-ranges"] == "bytes"
     assert invalid.status_code == 416
     assert invalid.headers["content-range"] == "bytes */10"
+
+
+def test_signed_media_route_streams_without_path_read_bytes(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "yuanclaw.config.paths.get_config_path",
+        lambda: tmp_path / "instance" / "config.json",
+    )
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    media_path = get_media_dir("api") / "streamed.mp4"
+    expected = b"streamed-content"
+    media_path.write_bytes(expected)
+    session = runtime.session_manager.get_or_create("studio:thread-streamed")
+    session.add_message("user", "clip", media=[str(media_path)])
+    runtime.session_manager.save(session)
+
+    with TestClient(create_app(runtime)) as client:
+        replay = client.get(f"/api/sessions/{quote(session.key, safe='')}/messages")
+        media_url = replay.json()["messages"][0]["media_urls"][0]["url"]
+        monkeypatch.setattr(
+            Path,
+            "read_bytes",
+            lambda _self: (_ for _ in ()).throw(AssertionError("read_bytes is forbidden")),
+        )
+        response = client.get(media_url)
+
+    assert response.status_code == 200
+    assert response.content == expected
+    assert response.headers["content-length"] == str(len(expected))
 
 
 def test_session_messages_api_does_not_create_missing_session(tmp_path) -> None:

@@ -23,7 +23,7 @@ from urllib.parse import unquote
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from loguru import logger
 
 from yuanclaw import __version__
@@ -207,6 +207,7 @@ _MAX_COWBOY_NAME_CHARS = 200
 _MAX_DISTILL_SESSIONS = 40
 _MAX_DISTILL_INSIGHTS = 80
 _MAX_DISTILL_PROMPT_CHARS = 20_000
+_MEDIA_STREAM_CHUNK_BYTES = 64 * 1024
 
 
 @dataclass
@@ -637,6 +638,19 @@ def _parse_single_byte_range(range_header: str, size: int) -> tuple[int, int]:
     return start, min(end, size - 1)
 
 
+def _stream_file_range(path: Path, *, start: int, length: int):
+    """Yield one bounded file range without loading it fully into memory."""
+    with path.open("rb") as handle:
+        handle.seek(start)
+        remaining = length
+        while remaining > 0:
+            chunk = handle.read(min(_MEDIA_STREAM_CHUNK_BYTES, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+
+
 def _serve_signed_media(
     sig: str,
     payload: str,
@@ -695,20 +709,22 @@ def _serve_signed_media(
                     "X-Content-Type-Options": "nosniff",
                 },
             )
-        try:
-            with candidate.open("rb") as handle:
-                handle.seek(start)
-                body = handle.read(end - start + 1)
-        except OSError:
-            return Response("read error", status_code=500)
+        length = end - start + 1
         headers["Content-Range"] = f"bytes {start}-{end}/{size}"
-        return Response(body, status_code=206, media_type=mime, headers=headers)
+        headers["Content-Length"] = str(length)
+        return StreamingResponse(
+            _stream_file_range(candidate, start=start, length=length),
+            status_code=206,
+            media_type=mime,
+            headers=headers,
+        )
 
-    try:
-        body = candidate.read_bytes()
-    except OSError:
-        return Response("read error", status_code=500)
-    return Response(body, media_type=mime, headers=headers)
+    headers["Content-Length"] = str(size)
+    return StreamingResponse(
+        _stream_file_range(candidate, start=0, length=size),
+        media_type=mime,
+        headers=headers,
+    )
 
 
 def _extract_description(skill_file: Path) -> str:
