@@ -68,6 +68,10 @@ class FallbackProvider(LLMProvider):
         self._provider_factory = provider_factory
         self._primary_failures = 0
         self._primary_tripped_at: float | None = None
+        self._circuit_lock = asyncio.Lock()
+        self._primary_attempt_seq = 0
+        self._primary_applied_seq = 0
+        self._primary_outcomes: dict[int, bool | None] = {}
 
     @property
     def generation(self):
@@ -80,12 +84,41 @@ class FallbackProvider(LLMProvider):
     def get_default_model(self) -> str:
         return self._primary.get_default_model()
 
-    def _primary_available(self) -> bool:
+    def _primary_available_unlocked(self) -> bool:
         if self._primary_tripped_at is None:
             return True
         if time.monotonic() - self._primary_tripped_at >= _PRIMARY_COOLDOWN_S:
             return True
         return False
+
+    async def _begin_primary_attempt(self) -> int | None:
+        async with self._circuit_lock:
+            if not self._primary_available_unlocked():
+                return None
+            self._primary_attempt_seq += 1
+            return self._primary_attempt_seq
+
+    async def _record_primary_outcome(
+        self,
+        attempt_id: int,
+        succeeded: bool | None,
+    ) -> None:
+        async with self._circuit_lock:
+            self._primary_outcomes[attempt_id] = succeeded
+            while self._primary_applied_seq + 1 in self._primary_outcomes:
+                self._primary_applied_seq += 1
+                outcome = self._primary_outcomes.pop(self._primary_applied_seq)
+                if outcome is True:
+                    self._primary_failures = 0
+                    self._primary_tripped_at = None
+                elif outcome is False:
+                    self._primary_failures += 1
+                    if self._primary_failures >= _PRIMARY_FAILURE_THRESHOLD:
+                        self._primary_tripped_at = time.monotonic()
+
+    async def _primary_is_tripped(self) -> bool:
+        async with self._circuit_lock:
+            return not self._primary_available_unlocked()
 
     async def chat(self, **kwargs: Any) -> LLMResponse:
         if not self._fallback_presets:
@@ -100,12 +133,16 @@ class FallbackProvider(LLMProvider):
         primary_model = kwargs.get("model") or self._primary.get_default_model()
         last_response: LLMResponse | None = None
 
-        if self._primary_available():
-            response, emitted = await self._attempt(call, self._primary, kwargs)
+        primary_attempt_id = await self._begin_primary_attempt()
+        if primary_attempt_id is not None:
+            try:
+                response, emitted = await self._attempt(call, self._primary, kwargs)
+            except asyncio.CancelledError:
+                await self._record_primary_outcome(primary_attempt_id, None)
+                raise
             last_response = response
             if not self._is_error_response(response):
-                self._primary_failures = 0
-                self._primary_tripped_at = None
+                await self._record_primary_outcome(primary_attempt_id, True)
                 return response
 
             if emitted:
@@ -113,6 +150,7 @@ class FallbackProvider(LLMProvider):
                     "Primary model '{}' failed after streaming output; fallback suppressed",
                     primary_model,
                 )
+                await self._record_primary_outcome(primary_attempt_id, None)
                 return response
 
             if not self._should_fallback(response):
@@ -121,11 +159,11 @@ class FallbackProvider(LLMProvider):
                     primary_model,
                     (response.content or "")[:120],
                 )
+                await self._record_primary_outcome(primary_attempt_id, None)
                 return response
 
-            self._primary_failures += 1
-            if self._primary_failures >= _PRIMARY_FAILURE_THRESHOLD:
-                self._primary_tripped_at = time.monotonic()
+            await self._record_primary_outcome(primary_attempt_id, False)
+            if await self._primary_is_tripped():
                 logger.warning(
                     "Primary model '{}' circuit open after {} consecutive failures",
                     primary_model,
@@ -134,7 +172,7 @@ class FallbackProvider(LLMProvider):
         else:
             logger.debug("Primary model '{}' circuit open; skipping", primary_model)
 
-        primary_skipped = not self._primary_available()
+        primary_skipped = await self._primary_is_tripped()
         for idx, fallback in enumerate(self._fallback_presets):
             fallback_model = fallback.model
             if idx == 0 and primary_skipped:

@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -50,6 +51,25 @@ class _RaisingProvider(LLMProvider):
         return self.model
 
 
+class _ConcurrentPrimary(LLMProvider):
+    def __init__(self, responses: list[LLMResponse]) -> None:
+        super().__init__()
+        self.responses = responses
+        self.entered = [asyncio.Event() for _ in responses]
+        self.release = [asyncio.Event() for _ in responses]
+        self.calls = 0
+
+    async def chat(self, **kwargs: Any) -> LLMResponse:
+        index = self.calls
+        self.calls += 1
+        self.entered[index].set()
+        await self.release[index].wait()
+        return self.responses[index]
+
+    def get_default_model(self) -> str:
+        return "primary-model"
+
+
 class _FakeBedrockClient:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -79,6 +99,62 @@ class _FallbackPreset:
     max_tokens: int = 1024
     temperature: float = 0.2
     reasoning_effort: str | None = None
+
+
+@pytest.mark.asyncio
+async def test_fallback_circuit_applies_concurrent_outcomes_in_attempt_order() -> None:
+    primary = _ConcurrentPrimary([
+        LLMResponse(
+            content="temporary failure",
+            finish_reason="error",
+            error_kind="server_error",
+        ),
+        LLMResponse(content="newer success"),
+    ])
+    wrapper = FallbackProvider(
+        primary=primary,
+        fallback_presets=[_FallbackPreset(model="fallback-model")],
+        provider_factory=lambda _preset: _FakeProvider(
+            "fallback-model",
+            [LLMResponse(content="fallback success")],
+        ),
+    )
+
+    older = asyncio.create_task(wrapper.chat(messages=[]))
+    await primary.entered[0].wait()
+    newer = asyncio.create_task(wrapper.chat(messages=[]))
+    await primary.entered[1].wait()
+    primary.release[1].set()
+    assert (await newer).content == "newer success"
+
+    primary.release[0].set()
+    assert (await older).content == "fallback success"
+    assert wrapper._primary_failures == 0
+    assert wrapper._primary_tripped_at is None
+
+
+@pytest.mark.asyncio
+async def test_fallback_circuit_skips_primary_after_failure_threshold() -> None:
+    error = LLMResponse(
+        content="temporary failure",
+        finish_reason="error",
+        error_kind="server_error",
+    )
+    primary = _FakeProvider("primary-model", [error, error, error])
+    wrapper = FallbackProvider(
+        primary=primary,
+        fallback_presets=[_FallbackPreset(model="fallback-model")],
+        provider_factory=lambda _preset: _FakeProvider(
+            "fallback-model",
+            [LLMResponse(content="fallback success")],
+        ),
+    )
+
+    for _ in range(4):
+        assert (await wrapper.chat(messages=[])).content == "fallback success"
+
+    assert len(primary.calls) == 3
+    assert wrapper._primary_tripped_at is not None
 
 
 @pytest.mark.asyncio
