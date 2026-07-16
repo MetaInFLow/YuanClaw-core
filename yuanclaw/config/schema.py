@@ -288,8 +288,8 @@ class MemoryConfig(Base):
 
     backend: Literal["legacy", "core"] = "legacy"
     daily_pages: bool = True
-    recent_days: int = 2
-    search_max_results: int = 8
+    recent_days: int = Field(default=2, ge=0, le=3650)
+    search_max_results: int = Field(default=8, ge=1, le=1000)
     extra_paths: list[str] = Field(default_factory=list)
 
 
@@ -297,13 +297,13 @@ class MemoryFlushConfig(Base):
     """Pre-compaction memory flush configuration."""
 
     enabled: bool = True
-    soft_threshold_tokens: int = 4000
+    soft_threshold_tokens: int = Field(default=4000, ge=1, le=10_000_000)
 
 
 class CompactionConfig(Base):
     """Compaction budget and flush thresholds."""
 
-    reserve_tokens_floor: int = 12000
+    reserve_tokens_floor: int = Field(default=12000, ge=0, le=10_000_000)
     memory_flush: MemoryFlushConfig = Field(default_factory=MemoryFlushConfig)
     session_ttl_minutes: int = Field(
         default=0,
@@ -320,9 +320,9 @@ class GenerationConfig(Base):
     provider: str = (
         "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
     )
-    max_tokens: int = 8192
-    context_window_tokens: int = 65536
-    temperature: float = 0.1
+    max_tokens: int = Field(default=8192, ge=1, le=10_000_000)
+    context_window_tokens: int = Field(default=65536, ge=1, le=10_000_000)
+    temperature: float = Field(default=0.1, ge=0, le=2)
     reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
 
 
@@ -331,9 +331,9 @@ class InlineFallbackConfig(Base):
 
     model: str
     provider: str = "auto"
-    max_tokens: int | None = None
-    context_window_tokens: int | None = None
-    temperature: float | None = None
+    max_tokens: int | None = Field(default=None, ge=1, le=10_000_000)
+    context_window_tokens: int | None = Field(default=None, ge=1, le=10_000_000)
+    temperature: float | None = Field(default=None, ge=0, le=2)
     reasoning_effort: str | None = None
 
 
@@ -354,10 +354,10 @@ class AgentDefaults(GenerationConfig):
     """Default agent configuration."""
 
     workspace: str = "~/.yuanclaw/workspace"
-    max_tool_iterations: int = 40
-    max_concurrent_subagents: int = Field(default=1, ge=1)
+    max_tool_iterations: int = Field(default=40, ge=1, le=1000)
+    max_concurrent_subagents: int = Field(default=1, ge=1, le=100)
     subagent_timeout_s: float = Field(default=900.0, gt=0, le=86_400)
-    memory_window: int = 100
+    memory_window: int = Field(default=100, ge=2, le=100_000)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
     fallback_models: list[str | InlineFallbackConfig] = Field(default_factory=list)
@@ -447,7 +447,7 @@ class GatewayConfig(Base):
     """Gateway/server configuration."""
 
     host: str = "0.0.0.0"
-    port: int = 18790
+    port: int = Field(default=18790, ge=1, le=65535)
     token: str = ""
     token_issue_path: str = "/api/auth/token"
     token_issue_secret: str = ""
@@ -470,10 +470,10 @@ class GatewayConfig(Base):
 class WebSearchConfig(Base):
     """Web search tool configuration."""
 
-    provider: str = "brave"  # brave, tavily, duckduckgo, searxng, jina
+    provider: Literal["brave", "tavily", "duckduckgo", "searxng", "jina"] = "brave"
     api_key: str = ""
     base_url: str = ""  # SearXNG base URL
-    max_results: int = 5
+    max_results: int = Field(default=5, ge=1, le=10)
 
 
 class WebToolsConfig(Base):
@@ -507,7 +507,7 @@ class CliAppsToolConfig(Base):
 class ExecToolConfig(Base):
     """Shell exec tool configuration."""
 
-    timeout: int = 60
+    timeout: int = Field(default=60, ge=1, le=86_400)
     path_append: str = ""
 
 
