@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from yuanclaw.agent.loop import AgentLoop
+from yuanclaw.agent.tools import image_generation as image_tool_module
 from yuanclaw.agent.tools.image_generation import ImageGenerationTool
 from yuanclaw.bus.queue import MessageBus
 from yuanclaw.config.loader import set_config_path
@@ -20,6 +21,12 @@ from yuanclaw.security.workspace_access import (
     bind_workspace_scope,
     build_workspace_scope,
     reset_workspace_scope,
+)
+from yuanclaw.utils import artifacts as artifact_utils
+from yuanclaw.utils.artifacts import (
+    ArtifactError,
+    decode_image_data_url,
+    store_generated_image_artifact,
 )
 
 _PNG_BYTES = base64.b64decode(
@@ -163,3 +170,65 @@ async def test_generate_image_rejects_reference_images_outside_workspace_and_med
 
     assert result.startswith("Error:")
     assert "reference_images must be inside the workspace or YuanClaw media directory" in result
+
+
+@pytest.mark.asyncio
+async def test_generate_image_rejects_oversized_reference_before_reading(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    reference = workspace / "large.png"
+    reference.write_bytes(_PNG_BYTES)
+    monkeypatch.setattr(image_tool_module, "MAX_REFERENCE_IMAGE_BYTES", 4)
+
+    config = Config()
+    config.tools.image_generation.enabled = True
+    config.tools.image_generation.provider = "mock"
+    tool = ImageGenerationTool(
+        workspace=workspace,
+        config=config.tools.image_generation,
+        provider_configs={},
+    )
+
+    result = await tool.execute(prompt="edit", reference_images=[str(reference)])
+
+    assert result.startswith("Error:")
+    assert "reference image exceeds" in result
+
+
+def test_decode_image_data_url_rejects_oversized_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(artifact_utils, "MAX_IMAGE_ARTIFACT_BYTES", 4)
+
+    with pytest.raises(ArtifactError, match="image artifact exceeds"):
+        decode_image_data_url(_PNG_DATA_URL)
+
+
+def test_artifact_pair_is_cleaned_when_sidecar_commit_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "instance" / "config.json"
+    config_file.parent.mkdir()
+    set_config_path(config_file)
+    original_replace = artifact_utils.os.replace
+
+    def fail_sidecar_replace(source: Path, target: Path) -> None:
+        if Path(target).suffix == ".json":
+            raise OSError("sidecar commit failed")
+        original_replace(source, target)
+
+    monkeypatch.setattr(artifact_utils.os, "replace", fail_sidecar_replace)
+
+    with pytest.raises(OSError, match="sidecar commit failed"):
+        store_generated_image_artifact(
+            _PNG_DATA_URL,
+            prompt="test",
+            model="mock-image",
+        )
+
+    assert list(tmp_path.rglob("img_*")) == []
+    assert list(tmp_path.rglob("*.tmp")) == []

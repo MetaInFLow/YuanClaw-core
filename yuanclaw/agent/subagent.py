@@ -5,7 +5,7 @@ import json
 import uuid
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 from loguru import logger
 
@@ -22,6 +22,12 @@ from yuanclaw.security.workspace_access import (
     bind_workspace_scope,
     reset_workspace_scope,
 )
+
+
+class _SubagentOrigin(TypedDict):
+    channel: str
+    chat_id: str
+    session_key: str | None
 
 
 class SubagentManager:
@@ -45,6 +51,7 @@ class SubagentManager:
         restrict_to_workspace: bool = False,
         llm_wall_timeout_for_session: Callable[[str | None], float | None] | None = None,
         max_concurrent_subagents: int | None = None,
+        subagent_timeout_s: float | None = None,
     ):
         from yuanclaw.config.schema import AgentDefaults, ExecToolConfig
         self.provider = provider
@@ -67,6 +74,11 @@ class SubagentManager:
             if max_concurrent_subagents is not None
             else AgentDefaults().max_concurrent_subagents
         )
+        self.subagent_timeout_s = (
+            subagent_timeout_s
+            if subagent_timeout_s is not None
+            else AgentDefaults().subagent_timeout_s
+        )
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
 
@@ -87,7 +99,11 @@ class SubagentManager:
             )
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
-        origin = {"channel": origin_channel, "chat_id": origin_chat_id}
+        origin: _SubagentOrigin = {
+            "channel": origin_channel,
+            "chat_id": origin_chat_id,
+            "session_key": session_key,
+        }
 
         bg_task = asyncio.create_task(
             self._run_subagent(task_id, task, display_label, origin, workspace_scope)
@@ -113,120 +129,147 @@ class SubagentManager:
         task_id: str,
         task: str,
         label: str,
-        origin: dict[str, str],
+        origin: _SubagentOrigin,
         workspace_scope: WorkspaceScope | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
 
         try:
-            session_key = origin.get("session_key")
-            root = workspace_scope.project_path if workspace_scope is not None else self.workspace
-            restrict_to_workspace = (
-                workspace_scope.restrict_to_workspace
-                if workspace_scope is not None
-                else self.restrict_to_workspace
-            )
-
-            # Build subagent tools (no message tool, no spawn tool)
-            tools = ToolRegistry()
-            allowed_dir = root if restrict_to_workspace else None
-            tools.register(ReadFileTool(workspace=root, allowed_dir=allowed_dir))
-            tools.register(WriteFileTool(workspace=root, allowed_dir=allowed_dir))
-            tools.register(EditFileTool(workspace=root, allowed_dir=allowed_dir))
-            tools.register(ListDirTool(workspace=root, allowed_dir=allowed_dir))
-            tools.register(ExecTool(
-                working_dir=str(root),
-                timeout=self.exec_config.timeout,
-                restrict_to_workspace=restrict_to_workspace,
-                path_append=self.exec_config.path_append,
-            ))
-            tools.register(
-                WebSearchTool(
-                    api_key=self.brave_api_key,
-                    max_results=self.web_search_max_results,
-                    proxy=self.web_proxy,
-                    provider=self.web_search_provider,
-                    base_url=self.web_search_base_url,
+            async with asyncio.timeout(self.subagent_timeout_s):
+                final_result = await self._execute_subagent(
+                    task_id,
+                    task,
+                    origin,
+                    workspace_scope,
                 )
-            )
-            tools.register(WebFetchTool(proxy=self.web_proxy))
-
-            system_prompt = self._build_subagent_prompt(root)
-            messages: list[dict[str, Any]] = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": task},
-            ]
-
-            # Run agent loop (limited iterations)
-            max_iterations = 15
-            iteration = 0
-            final_result: str | None = None
-
-            token = bind_workspace_scope(workspace_scope) if workspace_scope is not None else None
-            try:
-                while iteration < max_iterations:
-                    iteration += 1
-
-                    response = await self._await_llm_response(
-                        self.provider.chat(
-                            messages=messages,
-                            tools=tools.get_definitions(),
-                            model=self.model,
-                            temperature=self.temperature,
-                            max_tokens=self.max_tokens,
-                            reasoning_effort=self.reasoning_effort,
-                        ),
-                        session_key=session_key,
-                    )
-
-                    if response.has_tool_calls:
-                        # Add assistant message with tool calls
-                        tool_call_dicts = [
-                            {
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.name,
-                                    "arguments": json.dumps(tc.arguments, ensure_ascii=False),
-                                },
-                            }
-                            for tc in response.tool_calls
-                        ]
-                        messages.append({
-                            "role": "assistant",
-                            "content": response.content or "",
-                            "tool_calls": tool_call_dicts,
-                        })
-
-                        # Execute tools
-                        for tool_call in response.tool_calls:
-                            args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                            logger.debug("Subagent [{}] executing: {} with arguments: {}", task_id, tool_call.name, args_str)
-                            result = await tools.execute(tool_call.name, tool_call.arguments)
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "name": tool_call.name,
-                                "content": result,
-                            })
-                    else:
-                        final_result = response.content
-                        break
-            finally:
-                if token is not None:
-                    reset_workspace_scope(token)
-
-            if final_result is None:
-                final_result = "Task completed but no final response was generated."
 
             logger.info("Subagent [{}] completed successfully", task_id)
             await self._announce_result(task_id, label, task, final_result, origin, "ok")
 
+        except TimeoutError as e:
+            detail = str(e) or f"subagent timed out after {self.subagent_timeout_s:g}s"
+            logger.error("Subagent [{}] failed: {}", task_id, detail)
+            await self._announce_result(task_id, label, task, f"Error: {detail}", origin, "error")
         except Exception as e:
             error_msg = f"Error: {str(e)}"
             logger.error("Subagent [{}] failed: {}", task_id, e)
             await self._announce_result(task_id, label, task, error_msg, origin, "error")
+
+    async def _execute_subagent(
+        self,
+        task_id: str,
+        task: str,
+        origin: _SubagentOrigin,
+        workspace_scope: WorkspaceScope | None,
+    ) -> str:
+        """Run one subagent task and return its final response."""
+        session_key = origin.get("session_key")
+        root = workspace_scope.project_path if workspace_scope is not None else self.workspace
+        restrict_to_workspace = (
+            workspace_scope.restrict_to_workspace
+            if workspace_scope is not None
+            else self.restrict_to_workspace
+        )
+
+        tools = ToolRegistry()
+        allowed_dir = root if restrict_to_workspace else None
+        tools.register(ReadFileTool(workspace=root, allowed_dir=allowed_dir))
+        tools.register(WriteFileTool(workspace=root, allowed_dir=allowed_dir))
+        tools.register(EditFileTool(workspace=root, allowed_dir=allowed_dir))
+        tools.register(ListDirTool(workspace=root, allowed_dir=allowed_dir))
+        tools.register(ExecTool(
+            working_dir=str(root),
+            timeout=self.exec_config.timeout,
+            restrict_to_workspace=restrict_to_workspace,
+            path_append=self.exec_config.path_append,
+        ))
+        tools.register(
+            WebSearchTool(
+                api_key=self.brave_api_key,
+                max_results=self.web_search_max_results,
+                proxy=self.web_proxy,
+                provider=self.web_search_provider,
+                base_url=self.web_search_base_url,
+            )
+        )
+        tools.register(WebFetchTool(proxy=self.web_proxy))
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": self._build_subagent_prompt(root)},
+            {"role": "user", "content": task},
+        ]
+
+        max_iterations = 15
+        token = bind_workspace_scope(workspace_scope) if workspace_scope is not None else None
+        try:
+            for _iteration in range(max_iterations):
+                response = await self._await_llm_response(
+                    self.provider.chat(
+                        messages=messages,
+                        tools=tools.get_definitions(),
+                        model=self.model,
+                        temperature=self.temperature,
+                        max_tokens=self.max_tokens,
+                        reasoning_effort=self.reasoning_effort,
+                    ),
+                    session_key=session_key,
+                )
+
+                if response.error_kind is not None or response.error_status_code is not None:
+                    error_kind = response.error_kind or "provider"
+                    status = (
+                        f" (status {response.error_status_code})"
+                        if response.error_status_code is not None
+                        else ""
+                    )
+                    raise RuntimeError(f"provider returned {error_kind} error{status}")
+
+                if response.has_tool_calls:
+                    tool_call_dicts = [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": json.dumps(tc.arguments, ensure_ascii=False),
+                            },
+                        }
+                        for tc in response.tool_calls
+                    ]
+                    messages.append({
+                        "role": "assistant",
+                        "content": response.content or "",
+                        "tool_calls": tool_call_dicts,
+                    })
+
+                    for tool_call in response.tool_calls:
+                        args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+                        logger.debug(
+                            "Subagent [{}] executing: {} with arguments: {}",
+                            task_id,
+                            tool_call.name,
+                            args_str,
+                        )
+                        result = await tools.execute(tool_call.name, tool_call.arguments)
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_call.name,
+                            "content": result,
+                        })
+                    continue
+
+                if response.content is None:
+                    raise RuntimeError("provider returned no final response")
+                return response.content
+        finally:
+            if token is not None:
+                reset_workspace_scope(token)
+
+        raise RuntimeError(
+            f"subagent reached maximum iterations ({max_iterations}) without a final response"
+        )
 
     async def _await_llm_response(self, coro, *, session_key: str | None):
         timeout_s = (
@@ -249,7 +292,7 @@ class SubagentManager:
         label: str,
         task: str,
         result: str,
-        origin: dict[str, str],
+        origin: _SubagentOrigin,
         status: str,
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
@@ -304,6 +347,15 @@ Stay focused on the assigned task. Your final response will be reported back to 
                  if tid in self._running_tasks and not self._running_tasks[tid].done()]
         for t in tasks:
             t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return len(tasks)
+
+    async def cancel_all(self) -> int:
+        """Cancel and await every running subagent."""
+        tasks = [task for task in self._running_tasks.values() if not task.done()]
+        for task in tasks:
+            task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         return len(tasks)

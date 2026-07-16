@@ -1,12 +1,12 @@
 """Feishu/Lark channel implementation using lark-oapi SDK with WebSocket long connection."""
 
 import asyncio
+import importlib.util
 import json
 import os
 import re
 import threading
 from collections import OrderedDict
-from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -16,10 +16,10 @@ from yuanclaw.bus.queue import MessageBus
 from yuanclaw.channels.base import BaseChannel
 from yuanclaw.config.paths import get_media_dir
 from yuanclaw.config.schema import FeishuConfig
-
-import importlib.util
+from yuanclaw.utils.helpers import safe_filename
 
 FEISHU_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 
 # Message type display mapping
 MSG_TYPE_MAP = {
@@ -252,6 +252,7 @@ class FeishuChannel(BaseChannel):
         self._client: Any = None
         self._ws_client: Any = None
         self._ws_thread: threading.Thread | None = None
+        self._ws_stop_event = threading.Event()
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -273,6 +274,7 @@ class FeishuChannel(BaseChannel):
 
         import lark_oapi as lark
         self._running = True
+        self._ws_stop_event.clear()
         self._loop = asyncio.get_running_loop()
 
         # Create Lark client for sending messages
@@ -314,7 +316,6 @@ class FeishuChannel(BaseChannel):
         # instead of the already-running main asyncio loop, which would cause
         # "This event loop is already running" errors.
         def run_ws():
-            import time
             import lark_oapi.ws.client as _lark_ws_client
             ws_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(ws_loop)
@@ -326,8 +327,8 @@ class FeishuChannel(BaseChannel):
                         self._ws_client.start()
                     except Exception as e:
                         logger.warning("Feishu WebSocket error: {}", e)
-                    if self._running:
-                        time.sleep(5)
+                    if self._running and self._ws_stop_event.wait(5):
+                        break
             finally:
                 ws_loop.close()
 
@@ -350,11 +351,24 @@ class FeishuChannel(BaseChannel):
         Reference: https://github.com/larksuite/oapi-sdk-python/blob/v2_main/lark_oapi/ws/client.py#L86
         """
         self._running = False
+        self._ws_stop_event.set()
+        thread = self._ws_thread
+        if thread is not None and thread.is_alive():
+            await asyncio.to_thread(thread.join, 2.0)
+            if thread.is_alive():
+                logger.warning("Feishu WebSocket thread did not stop within 2 seconds")
+            else:
+                self._ws_thread = None
+        self._loop = None
         logger.info("Feishu bot stopped")
 
     def _add_reaction_sync(self, message_id: str, emoji_type: str) -> None:
         """Sync helper for adding reaction (runs in thread pool)."""
-        from lark_oapi.api.im.v1 import CreateMessageReactionRequest, CreateMessageReactionRequestBody, Emoji
+        from lark_oapi.api.im.v1 import (
+            CreateMessageReactionRequest,
+            CreateMessageReactionRequestBody,
+            Emoji,
+        )
         try:
             request = CreateMessageReactionRequest.builder() \
                 .message_id(message_id) \
@@ -758,10 +772,15 @@ class FeishuChannel(BaseChannel):
                     filename = f"{filename}.opus"
 
         if data and filename:
-            file_path = media_dir / filename
+            portable_basename = str(filename).replace("\\", "/").rsplit("/", 1)[-1]
+            safe_name = safe_filename(portable_basename) or f"{msg_type}.bin"
+            if len(data) > MAX_ATTACHMENT_BYTES:
+                return None, f"[{msg_type}: {safe_name} - too large]"
+            message_prefix = safe_filename(str(message_id or "message"))[:32] or "message"
+            file_path = media_dir / f"{message_prefix}_{safe_name}"
             file_path.write_bytes(data)
             logger.debug("Downloaded {} to {}", msg_type, file_path)
-            return str(file_path), f"[{msg_type}: {filename}]"
+            return str(file_path), f"[{msg_type}: {safe_name}]"
 
         return None, f"[{msg_type}: download failed]"
 
@@ -889,6 +908,9 @@ class FeishuChannel(BaseChannel):
                 return
 
             sender_id = sender.sender_id.open_id if sender.sender_id else "unknown"
+            if not self.is_allowed(sender_id):
+                return
+
             chat_id = message.chat_id
             chat_type = message.chat_type
             msg_type = message.message_type

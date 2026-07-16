@@ -36,6 +36,7 @@ class _FakeStreamChannel(BaseChannel):
         self.sent: list[str] = []
         self.deltas: list[tuple[str, str, dict]] = []
         self.finished = asyncio.Event()
+        self.sent_event = asyncio.Event()
 
     async def start(self) -> None:
         self._running = True
@@ -45,6 +46,7 @@ class _FakeStreamChannel(BaseChannel):
 
     async def send(self, msg) -> None:
         self.sent.append(msg.content)
+        self.sent_event.set()
 
     async def send_delta(self, chat_id: str, delta: str, metadata=None) -> None:
         self.deltas.append((chat_id, delta, dict(metadata or {})))
@@ -72,6 +74,44 @@ class _FakeStreamProvider:
         return LLMResponse(content="Hello", finish_reason="stop")
 
 
+class _BlockingChannel(_FakeStreamChannel):
+    def __init__(self, config, bus):
+        super().__init__(config, bus)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def send(self, msg) -> None:
+        self.started.set()
+        await self.release.wait()
+        await super().send(msg)
+
+
+class _FailingChannel(_FakeStreamChannel):
+    def __init__(self, config, bus):
+        super().__init__(config, bus)
+        self.attempts = 0
+
+    async def send(self, msg) -> None:
+        self.attempts += 1
+        raise RuntimeError("send failed")
+
+
+class _FailingStartChannel(_FakeStreamChannel):
+    async def start(self) -> None:
+        raise RuntimeError("start failed")
+
+
+class _ListeningChannel(_FakeStreamChannel):
+    def __init__(self, config, bus):
+        super().__init__(config, bus)
+        self.listening = asyncio.Event()
+
+    async def start(self) -> None:
+        self._running = True
+        self.listening.set()
+        await asyncio.Event().wait()
+
+
 def test_channels_config_preserves_plugin_sections(monkeypatch):
     monkeypatch.setattr(
         "yuanclaw.channels.manager.discover_all",
@@ -92,6 +132,7 @@ def test_channels_config_preserves_plugin_sections(monkeypatch):
 
     manager = ChannelManager(config, MessageBus())
     assert "demo_plugin" in manager.channels
+    assert manager.channels["demo_plugin"].is_allowed("anything") is True
 
 
 def test_channel_sections_preserve_extra_runtime_flags():
@@ -108,6 +149,32 @@ def test_channel_sections_preserve_extra_runtime_flags():
     )
 
     assert getattr(config.channels.telegram, "streaming", False) is True
+
+
+@pytest.mark.asyncio
+async def test_channel_manager_propagates_start_failure_and_cancels_peers() -> None:
+    manager = ChannelManager(Config(), MessageBus())
+    listening = _ListeningChannel({"enabled": True, "allow_from": ["*"]}, manager.bus)
+    failing = _FailingStartChannel({"enabled": True, "allow_from": ["*"]}, manager.bus)
+    manager.channels = {"listening": listening, "failing": failing}
+
+    with pytest.raises(RuntimeError, match="start failed"):
+        await manager.start_all()
+
+    assert manager._dispatch_task is None
+
+
+@pytest.mark.asyncio
+async def test_channel_manager_without_enabled_channels_runs_until_stopped() -> None:
+    manager = ChannelManager(Config(), MessageBus())
+    manager.channels = {}
+    task = asyncio.create_task(manager.start_all())
+    await asyncio.sleep(0)
+
+    assert not task.done()
+
+    await manager.stop_all()
+    await asyncio.wait_for(task, timeout=1.0)
 
 
 def test_local_provider_fallback_routes_plain_model_to_ollama():
@@ -206,4 +273,61 @@ async def test_channel_manager_routes_stream_markers_to_send_delta():
     finally:
         task.cancel()
         with suppress(asyncio.CancelledError):
-            await task
+            await asyncio.wait_for(task, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_channel_manager_isolates_slow_channel_delivery():
+    manager = ChannelManager(Config(), MessageBus())
+    slow = _BlockingChannel({"enabled": True, "allow_from": ["*"]}, manager.bus)
+    fast = _FakeStreamChannel({"enabled": True, "allow_from": ["*"]}, manager.bus)
+    manager.channels = {"slow": slow, "fast": fast}
+    task = asyncio.create_task(manager._dispatch_outbound())
+    try:
+        await manager.bus.publish_outbound(
+            OutboundMessage(channel="slow", chat_id="1", content="slow")
+        )
+        await asyncio.wait_for(slow.started.wait(), timeout=1.0)
+        await manager.bus.publish_outbound(
+            OutboundMessage(channel="fast", chat_id="2", content="fast")
+        )
+
+        await asyncio.wait_for(fast.sent_event.wait(), timeout=0.2)
+        assert fast.sent == ["fast"]
+        assert slow.sent == []
+    finally:
+        slow.release.set()
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_channel_manager_retries_then_records_dead_letter():
+    config = Config()
+    config.channels.outbound_retry_attempts = 1
+    config.channels.outbound_retry_delay_s = 0
+    manager = ChannelManager(config, MessageBus())
+    failing = _FailingChannel({"enabled": True, "allow_from": ["*"]}, manager.bus)
+    manager.channels = {"failing": failing}
+    task = asyncio.create_task(manager._dispatch_outbound())
+    try:
+        await manager.bus.publish_outbound(
+            OutboundMessage(channel="failing", chat_id="3", content="hello")
+        )
+        for _ in range(100):
+            if manager.dead_letters:
+                break
+            await asyncio.sleep(0.01)
+
+        assert failing.attempts == 2
+        assert len(manager.dead_letters) == 1
+        failure = manager.dead_letters[0]
+        assert failure.channel == "failing"
+        assert failure.chat_id == "3"
+        assert failure.error_type == "RuntimeError"
+        assert failure.attempts == 2
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)

@@ -23,11 +23,11 @@ from urllib.parse import unquote
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from loguru import logger
 
 from yuanclaw import __version__
-from yuanclaw.agent.loop import AgentLoop
+from yuanclaw.agent.skills import SkillsLoader
 from yuanclaw.bus.queue import MessageBus
 from yuanclaw.channels.manager import ChannelManager
 from yuanclaw.config.loader import save_config
@@ -36,6 +36,7 @@ from yuanclaw.config.schema import Config
 from yuanclaw.cron.service import CronService
 from yuanclaw.cron.types import CronJob
 from yuanclaw.providers.registry import PROVIDERS, find_by_name
+from yuanclaw.runtime import build_agent_loop
 from yuanclaw.session.goal_state import goal_state_ws_blob
 from yuanclaw.session.manager import SessionManager
 from yuanclaw.utils.helpers import sync_workspace_templates
@@ -199,6 +200,15 @@ _MEDIA_ALLOWED_MIMES = {
     "video/quicktime",
 }
 _BYTE_RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+_THREAD_SUMMARY_TIMEOUT_S = 30.0
+_KNOWLEDGE_DISTILL_TIMEOUT_S = 120.0
+_MAX_SESSION_KEY_CHARS = 512
+_MAX_SUMMARY_CONTENT_CHARS = 100_000
+_MAX_COWBOY_NAME_CHARS = 200
+_MAX_DISTILL_SESSIONS = 40
+_MAX_DISTILL_INSIGHTS = 80
+_MAX_DISTILL_PROMPT_CHARS = 20_000
+_MEDIA_STREAM_CHUNK_BYTES = 64 * 1024
 
 
 @dataclass
@@ -418,7 +428,7 @@ class OAuthLoginManager:
                     pass
 
         session.task = asyncio.create_task(_complete_login(), name=f"oauth-login-{provider_id}")
-        return self.status(provider_id)
+        return await asyncio.to_thread(self.status, provider_id)
 
     def status(self, provider_id: str) -> dict[str, Any]:
         status = self._token_status(provider_id, refresh=True)
@@ -478,12 +488,6 @@ def _make_provider(config: Config):
     return make_provider(config)
 
 
-def _image_gen_provider_configs(config: Config):
-    from yuanclaw.providers.image_generation import image_gen_provider_configs
-
-    return image_gen_provider_configs(config)
-
-
 def _mask_secret(value: str) -> str:
     """Mask secrets for UI display."""
     if not value:
@@ -491,6 +495,67 @@ def _mask_secret(value: str) -> str:
     if len(value) <= 6:
         return "*" * len(value)
     return f"{value[:4]}...{value[-2:]}"
+
+
+def _is_secret_config_key(key: str, parent_key: str | None = None) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+    parent = re.sub(r"[^a-z0-9]", "", (parent_key or "").lower())
+    if parent == "extraheaders":
+        return True
+    return normalized.endswith(("apikey", "token", "secret", "password", "privatekey")) or normalized in {
+        "authorization",
+        "cookie",
+    }
+
+
+def _redact_config_secrets(value: Any, parent_key: str | None = None) -> Any:
+    """Return a JSON-compatible config copy with secret strings masked."""
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            if isinstance(item, str) and _is_secret_config_key(key, parent_key):
+                redacted[key] = _mask_secret(item)
+            else:
+                redacted[key] = _redact_config_secrets(item, key)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_config_secrets(item, parent_key) for item in value]
+    return value
+
+
+def _preserve_masked_config_secrets(
+    incoming: Any,
+    existing: Any,
+    parent_key: str | None = None,
+) -> Any:
+    """Keep existing secrets when clients submit an empty value or the current mask."""
+    if isinstance(incoming, dict):
+        existing_map = existing if isinstance(existing, dict) else {}
+        merged: dict[str, Any] = {}
+        for key, item in incoming.items():
+            current = existing_map.get(key)
+            if (
+                isinstance(item, str)
+                and isinstance(current, str)
+                and current
+                and _is_secret_config_key(key, parent_key)
+                and item in {"", _mask_secret(current)}
+            ):
+                merged[key] = current
+            else:
+                merged[key] = _preserve_masked_config_secrets(item, current, key)
+        return merged
+    if isinstance(incoming, list):
+        existing_items = existing if isinstance(existing, list) else []
+        return [
+            _preserve_masked_config_secrets(
+                item,
+                existing_items[index] if index < len(existing_items) else None,
+                parent_key,
+            )
+            for index, item in enumerate(incoming)
+        ]
+    return incoming
 
 
 def _is_public_bind_host(host: str) -> bool:
@@ -629,6 +694,19 @@ def _parse_single_byte_range(range_header: str, size: int) -> tuple[int, int]:
     return start, min(end, size - 1)
 
 
+def _stream_file_range(path: Path, *, start: int, length: int):
+    """Yield one bounded file range without loading it fully into memory."""
+    with path.open("rb") as handle:
+        handle.seek(start)
+        remaining = length
+        while remaining > 0:
+            chunk = handle.read(min(_MEDIA_STREAM_CHUNK_BYTES, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+
+
 def _serve_signed_media(
     sig: str,
     payload: str,
@@ -687,65 +765,42 @@ def _serve_signed_media(
                     "X-Content-Type-Options": "nosniff",
                 },
             )
-        try:
-            with candidate.open("rb") as handle:
-                handle.seek(start)
-                body = handle.read(end - start + 1)
-        except OSError:
-            return Response("read error", status_code=500)
+        length = end - start + 1
         headers["Content-Range"] = f"bytes {start}-{end}/{size}"
-        return Response(body, status_code=206, media_type=mime, headers=headers)
+        headers["Content-Length"] = str(length)
+        return StreamingResponse(
+            _stream_file_range(candidate, start=start, length=length),
+            status_code=206,
+            media_type=mime,
+            headers=headers,
+        )
 
-    try:
-        body = candidate.read_bytes()
-    except OSError:
-        return Response("read error", status_code=500)
-    return Response(body, media_type=mime, headers=headers)
-
-
-def _extract_description(skill_file: Path) -> str:
-    """Extract skill description from frontmatter."""
-    try:
-        content = skill_file.read_text(encoding="utf-8")
-    except Exception:
-        return "No description"
-
-    if content.startswith("---"):
-        parts = content.split("---", 2)
-        if len(parts) >= 3:
-            for line in parts[1].splitlines():
-                line = line.strip()
-                if line.startswith("description:"):
-                    return line.split(":", 1)[1].strip().strip("'\"") or "No description"
-
-    for line in content.splitlines():
-        line = line.strip()
-        if line and not line.startswith("#"):
-            return line[:200]
-
-    return "No description"
+    headers["Content-Length"] = str(size)
+    return StreamingResponse(
+        _stream_file_range(candidate, start=0, length=size),
+        media_type=mime,
+        headers=headers,
+    )
 
 
-def _list_skills() -> list[dict[str, Any]]:
-    """List built-in skills from package directory."""
-    skills_dir = Path(__file__).resolve().parents[1] / "skills"
-    if not skills_dir.exists():
-        return []
-
+def _list_skills(workspace: Path) -> list[dict[str, Any]]:
+    """List the same workspace-overlaid skill inventory used by the agent runtime."""
+    loader = SkillsLoader(workspace)
+    skills = loader.list_skills(filter_unavailable=False)
+    available = {
+        item["name"] for item in loader.list_skills(filter_unavailable=True)
+    }
     items: list[dict[str, Any]] = []
-    for entry in sorted(skills_dir.iterdir()):
-        if not entry.is_dir():
-            continue
-        skill_file = entry / "SKILL.md"
-        if not skill_file.exists():
-            continue
+    for skill in skills:
+        metadata = loader.get_skill_metadata(skill["name"]) or {}
         items.append(
             {
-                "id": entry.name,
-                "name": entry.name,
-                "description": _extract_description(skill_file),
-                "version": "built-in",
-                "enabled": True,
+                "id": skill["name"],
+                "name": skill["name"],
+                "description": str(metadata.get("description") or skill["name"]),
+                "version": "built-in" if skill["source"] == "builtin" else "workspace",
+                "enabled": skill["name"] in available,
+                "source": skill["source"],
             }
         )
     return items
@@ -984,6 +1039,42 @@ def _render_session_messages(messages: list[dict[str, Any]], limit: int = 10) ->
     return "\n".join(rendered) if rendered else "- (no persisted messages)"
 
 
+def _validate_distill_payload_bounds(payload: dict[str, Any]) -> None:
+    sessions = payload.get("sessions")
+    if not isinstance(sessions, list) or not sessions:
+        raise ValueError("sessions are required")
+    if len(sessions) > _MAX_DISTILL_SESSIONS:
+        raise ValueError(f"sessions must contain at most {_MAX_DISTILL_SESSIONS} items")
+
+    insights = payload.get("existingInsights", [])
+    if not isinstance(insights, list):
+        raise ValueError("existingInsights must be an array")
+    if len(insights) > _MAX_DISTILL_INSIGHTS:
+        raise ValueError(
+            f"existingInsights must contain at most {_MAX_DISTILL_INSIGHTS} items"
+        )
+
+    for field_name in ("collectionPrompt", "systemPrompt", "archivePrompt"):
+        value = payload.get(field_name, "")
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} must be a string")
+        if len(value) > _MAX_DISTILL_PROMPT_CHARS:
+            raise ValueError(
+                f"{field_name} must be at most {_MAX_DISTILL_PROMPT_CHARS} characters"
+            )
+
+    for raw in sessions:
+        if not isinstance(raw, dict):
+            raise ValueError("each session must be an object")
+        session_key = raw.get("sessionKey")
+        if not isinstance(session_key, str) or not session_key.strip():
+            raise ValueError("each session requires a sessionKey")
+        if len(session_key) > _MAX_SESSION_KEY_CHARS:
+            raise ValueError(
+                f"sessionKey must be at most {_MAX_SESSION_KEY_CHARS} characters"
+            )
+
+
 def _channel_is_configured(channel_id: str, cfg: Any) -> bool:
     """Best-effort channel configuration check for UI display."""
     required: dict[str, list[str]] = {
@@ -1079,6 +1170,8 @@ class RuntimeEventBroker:
 class CoreRuntime:
     """In-memory runtime used by the Studio API server."""
 
+    _RESTART_DELAY_S = 1.0
+
     def __init__(self, config: Config, host: str, port: int, with_channels: bool) -> None:
         _validate_public_bind_auth(host, config.gateway)
         self.host = host
@@ -1087,43 +1180,9 @@ class CoreRuntime:
         self.started_at = 0.0
         self.events = RuntimeEventBroker()
         self.config = config
-        self.bus = MessageBus()
-        self.provider = _make_provider(config)
-        self.session_manager = SessionManager(config.workspace_path)
-        self.cron = CronService(get_cron_dir() / "jobs.json")
-        self.agent = AgentLoop(
-            bus=self.bus,
-            provider=self.provider,
-            workspace=config.workspace_path,
-            model=config.agents.defaults.model,
-            provider_name=config.get_provider_name(config.agents.defaults.model),
-            temperature=config.agents.defaults.temperature,
-            max_tokens=config.agents.defaults.max_tokens,
-            context_window_tokens=config.agents.defaults.context_window_tokens,
-            max_iterations=config.agents.defaults.max_tool_iterations,
-            memory_window=config.agents.defaults.memory_window,
-            memory_config=config.agents.defaults.memory,
-            compaction_config=config.agents.defaults.compaction,
-            reasoning_effort=config.agents.defaults.reasoning_effort,
-            brave_api_key=config.tools.web.search.api_key or None,
-            web_search_provider=config.tools.web.search.provider,
-            web_search_base_url=config.tools.web.search.base_url or None,
-            web_search_max_results=config.tools.web.search.max_results,
-            web_proxy=config.tools.web.proxy or None,
-            exec_config=config.tools.exec,
-            cron_service=self.cron,
-            restrict_to_workspace=config.tools.restrict_to_workspace,
-            session_manager=self.session_manager,
-            mcp_servers=config.tools.mcp_servers,
-            channels_config=config.channels,
-            image_generation_config=config.tools.image_generation,
-            image_generation_provider_configs=_image_gen_provider_configs(config),
-            cli_apps_config=config.tools.cli_apps,
-            max_concurrent_subagents=config.agents.defaults.max_concurrent_subagents,
-        )
-        self.channels = None
         self._agent_task: asyncio.Task | None = None
         self._channels_task: asyncio.Task | None = None
+        self._restart_task: asyncio.Task | None = None
         self._started = False
         self._lifecycle_lock = asyncio.Lock()
         self._install_components(config, self._create_components(config))
@@ -1140,35 +1199,13 @@ class CoreRuntime:
             provider = _make_provider(config)
             session_manager = SessionManager(config.workspace_path)
             cron = CronService(get_cron_dir() / "jobs.json")
-            agent = AgentLoop(
+            agent = build_agent_loop(
+                config,
                 bus=bus,
                 provider=provider,
-                workspace=config.workspace_path,
-                model=config.agents.defaults.model,
-                provider_name=config.get_provider_name(config.agents.defaults.model),
-                temperature=config.agents.defaults.temperature,
-                max_tokens=config.agents.defaults.max_tokens,
-                context_window_tokens=config.agents.defaults.context_window_tokens,
-                max_iterations=config.agents.defaults.max_tool_iterations,
-                memory_window=config.agents.defaults.memory_window,
-                memory_config=config.agents.defaults.memory,
-                compaction_config=config.agents.defaults.compaction,
-                reasoning_effort=config.agents.defaults.reasoning_effort,
-                brave_api_key=config.tools.web.search.api_key or None,
-                web_search_provider=config.tools.web.search.provider,
-                web_search_base_url=config.tools.web.search.base_url or None,
-                web_search_max_results=config.tools.web.search.max_results,
-                web_proxy=config.tools.web.proxy or None,
-                exec_config=config.tools.exec,
                 cron_service=cron,
-                restrict_to_workspace=config.tools.restrict_to_workspace,
                 session_manager=session_manager,
-                mcp_servers=config.tools.mcp_servers,
-                channels_config=config.channels,
-                image_generation_config=config.tools.image_generation,
-                image_generation_provider_configs=_image_gen_provider_configs(config),
-                cli_apps_config=config.tools.cli_apps,
-                max_concurrent_subagents=config.agents.defaults.max_concurrent_subagents,
+                restart_handler=self.request_restart,
             )
             cron.on_job = self._on_cron_job
             channels = ChannelManager(config, bus) if self.with_channels else None
@@ -1200,6 +1237,37 @@ class CoreRuntime:
         """Validate whether a config can be applied to the running Core."""
         _validate_public_bind_auth(self.host, config.gateway)
         return self._create_components(config)
+
+    def request_restart(self) -> bool:
+        """Schedule a lifecycle-managed runtime restart after the command reply is delivered."""
+        if not self._started:
+            return False
+        if self._restart_task is not None and not self._restart_task.done():
+            return False
+        self._restart_task = asyncio.create_task(
+            self._restart_after_delivery(),
+            name="yuanclaw-runtime-restart",
+        )
+        self._restart_task.add_done_callback(self._on_restart_done)
+        return True
+
+    async def _restart_after_delivery(self) -> None:
+        await asyncio.sleep(self._RESTART_DELAY_S)
+        prepared = self.prepare_config(self.config)
+        await self.apply_config(self.config, prepared)
+        self.events.publish({"type": "core.restarted"})
+
+    def _on_restart_done(self, task: asyncio.Task) -> None:
+        if self._restart_task is task:
+            self._restart_task = None
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error("Runtime restart failed ({})", type(error).__name__)
+            self.events.publish(
+                {"type": "core.restart_failed", "error_type": type(error).__name__}
+            )
 
     def _on_bus_inbound(self, msg: Any) -> None:
         content = (msg.content or "").strip()
@@ -1242,12 +1310,40 @@ class CoreRuntime:
 
     async def _on_cron_job(self, job: CronJob) -> str | None:
         """Execute a cron job with the same path used by direct chat."""
-        return await self.agent.process_direct(
-            job.payload.message,
-            session_key=f"cron:{job.id}",
-            channel=job.payload.channel or "cli",
-            chat_id=job.payload.to or "direct",
+        from yuanclaw.agent.tools.cron import CronTool
+        from yuanclaw.agent.tools.message import MessageTool
+        from yuanclaw.bus.events import OutboundMessage
+
+        channel = job.payload.channel or "cli"
+        chat_id = job.payload.to or "direct"
+        reminder_note = (
+            "[Scheduled Task] Timer finished.\n\n"
+            f"Task '{job.name}' has been triggered.\n"
+            f"Scheduled instruction: {job.payload.message}"
         )
+
+        cron_tool = self.agent.tools.get("cron")
+        cron_token = None
+        if isinstance(cron_tool, CronTool):
+            cron_token = cron_tool.set_cron_context(True)
+        try:
+            response = await self.agent.process_direct(
+                reminder_note,
+                session_key=f"cron:{job.id}",
+                channel=channel,
+                chat_id=chat_id,
+            )
+        finally:
+            if isinstance(cron_tool, CronTool) and cron_token is not None:
+                cron_tool.reset_cron_context(cron_token)
+
+        message_tool = self.agent.tools.get("message")
+        already_delivered = isinstance(message_tool, MessageTool) and message_tool._sent_in_turn
+        if job.payload.deliver and job.payload.to and response and not already_delivered:
+            await self.bus.publish_outbound(
+                OutboundMessage(channel=channel, chat_id=job.payload.to, content=response)
+            )
+        return response
 
     async def _start_locked(self) -> None:
         if self._started:
@@ -1258,6 +1354,12 @@ class CoreRuntime:
             self._agent_task = asyncio.create_task(self.agent.run(), name="yuanclaw-agent-loop")
             self._channels_task = asyncio.create_task(
                 self.channels.start_all(), name="yuanclaw-channels"
+            )
+            self._agent_task.add_done_callback(
+                lambda task: self._on_service_task_done("agent", task)
+            )
+            self._channels_task.add_done_callback(
+                lambda task: self._on_service_task_done("channels", task)
             )
         self.started_at = time.time()
         self._started = True
@@ -1272,20 +1374,47 @@ class CoreRuntime:
             }
         )
 
+    def _on_service_task_done(self, service: str, task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is None:
+            if not self._started:
+                return
+            error_type = "UnexpectedExit"
+        else:
+            error_type = type(error).__name__
+        logger.error("Runtime {} service stopped ({})", service, error_type)
+        self.events.publish(
+            {
+                "type": "core.service_failed",
+                "service": service,
+                "error_type": error_type,
+            }
+        )
+
     async def start(self) -> None:
         """Start runtime services."""
         async with self._lifecycle_lock:
             await self._start_locked()
 
-    async def _stop_locked(self) -> None:
+    async def _stop_locked(
+        self,
+        *,
+        close_provider: bool = True,
+        close_bus: bool = True,
+    ) -> None:
         if not self._started:
+            if close_bus:
+                self.bus.close()
+            if close_provider:
+                await self.agent.provider.aclose()
             return
 
         self.cron.stop()
         if self.channels is not None:
             await self.channels.stop_all()
-        self.agent.stop()
-        await self.agent.close_mcp()
+        await self.agent.shutdown(close_provider=close_provider)
 
         tasks = [t for t in (self._agent_task, self._channels_task) if t is not None]
         for task in tasks:
@@ -1297,11 +1426,21 @@ class CoreRuntime:
         self._agent_task = None
         self._channels_task = None
         self._started = False
+        if close_bus:
+            self.bus.close()
         self.events.publish({"type": "core.stopped"})
         logger.info("Studio API runtime stopped")
 
     async def stop(self) -> None:
         """Stop runtime services."""
+        restart_task = self._restart_task
+        if (
+            restart_task is not None
+            and restart_task is not asyncio.current_task()
+            and not restart_task.done()
+        ):
+            restart_task.cancel()
+            await asyncio.gather(restart_task, return_exceptions=True)
         async with self._lifecycle_lock:
             await self._stop_locked()
 
@@ -1315,13 +1454,46 @@ class CoreRuntime:
 
         async with self._lifecycle_lock:
             was_running = self._started
-            if was_running:
-                await self._stop_locked()
+            previous_config = self.config
+            previous_components = {
+                "bus": self.bus,
+                "provider": self.provider,
+                "session_manager": self.session_manager,
+                "cron": self.cron,
+                "agent": self.agent,
+                "channels": self.channels,
+            }
+            try:
+                if was_running:
+                    await self._stop_locked(close_provider=False, close_bus=False)
 
-            self._install_components(config, components)
+                self._install_components(config, components)
 
-            if was_running:
-                await self._start_locked()
+                if was_running:
+                    await self._start_locked()
+                try:
+                    await previous_components["agent"].provider.aclose()
+                except Exception as close_error:
+                    logger.warning(
+                        "Previous provider cleanup failed after reconfigure ({})",
+                        type(close_error).__name__,
+                    )
+                previous_components["bus"].close()
+            except BaseException as apply_error:
+                try:
+                    if self._started:
+                        await self._stop_locked()
+                    else:
+                        self.cron.stop()
+                        await self.agent.shutdown()
+                    self._install_components(previous_config, previous_components)
+                    if was_running:
+                        await self._start_locked()
+                except BaseException as rollback_error:
+                    raise RuntimeError(
+                        f"Runtime config apply failed and rollback failed: {rollback_error}"
+                    ) from apply_error
+                raise
 
         self.events.publish(
             {
@@ -1338,14 +1510,19 @@ class CoreRuntime:
 
     @property
     def running(self) -> bool:
-        return self._started
+        if not self._started:
+            return False
+        if not self.with_channels:
+            return True
+        tasks = (self._agent_task, self._channels_task)
+        return all(task is not None and not task.done() for task in tasks)
 
     def status_payload(self) -> dict[str, Any]:
         """Build dashboard status response."""
         channel_status = self.channels.get_status() if self.channels else {}
         channels = _channel_rows(self.config, channel_status)
         sessions = self.session_manager.list_sessions()
-        skills = _list_skills()
+        skills = _list_skills(self.config.workspace_path)
         cron_jobs = self.cron.list_jobs(include_disabled=True)
         connected_channels = sum(1 for item in channels if item["running"])
 
@@ -1595,7 +1772,7 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
 
     @app.get("/api/skills")
     async def skills() -> dict[str, Any]:
-        items = _list_skills()
+        items = _list_skills(runtime.config.workspace_path)
         return {"items": items, "total": len(items)}
 
     @app.get("/api/channels")
@@ -1620,29 +1797,61 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
         items = runtime.session_manager.list_sessions()
         return {"items": items, "total": len(items)}
 
+    @app.delete("/api/sessions/{session_key:path}")
+    async def delete_session(session_key: str) -> dict[str, Any]:
+        key = unquote(session_key)
+        if not key:
+            raise HTTPException(status_code=400, detail="session key is required")
+        cancelled = await runtime.agent.cancel_session(key)
+        deleted = runtime.session_manager.delete(key)
+        return {"ok": True, "deleted": deleted, "cancelled_tasks": cancelled}
+
     @app.post("/api/sessions/{session_key:path}/summary")
     async def session_summary(session_key: str, payload: dict[str, Any]) -> dict[str, Any]:
         key = unquote(session_key)
         if not key:
             raise HTTPException(status_code=400, detail="session key is required")
+        if len(key) > _MAX_SESSION_KEY_CHARS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"session key must be at most {_MAX_SESSION_KEY_CHARS} characters",
+            )
 
         content = str(payload.get("content") or "").strip()
         if not content:
             raise HTTPException(status_code=400, detail="content is required")
+        if len(content) > _MAX_SUMMARY_CONTENT_CHARS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"content must be at most {_MAX_SUMMARY_CONTENT_CHARS} characters",
+            )
 
         cowboy_name = str(payload.get("cowboyName") or "").strip() or None
-        return await runtime.generate_thread_summary(
-            session_key=key,
-            content=content,
-            cowboy_name=cowboy_name,
-        )
+        if cowboy_name and len(cowboy_name) > _MAX_COWBOY_NAME_CHARS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"cowboyName must be at most {_MAX_COWBOY_NAME_CHARS} characters",
+            )
+        try:
+            async with asyncio.timeout(_THREAD_SUMMARY_TIMEOUT_S):
+                return await runtime.generate_thread_summary(
+                    session_key=key,
+                    content=content,
+                    cowboy_name=cowboy_name,
+                )
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail="thread summary timed out") from exc
 
     @app.post("/api/internal/knowledge/distill")
     async def knowledge_distill(payload: dict[str, Any]) -> dict[str, Any]:
         try:
-            return await runtime.distill_knowledge(payload)
+            _validate_distill_payload_bounds(payload)
+            async with asyncio.timeout(_KNOWLEDGE_DISTILL_TIMEOUT_S):
+                return await runtime.distill_knowledge(payload)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail="knowledge distill timed out") from exc
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -1681,16 +1890,18 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
 
     @app.get("/api/config")
     async def read_config() -> dict[str, Any]:
+        oauth_specs = [spec for spec in PROVIDERS if spec.is_oauth]
+        oauth_results = await asyncio.gather(
+            *(asyncio.to_thread(oauth_manager.status, spec.name) for spec in oauth_specs)
+        )
         oauth_statuses = {
-            spec.name: oauth_manager.status(spec.name)
-            for spec in PROVIDERS
-            if spec.is_oauth
+            spec.name: result for spec, result in zip(oauth_specs, oauth_results, strict=True)
         }
         return {
             "model": runtime.config.agents.defaults.model,
             "workspace": str(runtime.config.workspace_path),
             "providers": _provider_rows(runtime.config, oauth_statuses=oauth_statuses),
-            "raw": runtime.config.model_dump(by_alias=True),
+            "raw": _redact_config_secrets(runtime.config.model_dump(by_alias=True)),
         }
 
     @app.get("/api/usage")
@@ -1700,7 +1911,9 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
     @app.get("/api/providers/oauth/{provider_id}")
     async def oauth_provider_status(provider_id: str) -> dict[str, Any]:
         try:
-            return oauth_manager.status(provider_id.replace("-", "_"))
+            return await asyncio.to_thread(
+                oauth_manager.status, provider_id.replace("-", "_")
+            )
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1714,12 +1927,18 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
     @app.post("/api/providers/oauth/{provider_id}/logout")
     async def oauth_provider_logout(provider_id: str) -> dict[str, Any]:
         try:
-            return oauth_manager.logout(provider_id.replace("-", "_"))
+            return await asyncio.to_thread(
+                oauth_manager.logout, provider_id.replace("-", "_")
+            )
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.put("/api/config")
     async def write_config(payload: dict[str, Any]) -> dict[str, Any]:
+        payload = _preserve_masked_config_secrets(
+            payload,
+            runtime.config.model_dump(by_alias=True),
+        )
         try:
             _validate_channel_payloads(payload)
         except Exception as exc:
@@ -1735,10 +1954,28 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"config is not applicable: {exc}") from exc
 
+        previous_config = runtime.config.model_copy(deep=True)
         try:
             save_config(next_config)
             await runtime.apply_config(next_config, prepared_components=prepared_components)
         except Exception as exc:
+            try:
+                await prepared_components["agent"].shutdown()
+            except Exception as cleanup_error:
+                logger.warning(
+                    "Prepared runtime cleanup failed after config error ({})",
+                    type(cleanup_error).__name__,
+                )
+            try:
+                save_config(previous_config)
+            except Exception as rollback_error:
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        f"failed to apply config: {exc}; "
+                        f"failed to restore previous config: {rollback_error}"
+                    ),
+                ) from exc
             raise HTTPException(status_code=500, detail=f"failed to apply config: {exc}") from exc
 
         return {
@@ -1766,9 +2003,23 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
                 await websocket.send_json({"type": "error", "message": f"invalid payload: {exc}"})
                 continue
 
+            if not isinstance(payload, dict):
+                await websocket.send_json({"type": "error", "message": "payload must be an object"})
+                continue
             event_type = str(payload.get("type") or "chat")
             if event_type == "ping":
                 await websocket.send_json({"type": "pong"})
+                continue
+            if event_type == "stop":
+                stop_key = str(payload.get("sessionKey") or "studio:default")
+                stopped_count = await runtime.agent.cancel_session(stop_key)
+                await websocket.send_json(
+                    {
+                        "type": "stopped",
+                        "sessionKey": stop_key,
+                        "cancelled": stopped_count,
+                    }
+                )
                 continue
             if event_type != "chat":
                 await websocket.send_json({"type": "error", "message": f"unknown event type: {event_type}"})
@@ -1778,13 +2029,29 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
             if not content:
                 await websocket.send_json({"type": "error", "message": "content is required"})
                 continue
+            if len(content) > 200_000:
+                await websocket.send_json(
+                    {"type": "error", "message": "content exceeds 200000 characters"}
+                )
+                continue
 
             session_key = str(payload.get("sessionKey") or "studio:default")
+            if len(session_key) > 512:
+                await websocket.send_json(
+                    {"type": "error", "message": "sessionKey exceeds 512 characters"}
+                )
+                continue
+            raw_skill_names = payload.get("skillNames") or []
+            if not isinstance(raw_skill_names, list):
+                await websocket.send_json(
+                    {"type": "error", "message": "skillNames must be an array"}
+                )
+                continue
             skill_names = [
                 str(name).strip()
-                for name in (payload.get("skillNames") or [])
-                if str(name).strip()
-            ]
+                for name in raw_skill_names[:16]
+                if isinstance(name, str) and str(name).strip()
+            ][:16]
             runtime_metadata: dict[str, Any] = {}
             if payload.get("cliApps") is not None:
                 runtime_metadata["cliApps"] = payload.get("cliApps")
@@ -1827,7 +2094,16 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
                 file_edit_events: list[dict[str, Any]] | None = None,
                 **_kwargs: Any,
             ) -> None:
+                text = str(text)[:20_000]
                 progress_lines.append(text)
+                if len(progress_lines) > 200:
+                    del progress_lines[:-200]
+                tool_events = tool_events[:100] if isinstance(tool_events, list) else None
+                file_edit_events = (
+                    file_edit_events[:100]
+                    if isinstance(file_edit_events, list)
+                    else None
+                )
                 event = {
                     "type": "agent.tool_hint" if tool_hint else "agent.progress",
                     "channel": "studio",
@@ -1871,15 +2147,81 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
                         "session_key": session_key,
                     }
                 )
-                final = await runtime.agent.process_direct(
-                    content=content,
-                    session_key=session_key,
-                    channel="studio",
-                    chat_id=chat_id or "default",
-                    skill_names=skill_names,
-                    on_progress=on_progress,
-                    metadata=runtime_metadata,
+                turn_task = asyncio.create_task(
+                    runtime.agent.process_direct(
+                        content=content,
+                        session_key=session_key,
+                        channel="studio",
+                        chat_id=chat_id or "default",
+                        skill_names=skill_names,
+                        on_progress=on_progress,
+                        metadata=runtime_metadata,
+                    ),
+                    name=f"studio-turn:{session_key}",
                 )
+                turn_stopped = False
+                while not turn_task.done():
+                    control_task = asyncio.create_task(websocket.receive_json())
+                    completed, _ = await asyncio.wait(
+                        {turn_task, control_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if turn_task in completed:
+                        control_task.cancel()
+                        await asyncio.gather(control_task, return_exceptions=True)
+                        break
+
+                    try:
+                        control = control_task.result()
+                    except WebSocketDisconnect:
+                        await runtime.agent.cancel_session(session_key)
+                        turn_task.cancel()
+                        await asyncio.gather(turn_task, return_exceptions=True)
+                        raise
+
+                    if not isinstance(control, dict):
+                        await websocket.send_json(
+                            {"type": "error", "message": "control payload must be an object"}
+                        )
+                        continue
+                    control_type = str(control.get("type") or "")
+                    if control_type == "ping":
+                        await websocket.send_json({"type": "pong"})
+                        continue
+                    if control_type == "stop":
+                        stop_key = str(control.get("sessionKey") or session_key)
+                        stopped_count = await runtime.agent.cancel_session(stop_key)
+                        if not turn_task.done():
+                            turn_task.cancel()
+                        await asyncio.gather(turn_task, return_exceptions=True)
+                        await websocket.send_json(
+                            {
+                                "type": "stopped",
+                                "sessionKey": stop_key,
+                                "cancelled": stopped_count,
+                            }
+                        )
+                        runtime.events.publish(
+                            {
+                                "type": "agent.turn_end",
+                                "status": "stopped",
+                                "channel": "studio",
+                                "chat_id": chat_id or "default",
+                                "session_key": session_key,
+                            }
+                        )
+                        turn_stopped = True
+                        break
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "message": "a chat turn is already running; send stop first",
+                        }
+                    )
+
+                if turn_stopped:
+                    continue
+                final = await turn_task
                 if not final:
                     final = "\n".join(progress_lines).strip()
                 session_data = runtime.session_manager.read_session_file(session_key) or {}
@@ -1952,6 +2294,18 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
             pass
         finally:
             runtime.events.unsubscribe(queue)
+
+    @app.get("/{dynamic_path:path}")
+    async def dynamic_gateway_token_path(
+        dynamic_path: str,
+        request: Request,
+    ) -> dict[str, Any]:
+        """Serve a token path changed by hot config after static routes are checked."""
+        configured_path = str(runtime.config.gateway.token_issue_path or "").rstrip("/")
+        requested_path = f"/{dynamic_path}".rstrip("/") or "/"
+        if configured_path and requested_path == configured_path:
+            return await issue_gateway_token(request)
+        raise HTTPException(status_code=404, detail="not found")
 
     return app
 

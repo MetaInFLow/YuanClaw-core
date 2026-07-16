@@ -1,3 +1,4 @@
+import threading
 from pathlib import Path
 
 import pytest
@@ -49,3 +50,23 @@ async def test_memory_get_tool_reports_errors(tmp_path: Path) -> None:
     result = await tool.execute(path="missing.md")
 
     assert result.startswith("Error reading memory:")
+
+
+@pytest.mark.asyncio
+async def test_memory_search_tool_runs_backend_off_event_loop(tmp_path: Path) -> None:
+    caller_thread = threading.get_ident()
+
+    class RecordingBackend:
+        workspace = tmp_path
+        worker_thread = caller_thread
+
+        def search(self, query: str, max_results: int = 8):
+            self.worker_thread = threading.get_ident()
+            return []
+
+    backend = RecordingBackend()
+    tool = MemorySearchTool(backend=backend)
+
+    await tool.execute(query="alpha")
+
+    assert backend.worker_thread != caller_thread

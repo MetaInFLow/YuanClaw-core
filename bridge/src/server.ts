@@ -5,19 +5,17 @@
 
 import { WebSocketServer, WebSocket } from 'ws';
 import { WhatsAppClient, InboundMessage } from './whatsapp.js';
-
-interface SendCommand {
-  type: 'send';
-  to: string;
-  text: string;
-}
+import { parseSendCommand, SendCommand } from './protocol.js';
 
 interface BridgeMessage {
-  type: 'message' | 'status' | 'qr' | 'error';
+  type: 'message' | 'status' | 'qr' | 'error' | 'sent';
   [key: string]: unknown;
 }
 
 export class BridgeServer {
+  private static readonly MAX_CLIENT_BUFFER_BYTES = 1_048_576;
+  private static readonly MAX_COMMAND_BYTES = 1_048_576;
+
   private wss: WebSocketServer | null = null;
   private wa: WhatsAppClient | null = null;
   private clients: Set<WebSocket> = new Set();
@@ -26,7 +24,11 @@ export class BridgeServer {
 
   async start(): Promise<void> {
     // Bind to localhost only — never expose to external network
-    this.wss = new WebSocketServer({ host: '127.0.0.1', port: this.port });
+    this.wss = new WebSocketServer({
+      host: '127.0.0.1',
+      port: this.port,
+      maxPayload: BridgeServer.MAX_COMMAND_BYTES,
+    });
     console.log(`🌉 Bridge server listening on ws://127.0.0.1:${this.port}`);
     if (this.token) console.log('🔒 Token authentication enabled');
 
@@ -72,12 +74,12 @@ export class BridgeServer {
 
     ws.on('message', async (data) => {
       try {
-        const cmd = JSON.parse(data.toString()) as SendCommand;
+        const cmd = parseSendCommand(JSON.parse(data.toString()));
         await this.handleCommand(cmd);
-        ws.send(JSON.stringify({ type: 'sent', to: cmd.to }));
+        this.sendToClient(ws, { type: 'sent', to: cmd.to });
       } catch (error) {
         console.error('Error handling command:', error);
-        ws.send(JSON.stringify({ type: 'error', error: String(error) }));
+        this.sendToClient(ws, { type: 'error', error: String(error) });
       }
     });
 
@@ -93,31 +95,51 @@ export class BridgeServer {
   }
 
   private async handleCommand(cmd: SendCommand): Promise<void> {
-    if (cmd.type === 'send' && this.wa) {
-      await this.wa.sendMessage(cmd.to, cmd.text);
+    if (!this.wa) {
+      throw new Error('WhatsApp client is not available');
     }
+    await this.wa.sendMessage(cmd.to, cmd.text);
+  }
+
+  private sendToClient(client: WebSocket, msg: BridgeMessage): void {
+    if (client.readyState !== WebSocket.OPEN) return;
+    if (client.bufferedAmount > BridgeServer.MAX_CLIENT_BUFFER_BYTES) {
+      this.clients.delete(client);
+      client.close(1013, 'Client is not consuming messages');
+      return;
+    }
+
+    client.send(JSON.stringify(msg), (error) => {
+      if (!error) return;
+      console.error('WebSocket send error:', error);
+      this.clients.delete(client);
+      client.terminate();
+    });
   }
 
   private broadcast(msg: BridgeMessage): void {
-    const data = JSON.stringify(msg);
     for (const client of this.clients) {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(data);
-      }
+      this.sendToClient(client, msg);
     }
   }
 
   async stop(): Promise<void> {
     // Close all client connections
     for (const client of this.clients) {
-      client.close();
+      client.terminate();
     }
     this.clients.clear();
 
     // Close WebSocket server
     if (this.wss) {
-      this.wss.close();
+      const server = this.wss;
       this.wss = null;
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      });
     }
 
     // Disconnect WhatsApp

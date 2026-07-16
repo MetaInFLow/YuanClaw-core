@@ -530,22 +530,30 @@ class TestConsolidationDeduplicationGuard:
         loop.sessions.save(session)
 
         consolidation_calls = 0
+        consolidation_started = asyncio.Event()
+        release_consolidation = asyncio.Event()
 
         async def _fake_consolidate(_session, archive_all: bool = False) -> None:
             nonlocal consolidation_calls
             consolidation_calls += 1
-            await asyncio.sleep(0.05)
+            consolidation_started.set()
+            await release_consolidation.wait()
 
         loop._consolidate_memory = _fake_consolidate  # type: ignore[method-assign]
 
         msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="hello")
-        await loop._process_message(msg)
-        await loop._process_message(msg)
-        await asyncio.sleep(0.1)
+        first = asyncio.create_task(loop._process_message(msg))
+        await consolidation_started.wait()
+        second = asyncio.create_task(loop._process_message(msg))
+        await asyncio.sleep(0)
 
         assert consolidation_calls == 1, (
             f"Expected exactly 1 consolidation, got {consolidation_calls}"
         )
+        release_consolidation.set()
+        await asyncio.gather(first, second)
+        if loop._consolidation_tasks:
+            await asyncio.gather(*loop._consolidation_tasks)
 
     @pytest.mark.asyncio
     async def test_new_command_guard_prevents_concurrent_consolidation(
@@ -626,20 +634,24 @@ class TestConsolidationDeduplicationGuard:
         loop.sessions.save(session)
 
         started = asyncio.Event()
+        release = asyncio.Event()
 
         async def _slow_consolidate(_session, archive_all: bool = False) -> None:
             started.set()
-            await asyncio.sleep(0.1)
+            await release.wait()
 
         loop._consolidate_memory = _slow_consolidate  # type: ignore[method-assign]
 
         msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="hello")
-        await loop._process_message(msg)
+        processing = asyncio.create_task(loop._process_message(msg))
 
         await started.wait()
         assert len(loop._consolidation_tasks) == 1, "Task must be referenced while in-flight"
 
-        await asyncio.sleep(0.15)
+        release.set()
+        await processing
+        if loop._consolidation_tasks:
+            await asyncio.gather(*loop._consolidation_tasks)
         assert len(loop._consolidation_tasks) == 0, (
             "Task reference must be removed after completion"
         )

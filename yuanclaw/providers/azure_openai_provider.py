@@ -138,6 +138,18 @@ class AzureOpenAIProvider(LLMProvider):
         Returns:
             LLMResponse with content and/or tool calls.
         """
+        if on_text_delta is not None:
+            return await self.chat_stream(
+                messages=messages,
+                tools=tools,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                tool_choice=tool_choice,
+                on_content_delta=on_text_delta,
+            )
+
         deployment_name = model or self.default_model
         url = self._build_chat_url(deployment_name)
         headers = self._build_headers()
@@ -150,18 +162,19 @@ class AzureOpenAIProvider(LLMProvider):
             async with httpx.AsyncClient(timeout=60.0, verify=True) as client:
                 response = await client.post(url, headers=headers, json=payload)
                 if response.status_code != 200:
-                    return LLMResponse(
+                    return self._error_response(
                         content=f"Azure OpenAI API Error {response.status_code}: {response.text}",
-                        finish_reason="error",
+                        status_code=response.status_code,
+                        error_type="AzureOpenAIError",
                     )
 
                 response_data = response.json()
                 return self._parse_response(response_data)
 
         except Exception as e:
-            return LLMResponse(
+            return self._error_response(
                 content=f"Error calling Azure OpenAI: {repr(e)}",
-                finish_reason="error",
+                exc=e,
             )
 
     def _parse_response(self, response: dict[str, Any]) -> LLMResponse:
@@ -206,9 +219,10 @@ class AzureOpenAIProvider(LLMProvider):
             )
 
         except (KeyError, IndexError) as e:
-            return LLMResponse(
+            return self._error_response(
                 content=f"Error parsing Azure OpenAI response: {str(e)}",
-                finish_reason="error",
+                exc=e,
+                error_type="InvalidResponseError",
             )
 
     async def chat_stream(
@@ -231,19 +245,21 @@ class AzureOpenAIProvider(LLMProvider):
             reasoning_effort, tool_choice=tool_choice,
         )
         payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
 
         try:
             async with httpx.AsyncClient(timeout=60.0, verify=True) as client:
                 async with client.stream("POST", url, headers=headers, json=payload) as response:
                     if response.status_code != 200:
                         text = await response.aread()
-                        return LLMResponse(
+                        return self._error_response(
                             content=f"Azure OpenAI API Error {response.status_code}: {text.decode('utf-8', 'ignore')}",
-                            finish_reason="error",
+                            status_code=response.status_code,
+                            error_type="AzureOpenAIError",
                         )
                     return await self._consume_stream(response, on_content_delta)
         except Exception as e:
-            return LLMResponse(content=f"Error calling Azure OpenAI: {repr(e)}", finish_reason="error")
+            return self._error_response(content=f"Error calling Azure OpenAI: {repr(e)}", exc=e)
 
     async def _consume_stream(
         self,
@@ -254,6 +270,7 @@ class AzureOpenAIProvider(LLMProvider):
         content_parts: list[str] = []
         tool_call_buffers: dict[int, dict[str, str]] = {}
         finish_reason = "stop"
+        usage: dict[str, int] = {}
 
         async for line in response.aiter_lines():
             if not line.startswith("data: "):
@@ -265,6 +282,14 @@ class AzureOpenAIProvider(LLMProvider):
                 chunk = json.loads(data)
             except Exception:
                 continue
+
+            usage_data = chunk.get("usage")
+            if isinstance(usage_data, dict):
+                usage = {
+                    "prompt_tokens": int(usage_data.get("prompt_tokens", 0) or 0),
+                    "completion_tokens": int(usage_data.get("completion_tokens", 0) or 0),
+                    "total_tokens": int(usage_data.get("total_tokens", 0) or 0),
+                }
 
             choices = chunk.get("choices") or []
             if not choices:
@@ -304,6 +329,7 @@ class AzureOpenAIProvider(LLMProvider):
             content="".join(content_parts) or None,
             tool_calls=tool_calls,
             finish_reason=finish_reason,
+            usage=usage,
         )
 
     def get_default_model(self) -> str:

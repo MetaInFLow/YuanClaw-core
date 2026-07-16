@@ -1,5 +1,6 @@
 """Message tool for sending messages to users."""
 
+from contextvars import ContextVar
 from typing import Any, Awaitable, Callable
 
 from yuanclaw.agent.tools.base import Tool
@@ -17,16 +18,32 @@ class MessageTool(Tool):
         default_message_id: str | None = None,
     ):
         self._send_callback = send_callback
-        self._default_channel = default_channel
-        self._default_chat_id = default_chat_id
-        self._default_message_id = default_message_id
-        self._sent_in_turn: bool = False
+        self._route: ContextVar[tuple[str, str, dict[str, Any]]] = ContextVar(
+            f"message_route_{id(self)}",
+            default=(
+                default_channel,
+                default_chat_id,
+                {"message_id": default_message_id} if default_message_id else {},
+            ),
+        )
+        self._sent: ContextVar[bool] = ContextVar(f"message_sent_{id(self)}", default=False)
 
-    def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
+    def set_context(
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None = None,
+        routing_metadata: dict[str, Any] | None = None,
+    ) -> None:
         """Set the current message context."""
-        self._default_channel = channel
-        self._default_chat_id = chat_id
-        self._default_message_id = message_id
+        metadata = {
+            key: value
+            for key, value in (routing_metadata or {}).items()
+            if key in {"message_id", "message_thread_id", "thread_ts"} and value is not None
+        }
+        if message_id is not None:
+            metadata["message_id"] = message_id
+        self._route.set((channel, chat_id, metadata))
 
     def set_send_callback(self, callback: Callable[[OutboundMessage], Awaitable[None]]) -> None:
         """Set the callback for sending messages."""
@@ -34,7 +51,15 @@ class MessageTool(Tool):
 
     def start_turn(self) -> None:
         """Reset per-turn send tracking."""
-        self._sent_in_turn = False
+        self._sent.set(False)
+
+    @property
+    def _sent_in_turn(self) -> bool:
+        return self._sent.get()
+
+    @_sent_in_turn.setter
+    def _sent_in_turn(self, value: bool) -> None:
+        self._sent.set(bool(value))
 
     @property
     def name(self) -> str:
@@ -83,9 +108,10 @@ class MessageTool(Tool):
         media: list[str] | None = None,
         **kwargs: Any
     ) -> str:
-        channel = channel or self._default_channel
-        chat_id = chat_id or self._default_chat_id
-        message_id = message_id or self._default_message_id
+        default_channel, default_chat_id, routing_metadata = self._route.get()
+        channel = channel or default_channel
+        chat_id = chat_id or default_chat_id
+        message_id = message_id or routing_metadata.get("message_id")
 
         if not channel or not chat_id:
             return "Error: No target channel/chat specified"
@@ -98,14 +124,12 @@ class MessageTool(Tool):
             chat_id=chat_id,
             content=content,
             media=media or [],
-            metadata={
-                "message_id": message_id,
-            },
+            metadata={**routing_metadata, "message_id": message_id},
         )
 
         try:
             await self._send_callback(msg)
-            if channel == self._default_channel and chat_id == self._default_chat_id:
+            if channel == default_channel and chat_id == default_chat_id:
                 self._sent_in_turn = True
             media_info = f" with {len(media)} attachments" if media else ""
             return f"Message sent to {channel}:{chat_id}{media_info}"

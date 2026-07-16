@@ -181,9 +181,29 @@ async def test_exec_session_supports_start_poll_stdin_and_list(tmp_path: Path) -
         yield_time_ms=100,
         max_output_chars=2000,
     )
+    output_parts = [finished]
 
-    assert "got:hello" in finished
-    assert "Exit code: 0" in finished
+    for _ in range(20):
+        if "Process running. session_id:" not in finished:
+            break
+        finished = await write_tool.execute(
+            session_id=session_id,
+            yield_time_ms=100,
+            max_output_chars=2000,
+        )
+        output_parts.append(finished)
+
+    if "Process running. session_id:" in finished:
+        await write_tool.execute(
+            session_id=session_id,
+            terminate=True,
+            yield_time_ms=0,
+            max_output_chars=2000,
+        )
+
+    combined_output = "\n".join(output_parts)
+    assert "got:hello" in combined_output
+    assert "Exit code: 0" in combined_output
 
 
 @pytest.mark.asyncio
@@ -288,7 +308,10 @@ async def test_agent_loop_exec_sessions_are_isolated_between_sessions(tmp_path: 
     )
 
     loop._set_tool_context("studio", "thread-a")
-    await write_tool.execute(session_id=session_id, terminate=True, yield_time_ms=0)
+    terminated = await write_tool.execute(session_id=session_id, terminate=True, yield_time_ms=0)
+    assert "Session terminated." in terminated
+    assert "Exit code:" in terminated
+    assert await list_tool.execute() == "No active exec sessions."
 
 
 def test_agent_loop_registers_core_runtime_tools(tmp_path: Path) -> None:

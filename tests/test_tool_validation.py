@@ -1,7 +1,7 @@
 from typing import Any
 
 from yuanclaw.agent.tools.base import Tool
-from yuanclaw.agent.tools.registry import ToolRegistry
+from yuanclaw.agent.tools.registry import ToolExecutionResult, ToolRegistry
 from yuanclaw.agent.tools.shell import ExecTool
 
 
@@ -105,6 +105,17 @@ async def test_registry_returns_validation_error() -> None:
     reg.register(SampleTool())
     result = await reg.execute("sample", {"query": "hi"})
     assert "Invalid parameters" in result
+
+
+def test_tool_execution_result_recognizes_string_and_object_errors() -> None:
+    string_error = ToolExecutionResult.from_content("  error: failed")
+    object_error = ToolExecutionResult.from_content({"error": "failed", "url": "example"})
+    success = ToolExecutionResult.from_content({"value": "ok"})
+
+    assert string_error.ok is False
+    assert object_error.error == "failed"
+    assert object_error.content["url"] == "example"
+    assert success.ok is True
 
 
 def test_exec_extract_absolute_paths_keeps_full_windows_path() -> None:

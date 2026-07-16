@@ -7,6 +7,7 @@ import pytest
 
 from yuanclaw.agent.loop import AgentLoop
 from yuanclaw.agent.tools.message import MessageTool
+from yuanclaw.agent.tools.registry import ToolExecutionResult
 from yuanclaw.bus.events import InboundMessage, OutboundMessage
 from yuanclaw.bus.queue import MessageBus
 from yuanclaw.providers.base import LLMResponse, ToolCallRequest
@@ -100,7 +101,9 @@ class TestMessageToolSuppressLogic:
         ])
         loop.provider.chat = AsyncMock(side_effect=lambda *a, **kw: next(calls))
         loop.tools.get_definitions = MagicMock(return_value=[])
-        loop.tools.execute = AsyncMock(return_value="ok")
+        loop.tools.execute_result = AsyncMock(
+            return_value=ToolExecutionResult(content="ok")
+        )
 
         progress: list[tuple[str, bool]] = []
 
@@ -124,7 +127,9 @@ class TestMessageToolSuppressLogic:
         ])
         loop.provider.chat = AsyncMock(side_effect=lambda *a, **kw: next(calls))
         loop.tools.get_definitions = MagicMock(return_value=[])
-        loop.tools.execute = AsyncMock(return_value="file contents")
+        loop.tools.execute_result = AsyncMock(
+            return_value=ToolExecutionResult(content="file contents")
+        )
 
         progress: list[dict] = []
 
@@ -195,7 +200,11 @@ class TestMessageToolSuppressLogic:
         ])
         loop.provider.chat = AsyncMock(side_effect=lambda *a, **kw: next(calls))
         loop.tools.get_definitions = MagicMock(return_value=[])
-        loop.tools.execute = AsyncMock(return_value="Patch applied:\n- update demo.txt (+1/-1)")
+        loop.tools.execute_result = AsyncMock(
+            return_value=ToolExecutionResult(
+                content="Patch applied:\n- update demo.txt (+1/-1)"
+            )
+        )
 
         progress: list[dict] = []
 
@@ -254,7 +263,12 @@ class TestMessageToolSuppressLogic:
         ])
         loop.provider.chat = AsyncMock(side_effect=lambda *a, **kw: next(calls))
         loop.tools.get_definitions = MagicMock(return_value=[])
-        loop.tools.execute = AsyncMock(return_value="Error: old_text required")
+        loop.tools.execute_result = AsyncMock(
+            return_value=ToolExecutionResult(
+                content="Error: old_text required",
+                error="Error: old_text required",
+            )
+        )
 
         progress: list[list[dict] | None] = []
 

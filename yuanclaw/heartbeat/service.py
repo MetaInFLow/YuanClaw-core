@@ -59,6 +59,9 @@ class HeartbeatService:
         on_notify: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         interval_s: int = 30 * 60,
         enabled: bool = True,
+        decision_timeout_s: float = 60.0,
+        execution_timeout_s: float = 600.0,
+        notify_timeout_s: float = 30.0,
     ):
         self.workspace = workspace
         self.provider = provider
@@ -67,8 +70,12 @@ class HeartbeatService:
         self.on_notify = on_notify
         self.interval_s = interval_s
         self.enabled = enabled
+        self.decision_timeout_s = decision_timeout_s
+        self.execution_timeout_s = execution_timeout_s
+        self.notify_timeout_s = notify_timeout_s
         self._running = False
         self._task: asyncio.Task | None = None
+        self._run_lock = asyncio.Lock()
 
     @property
     def heartbeat_file(self) -> Path:
@@ -102,8 +109,16 @@ class HeartbeatService:
         if not response.has_tool_calls:
             return "skip", ""
 
-        args = response.tool_calls[0].arguments
-        return args.get("action", "skip"), args.get("tasks", "")
+        tool_call = response.tool_calls[0]
+        if tool_call.name != "heartbeat" or not isinstance(tool_call.arguments, dict):
+            return "skip", ""
+        action = tool_call.arguments.get("action")
+        tasks = tool_call.arguments.get("tasks", "")
+        if action not in {"skip", "run"}:
+            return "skip", ""
+        if action == "run" and (not isinstance(tasks, str) or not tasks.strip()):
+            return "skip", ""
+        return action, tasks.strip() if isinstance(tasks, str) else ""
 
     async def start(self) -> None:
         """Start the heartbeat service."""
@@ -125,6 +140,13 @@ class HeartbeatService:
             self._task.cancel()
             self._task = None
 
+    async def aclose(self) -> None:
+        """Stop the service and wait for its loop task to finish."""
+        task = self._task
+        self.stop()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+
     async def _run_loop(self) -> None:
         """Main heartbeat loop."""
         while self._running:
@@ -139,35 +161,59 @@ class HeartbeatService:
 
     async def _tick(self) -> None:
         """Execute a single heartbeat tick."""
+        try:
+            await self._run_once(notify=True)
+        except TimeoutError as exc:
+            logger.error("Heartbeat timed out: {}", exc)
+        except Exception:
+            logger.exception("Heartbeat execution failed")
+
+    async def _run_once(self, *, notify: bool) -> str | None:
+        if self._run_lock.locked():
+            logger.info("Heartbeat: skipped overlapping trigger")
+            return None
+        async with self._run_lock:
+            return await self._run_once_locked(notify=notify)
+
+    async def _run_once_locked(self, *, notify: bool) -> str | None:
         content = self._read_heartbeat_file()
         if not content:
             logger.debug("Heartbeat: HEARTBEAT.md missing or empty")
-            return
+            return None
 
         logger.info("Heartbeat: checking for tasks...")
 
         try:
-            action, tasks = await self._decide(content)
+            async with asyncio.timeout(self.decision_timeout_s):
+                action, tasks = await self._decide(content)
+        except TimeoutError:
+            raise TimeoutError(f"decision exceeded {self.decision_timeout_s:g}s") from None
 
-            if action != "run":
-                logger.info("Heartbeat: OK (nothing to report)")
-                return
+        if action != "run":
+            logger.info("Heartbeat: OK (nothing to report)")
+            return None
 
-            logger.info("Heartbeat: tasks found, executing...")
-            if self.on_execute:
-                response = await self.on_execute(tasks)
-                if response and self.on_notify:
-                    logger.info("Heartbeat: completed, delivering response")
-                    await self.on_notify(response)
-        except Exception:
-            logger.exception("Heartbeat execution failed")
+        logger.info("Heartbeat: tasks found, executing...")
+        if self.on_execute:
+            try:
+                async with asyncio.timeout(self.execution_timeout_s):
+                    response = await self.on_execute(tasks)
+            except TimeoutError:
+                raise TimeoutError(
+                    f"execution exceeded {self.execution_timeout_s:g}s"
+                ) from None
+            if notify and response and self.on_notify:
+                try:
+                    async with asyncio.timeout(self.notify_timeout_s):
+                        logger.info("Heartbeat: completed, delivering response")
+                        await self.on_notify(response)
+                except TimeoutError:
+                    raise TimeoutError(
+                        f"notification exceeded {self.notify_timeout_s:g}s"
+                    ) from None
+            return response
+        return None
 
     async def trigger_now(self) -> str | None:
         """Manually trigger a heartbeat."""
-        content = self._read_heartbeat_file()
-        if not content:
-            return None
-        action, tasks = await self._decide(content)
-        if action != "run" or not self.on_execute:
-            return None
-        return await self.on_execute(tasks)
+        return await self._run_once(notify=False)

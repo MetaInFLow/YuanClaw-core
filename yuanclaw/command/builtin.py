@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import os
-import sys
+import inspect
 
 from loguru import logger
 
@@ -35,15 +34,28 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
 
 
 async def cmd_restart(ctx: CommandContext) -> OutboundMessage:
-    """Restart the current YuanClaw process in-place."""
+    """Request a restart through the owning runtime lifecycle manager."""
     msg = ctx.msg
-
-    async def _do_restart() -> None:
-        await asyncio.sleep(1)
-        os.execv(sys.executable, [sys.executable, "-m", "yuanclaw"] + sys.argv[1:])
-
-    asyncio.create_task(_do_restart())
-    return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content="Restarting YuanClaw...")
+    handler = getattr(ctx.loop, "restart_handler", None)
+    if not callable(handler):
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content="Restart is unavailable in this runtime. Restart it from the host process.",
+        )
+    try:
+        accepted = handler()
+        if inspect.isawaitable(accepted):
+            accepted = await accepted
+    except Exception as exc:
+        logger.error("Runtime restart request failed ({})", type(exc).__name__)
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content="Restart request failed. Check the runtime logs and try again.",
+        )
+    content = "Restarting YuanClaw..." if accepted else "A YuanClaw restart is already in progress."
+    return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
 
 
 async def cmd_status(ctx: CommandContext) -> OutboundMessage:

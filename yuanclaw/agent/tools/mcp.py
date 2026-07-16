@@ -2,6 +2,7 @@
 
 import asyncio
 from contextlib import AsyncExitStack
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -9,6 +10,15 @@ from loguru import logger
 
 from yuanclaw.agent.tools.base import Tool
 from yuanclaw.agent.tools.registry import ToolRegistry
+
+
+@dataclass(frozen=True)
+class MCPConnectionResult:
+    """Outcome for one configured MCP server."""
+
+    connected: bool
+    tool_names: tuple[str, ...] = ()
+    error_type: str | None = None
 
 
 def _extract_nullable_branch(options: Any) -> tuple[dict[str, Any], bool] | None:
@@ -134,79 +144,104 @@ class MCPToolWrapper(Tool):
 
 async def connect_mcp_servers(
     mcp_servers: dict, registry: ToolRegistry, stack: AsyncExitStack
-) -> None:
+) -> dict[str, MCPConnectionResult]:
     """Connect to configured MCP servers and register their tools."""
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.sse import sse_client
     from mcp.client.stdio import stdio_client
     from mcp.client.streamable_http import streamable_http_client
 
+    results: dict[str, MCPConnectionResult] = {}
     for name, cfg in mcp_servers.items():
         try:
-            transport_type = cfg.type
-            if not transport_type:
-                if cfg.command:
-                    transport_type = "stdio"
-                elif cfg.url:
-                    # Convention: URLs ending with /sse use SSE transport; others use streamableHttp
-                    transport_type = (
-                        "sse" if cfg.url.rstrip("/").endswith("/sse") else "streamableHttp"
-                    )
-                else:
-                    logger.warning("MCP server '{}': no command or url configured, skipping", name)
-                    continue
+            async with AsyncExitStack() as server_stack:
+                async with asyncio.timeout(cfg.connect_timeout):
+                    transport_type = cfg.type
+                    if not transport_type:
+                        if cfg.command:
+                            transport_type = "stdio"
+                        elif cfg.url:
+                            transport_type = (
+                                "sse"
+                                if cfg.url.rstrip("/").endswith("/sse")
+                                else "streamableHttp"
+                            )
+                        else:
+                            raise ValueError("no command or URL configured")
 
-            if transport_type == "stdio":
-                params = StdioServerParameters(
-                    command=cfg.command,
-                    args=cfg.args,
-                    env=cfg.env or None,
-                    cwd=cfg.cwd or None,
-                )
-                read, write = await stack.enter_async_context(stdio_client(params))
-            elif transport_type == "sse":
-                def httpx_client_factory(
-                    headers: dict[str, str] | None = None,
-                    timeout: httpx.Timeout | None = None,
-                    auth: httpx.Auth | None = None,
-                ) -> httpx.AsyncClient:
-                    merged_headers = {**(cfg.headers or {}), **(headers or {})}
-                    return httpx.AsyncClient(
-                        headers=merged_headers or None,
-                        follow_redirects=True,
-                        timeout=timeout,
-                        auth=auth,
-                    )
+                    if transport_type == "stdio":
+                        params = StdioServerParameters(
+                            command=cfg.command,
+                            args=cfg.args,
+                            env=cfg.env or None,
+                            cwd=cfg.cwd or None,
+                        )
+                        read, write = await server_stack.enter_async_context(stdio_client(params))
+                    elif transport_type == "sse":
+                        def httpx_client_factory(
+                            headers: dict[str, str] | None = None,
+                            timeout: httpx.Timeout | None = None,
+                            auth: httpx.Auth | None = None,
+                        ) -> httpx.AsyncClient:
+                            merged_headers = {**(cfg.headers or {}), **(headers or {})}
+                            return httpx.AsyncClient(
+                                headers=merged_headers or None,
+                                follow_redirects=True,
+                                timeout=timeout,
+                                auth=auth,
+                            )
 
-                read, write = await stack.enter_async_context(
-                    sse_client(cfg.url, httpx_client_factory=httpx_client_factory)
-                )
-            elif transport_type == "streamableHttp":
-                # Always provide an explicit httpx client so MCP HTTP transport does not
-                # inherit httpx's default 5s timeout and preempt the higher-level tool timeout.
-                http_client = await stack.enter_async_context(
-                    httpx.AsyncClient(
-                        headers=cfg.headers or None,
-                        follow_redirects=True,
-                        timeout=None,
-                    )
-                )
-                read, write, _ = await stack.enter_async_context(
-                    streamable_http_client(cfg.url, http_client=http_client)
-                )
-            else:
-                logger.warning("MCP server '{}': unknown transport type '{}'", name, transport_type)
-                continue
+                        read, write = await server_stack.enter_async_context(
+                            sse_client(cfg.url, httpx_client_factory=httpx_client_factory)
+                        )
+                    elif transport_type == "streamableHttp":
+                        http_client = await server_stack.enter_async_context(
+                            httpx.AsyncClient(
+                                headers=cfg.headers or None,
+                                follow_redirects=True,
+                                timeout=None,
+                            )
+                        )
+                        read, write, _ = await server_stack.enter_async_context(
+                            streamable_http_client(cfg.url, http_client=http_client)
+                        )
+                    else:
+                        raise ValueError(f"unknown transport type '{transport_type}'")
 
-            session = await stack.enter_async_context(ClientSession(read, write))
-            await session.initialize()
+                    session = await server_stack.enter_async_context(ClientSession(read, write))
+                    await session.initialize()
 
-            tools = await session.list_tools()
-            for tool_def in tools.tools:
-                wrapper = MCPToolWrapper(session, name, tool_def, tool_timeout=cfg.tool_timeout)
+                async with asyncio.timeout(cfg.discovery_timeout):
+                    discovered = await session.list_tools()
+
+                enabled_tools = set(cfg.enabled_tools)
+                wrappers = [
+                    MCPToolWrapper(session, name, tool_def, tool_timeout=cfg.tool_timeout)
+                    for tool_def in discovered.tools
+                    if not enabled_tools or tool_def.name in enabled_tools
+                ]
+                retained_stack = server_stack.pop_all()
+                stack.push_async_callback(retained_stack.aclose)
+
+            for wrapper in wrappers:
                 registry.register(wrapper)
                 logger.debug("MCP: registered tool '{}' from server '{}'", wrapper.name, name)
 
-            logger.info("MCP server '{}': connected, {} tools registered", name, len(tools.tools))
-        except Exception as e:
-            logger.error("MCP server '{}': failed to connect: {}", name, e)
+            tool_names = tuple(wrapper.name for wrapper in wrappers)
+            results[name] = MCPConnectionResult(connected=True, tool_names=tool_names)
+            logger.info("MCP server '{}': connected, {} tools registered", name, len(wrappers))
+        except TimeoutError:
+            results[name] = MCPConnectionResult(connected=False, error_type="TimeoutError")
+            logger.error("MCP server '{}': connection or discovery timed out", name)
+        except Exception as exc:
+            results[name] = MCPConnectionResult(
+                connected=False,
+                error_type=type(exc).__name__,
+            )
+            logger.error(
+                "MCP server '{}': failed to connect ({})",
+                name,
+                type(exc).__name__,
+            )
+
+    return results

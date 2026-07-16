@@ -13,7 +13,7 @@ from yuanclaw.agent.subagent import SubagentManager
 from yuanclaw.agent.tools.spawn import SpawnTool
 from yuanclaw.bus.events import InboundMessage
 from yuanclaw.bus.queue import MessageBus
-from yuanclaw.providers.base import LLMProvider, LLMResponse
+from yuanclaw.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from yuanclaw.security.workspace_access import (
     bind_workspace_scope,
     build_workspace_scope,
@@ -79,9 +79,11 @@ def test_agent_loop_passes_max_concurrent_subagents_to_manager(tmp_path: Path) -
         provider=_SlowProvider(delay_s=0),
         workspace=tmp_path,
         max_concurrent_subagents=3,
+        subagent_timeout_s=12.5,
     )
 
     assert loop.subagents.max_concurrent_subagents == 3
+    assert loop.subagents.subagent_timeout_s == 12.5
 
 
 @pytest.mark.asyncio
@@ -147,3 +149,107 @@ async def test_subagent_disables_wall_timeout_when_callback_returns_zero(tmp_pat
     inbound: InboundMessage = await bus.consume_inbound()
     assert "subagent-ok" in inbound.content
     assert "completed successfully" in inbound.content
+
+
+@pytest.mark.asyncio
+async def test_spawn_preserves_session_key_for_timeout_policy(tmp_path: Path) -> None:
+    bus = MessageBus()
+    observed_session_keys: list[str | None] = []
+    manager = SubagentManager(
+        provider=_SlowProvider(delay_s=0),
+        workspace=tmp_path,
+        bus=bus,
+        llm_wall_timeout_for_session=lambda key: observed_session_keys.append(key) or 1.0,
+    )
+
+    await manager.spawn(task="check context", session_key="websocket:thread-7")
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1.0)
+
+    assert observed_session_keys == ["websocket:thread-7"]
+
+
+@pytest.mark.asyncio
+async def test_subagent_total_timeout_is_reported_as_failure(tmp_path: Path) -> None:
+    bus = MessageBus()
+    manager = SubagentManager(
+        provider=_SlowProvider(delay_s=0.03),
+        workspace=tmp_path,
+        bus=bus,
+        llm_wall_timeout_for_session=lambda _key: 0,
+        subagent_timeout_s=0.001,
+    )
+
+    await manager._run_subagent(
+        "sub-1",
+        "do slow work",
+        "slow",
+        {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
+    )
+
+    inbound = await bus.consume_inbound()
+    assert "timed out after 0.001s" in inbound.content
+    assert "failed" in inbound.content
+
+
+class _ErrorProvider(LLMProvider):
+    async def chat(self, **kwargs: Any) -> LLMResponse:
+        return LLMResponse(
+            content="request failed",
+            error_kind="rate_limit",
+            error_status_code=429,
+        )
+
+    def get_default_model(self) -> str:
+        return "test-model"
+
+
+@pytest.mark.asyncio
+async def test_subagent_rejects_structured_provider_error(tmp_path: Path) -> None:
+    bus = MessageBus()
+    manager = SubagentManager(provider=_ErrorProvider(), workspace=tmp_path, bus=bus)
+
+    await manager._run_subagent(
+        "sub-1",
+        "do work",
+        "error",
+        {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
+    )
+
+    inbound = await bus.consume_inbound()
+    assert "provider returned rate_limit error (status 429)" in inbound.content
+    assert "failed" in inbound.content
+
+
+class _EndlessToolProvider(LLMProvider):
+    async def chat(self, **kwargs: Any) -> LLMResponse:
+        return LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCallRequest(id="missing", name="missing_tool", arguments={})
+            ],
+            finish_reason="tool_calls",
+        )
+
+    def get_default_model(self) -> str:
+        return "test-model"
+
+
+@pytest.mark.asyncio
+async def test_subagent_iteration_exhaustion_is_reported_as_failure(tmp_path: Path) -> None:
+    bus = MessageBus()
+    manager = SubagentManager(
+        provider=_EndlessToolProvider(),
+        workspace=tmp_path,
+        bus=bus,
+    )
+
+    await manager._run_subagent(
+        "sub-1",
+        "loop forever",
+        "loop",
+        {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
+    )
+
+    inbound = await bus.consume_inbound()
+    assert "maximum iterations (15)" in inbound.content
+    assert "failed" in inbound.content

@@ -1,4 +1,10 @@
+import threading
+
+import pytest
+
+from yuanclaw.bus.queue import MessageBus
 from yuanclaw.channels.feishu import FeishuChannel, _extract_post_content
+from yuanclaw.config.schema import FeishuConfig
 
 
 def test_extract_post_content_supports_post_wrapper_shape() -> None:
@@ -63,3 +69,18 @@ def test_register_optional_event_calls_supported_method() -> None:
 
     assert same is builder
     assert called == [handler]
+
+
+@pytest.mark.asyncio
+async def test_feishu_stop_wakes_and_joins_reconnect_thread() -> None:
+    channel = FeishuChannel(FeishuConfig(), MessageBus())
+    channel._running = True
+    thread = threading.Thread(target=channel._ws_stop_event.wait, args=(30,))
+    channel._ws_thread = thread
+    thread.start()
+
+    await channel.stop()
+
+    assert not thread.is_alive()
+    assert channel._ws_thread is None
+    assert channel._loop is None

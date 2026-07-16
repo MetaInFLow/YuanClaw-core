@@ -1,10 +1,15 @@
 """CLI commands for yuanclaw."""
 
 import asyncio
+import hashlib
+import json
 import os
 import select
+import shutil
 import signal
+import subprocess
 import sys
+import uuid
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -359,14 +364,13 @@ def gateway(
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
 ):
     """Start the yuanclaw gateway."""
-    from yuanclaw.agent.loop import AgentLoop
     from yuanclaw.bus.queue import MessageBus
     from yuanclaw.channels.manager import ChannelManager
     from yuanclaw.config.paths import get_cron_dir
     from yuanclaw.cron.service import CronService
     from yuanclaw.cron.types import CronJob
     from yuanclaw.heartbeat.service import HeartbeatService
-    from yuanclaw.providers.image_generation import image_gen_provider_configs
+    from yuanclaw.runtime import build_agent_loop
     from yuanclaw.session.manager import SessionManager
 
     if verbose:
@@ -387,33 +391,12 @@ def gateway(
     cron = CronService(cron_store_path)
 
     # Create agent with cron service
-    agent = AgentLoop(
+    agent = build_agent_loop(
+        config,
         bus=bus,
         provider=provider,
-        workspace=config.workspace_path,
-        model=config.agents.defaults.model,
-        temperature=config.agents.defaults.temperature,
-        max_tokens=config.agents.defaults.max_tokens,
-        context_window_tokens=config.agents.defaults.context_window_tokens,
-        max_iterations=config.agents.defaults.max_tool_iterations,
-        memory_window=config.agents.defaults.memory_window,
-        memory_config=config.agents.defaults.memory,
-        compaction_config=config.agents.defaults.compaction,
-        reasoning_effort=config.agents.defaults.reasoning_effort,
-        brave_api_key=config.tools.web.search.api_key or None,
-        web_search_provider=config.tools.web.search.provider,
-        web_search_base_url=config.tools.web.search.base_url or None,
-        web_search_max_results=config.tools.web.search.max_results,
-        web_proxy=config.tools.web.proxy or None,
-        exec_config=config.tools.exec,
         cron_service=cron,
-        restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
-        mcp_servers=config.tools.mcp_servers,
-        channels_config=config.channels,
-        image_generation_config=config.tools.image_generation,
-        image_generation_provider_configs=image_gen_provider_configs(config),
-        max_concurrent_subagents=config.agents.defaults.max_concurrent_subagents,
     )
 
     # Set cron callback (needs agent)
@@ -509,6 +492,9 @@ def gateway(
         on_notify=on_heartbeat_notify,
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
+        decision_timeout_s=hb_cfg.decision_timeout_s,
+        execution_timeout_s=hb_cfg.execution_timeout_s,
+        notify_timeout_s=hb_cfg.notify_timeout_s,
     )
 
     if channels.enabled_channels:
@@ -533,10 +519,9 @@ def gateway(
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         finally:
-            await agent.close_mcp()
-            heartbeat.stop()
+            await heartbeat.aclose()
             cron.stop()
-            agent.stop()
+            await agent.shutdown()
             await channels.stop_all()
 
     asyncio.run(run())
@@ -547,6 +532,40 @@ def gateway(
 # ============================================================================
 # Agent Commands
 # ============================================================================
+
+
+async def _wait_for_cli_turn(
+    turn_done: asyncio.Event,
+    bus_task: asyncio.Task,
+    outbound_task: asyncio.Task,
+    *,
+    timeout_s: float = 600.0,
+) -> None:
+    """Wait for a turn while monitoring the two background CLI tasks."""
+    waiter = asyncio.create_task(turn_done.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {waiter, bus_task, outbound_task},
+            timeout=timeout_s,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if waiter in done:
+            return
+        if not done:
+            raise TimeoutError(f"Agent turn timed out after {timeout_s:g} seconds")
+        for name, task in (("agent", bus_task), ("outbound", outbound_task)):
+            if task not in done:
+                continue
+            if task.cancelled():
+                raise RuntimeError(f"CLI {name} task was cancelled before the turn completed")
+            error = task.exception()
+            if error is not None:
+                raise RuntimeError(f"CLI {name} task failed before the turn completed") from error
+            raise RuntimeError(f"CLI {name} task stopped before the turn completed")
+    finally:
+        if not waiter.done():
+            waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
 
 
 @app.command()
@@ -561,11 +580,10 @@ def agent(
     """Interact with the agent directly."""
     from loguru import logger
 
-    from yuanclaw.agent.loop import AgentLoop
     from yuanclaw.bus.queue import MessageBus
     from yuanclaw.config.paths import get_cron_dir
     from yuanclaw.cron.service import CronService
-    from yuanclaw.providers.image_generation import image_gen_provider_configs
+    from yuanclaw.runtime import build_agent_loop
 
     config = _load_runtime_config(config, workspace)
     sync_workspace_templates(config.workspace_path)
@@ -582,32 +600,11 @@ def agent(
     else:
         logger.disable("yuanclaw")
 
-    agent_loop = AgentLoop(
+    agent_loop = build_agent_loop(
+        config,
         bus=bus,
         provider=provider,
-        workspace=config.workspace_path,
-        model=config.agents.defaults.model,
-        temperature=config.agents.defaults.temperature,
-        max_tokens=config.agents.defaults.max_tokens,
-        context_window_tokens=config.agents.defaults.context_window_tokens,
-        max_iterations=config.agents.defaults.max_tool_iterations,
-        memory_window=config.agents.defaults.memory_window,
-        memory_config=config.agents.defaults.memory,
-        compaction_config=config.agents.defaults.compaction,
-        reasoning_effort=config.agents.defaults.reasoning_effort,
-        brave_api_key=config.tools.web.search.api_key or None,
-        web_search_provider=config.tools.web.search.provider,
-        web_search_base_url=config.tools.web.search.base_url or None,
-        web_search_max_results=config.tools.web.search.max_results,
-        web_proxy=config.tools.web.proxy or None,
-        exec_config=config.tools.exec,
         cron_service=cron,
-        restrict_to_workspace=config.tools.restrict_to_workspace,
-        mcp_servers=config.tools.mcp_servers,
-        channels_config=config.channels,
-        image_generation_config=config.tools.image_generation,
-        image_generation_provider_configs=image_gen_provider_configs(config),
-        max_concurrent_subagents=config.agents.defaults.max_concurrent_subagents,
     )
 
     async def _cli_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -622,17 +619,22 @@ def agent(
         # Single message mode — direct call, no bus needed
         async def run_once():
             renderer = StreamRenderer(render_markdown=markdown)
-            response = await agent_loop.process_direct(
-                message,
-                session_id,
-                on_progress=_cli_progress,
-                on_stream=renderer.on_delta,
-                on_stream_end=renderer.on_end,
-            )
-            if not renderer.streamed:
-                await renderer.on_end()
-                _print_agent_response(response, render_markdown=markdown)
-            await agent_loop.close_mcp()
+            try:
+                response = await agent_loop.process_direct(
+                    message,
+                    session_id,
+                    on_progress=_cli_progress,
+                    on_stream=renderer.on_delta,
+                    on_stream_end=renderer.on_end,
+                )
+                if not renderer.streamed:
+                    await renderer.on_end()
+                    _print_agent_response(response, render_markdown=markdown)
+            finally:
+                try:
+                    await renderer.aclose()
+                finally:
+                    await agent_loop.shutdown()
 
         asyncio.run(run_once())
     else:
@@ -741,7 +743,7 @@ def agent(
                             metadata={"_wants_stream": True},
                         ))
 
-                        await turn_done.wait()
+                        await _wait_for_cli_turn(turn_done, bus_task, outbound_task)
 
                         if turn_response:
                             content = turn_response[0]
@@ -757,10 +759,14 @@ def agent(
                         console.print("\nGoodbye!")
                         break
             finally:
-                agent_loop.stop()
+                bus_task.cancel()
                 outbound_task.cancel()
                 await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
-                await agent_loop.close_mcp()
+                try:
+                    if renderer is not None:
+                        await renderer.aclose()
+                finally:
+                    await agent_loop.shutdown()
 
         asyncio.run(run_interactive())
 
@@ -869,22 +875,10 @@ def channels_status():
 
 def _get_bridge_dir() -> Path:
     """Get the bridge directory, setting it up if needed."""
-    import shutil
-    import subprocess
-
     # User's bridge location
     from yuanclaw.config.paths import get_bridge_install_dir
 
     user_bridge = get_bridge_install_dir()
-
-    # Check if already built
-    if (user_bridge / "dist" / "index.js").exists():
-        return user_bridge
-
-    # Check for npm
-    if not shutil.which("npm"):
-        console.print("[red]npm not found. Please install Node.js >= 18.[/red]")
-        raise typer.Exit(1)
 
     # Find source bridge: first check package data, then source dir
     pkg_bridge = Path(__file__).parent.parent / "bridge"  # yuanclaw/bridge (installed)
@@ -901,28 +895,87 @@ def _get_bridge_dir() -> Path:
         console.print("Try reinstalling: pip install --force-reinstall yuanclaw")
         raise typer.Exit(1)
 
+    package_data = json.loads((source / "package.json").read_text(encoding="utf-8"))
+    lock_path = source / "package-lock.json"
+    signature = {
+        "version": str(package_data.get("version") or "unknown"),
+        "lock_sha256": hashlib.sha256(lock_path.read_bytes()).hexdigest()
+        if lock_path.exists()
+        else "",
+    }
+    manifest_path = user_bridge / ".yuanclaw-bridge-install.json"
+    try:
+        installed_signature = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        installed_signature = None
+    if (user_bridge / "dist" / "index.js").is_file() and installed_signature == signature:
+        return user_bridge
+
+    npm = shutil.which("npm")
+    node = shutil.which("node")
+    if not npm or not node:
+        console.print("[red]npm/Node.js not found. Please install Node.js >= 20.[/red]")
+        raise typer.Exit(1)
+    try:
+        version_result = subprocess.run(
+            [node, "--version"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        major = int(version_result.stdout.strip().lstrip("v").split(".", 1)[0])
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        console.print(f"[red]Unable to verify Node.js version: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    if major < 20:
+        console.print(f"[red]Node.js >= 20 is required; found {version_result.stdout.strip()}.[/red]")
+        raise typer.Exit(1)
+
     console.print(f"{__logo__} Setting up bridge...")
 
-    # Copy to user directory
     user_bridge.parent.mkdir(parents=True, exist_ok=True)
-    if user_bridge.exists():
-        shutil.rmtree(user_bridge)
-    shutil.copytree(source, user_bridge, ignore=shutil.ignore_patterns("node_modules", "dist"))
+    staging = user_bridge.with_name(f".{user_bridge.name}.staging-{uuid.uuid4().hex}")
+    backup = user_bridge.with_name(f".{user_bridge.name}.backup-{uuid.uuid4().hex}")
 
-    # Install and build
     try:
+        shutil.copytree(
+            source,
+            staging,
+            ignore=shutil.ignore_patterns("node_modules", "dist"),
+        )
         console.print("  Installing dependencies...")
-        subprocess.run(["npm", "install"], cwd=user_bridge, check=True, capture_output=True)
+        subprocess.run([npm, "ci"], cwd=staging, check=True, capture_output=True)
 
         console.print("  Building...")
-        subprocess.run(["npm", "run", "build"], cwd=user_bridge, check=True, capture_output=True)
+        subprocess.run([npm, "run", "build"], cwd=staging, check=True, capture_output=True)
+        if not (staging / "dist" / "index.js").is_file():
+            raise RuntimeError("bridge build did not produce dist/index.js")
+        (staging / ".yuanclaw-bridge-install.json").write_text(
+            json.dumps(signature, indent=2),
+            encoding="utf-8",
+        )
+
+        if user_bridge.exists():
+            shutil.move(str(user_bridge), str(backup))
+        try:
+            shutil.move(str(staging), str(user_bridge))
+        except Exception:
+            if backup.exists() and not user_bridge.exists():
+                shutil.move(str(backup), str(user_bridge))
+            raise
+        if backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
 
         console.print("[green]✓[/green] Bridge ready\n")
-    except subprocess.CalledProcessError as e:
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as e:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
         console.print(f"[red]Build failed: {e}[/red]")
-        if e.stderr:
-            console.print(f"[dim]{e.stderr.decode()[:500]}[/dim]")
-        raise typer.Exit(1)
+        stderr = getattr(e, "stderr", None)
+        if stderr:
+            detail = stderr.decode(errors="replace") if isinstance(stderr, bytes) else str(stderr)
+            console.print(f"[dim]{detail[:500]}[/dim]")
+        raise typer.Exit(1) from e
 
     return user_bridge
 
@@ -930,8 +983,6 @@ def _get_bridge_dir() -> Path:
 @channels_app.command("login")
 def channels_login():
     """Link device via QR code."""
-    import subprocess
-
     from yuanclaw.config.loader import load_config
     from yuanclaw.config.paths import get_runtime_subdir
 
@@ -950,8 +1001,10 @@ def channels_login():
         subprocess.run(["npm", "start"], cwd=bridge_dir, check=True, env=env)
     except subprocess.CalledProcessError as e:
         console.print(f"[red]Bridge failed: {e}[/red]")
+        raise typer.Exit(e.returncode or 1) from e
     except FileNotFoundError:
         console.print("[red]npm not found. Please install Node.js.[/red]")
+        raise typer.Exit(1) from None
 
 
 @channels_app.command("pairings")

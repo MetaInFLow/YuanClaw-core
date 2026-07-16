@@ -4,10 +4,22 @@ import json
 import os
 import re
 import shutil
+import sys
 from pathlib import Path
+from typing import Any
+
+import yaml
 
 # Default builtin skills directory (relative to this file)
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
+
+
+def _truncate_with_marker(text: str, limit: int, marker: str) -> str:
+    if len(text) <= limit:
+        return text
+    if limit <= len(marker):
+        return marker[:limit]
+    return text[:limit - len(marker)].rstrip() + marker
 
 
 class SkillsLoader:
@@ -17,6 +29,8 @@ class SkillsLoader:
     Skills are markdown files (SKILL.md) that teach the agent how to use
     specific tools or perform certain tasks.
     """
+
+    _VALID_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
     def __init__(self, workspace: Path, builtin_skills_dir: Path | None = None):
         self.workspace = workspace
@@ -37,18 +51,18 @@ class SkillsLoader:
 
         # Workspace skills (highest priority)
         if self.workspace_skills.exists():
-            for skill_dir in self.workspace_skills.iterdir():
+            for skill_dir in sorted(self.workspace_skills.iterdir(), key=lambda path: path.name.lower()):
                 if skill_dir.is_dir():
-                    skill_file = skill_dir / "SKILL.md"
-                    if skill_file.exists():
+                    skill_file = self._skill_file(self.workspace_skills, skill_dir.name)
+                    if skill_file is not None:
                         skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "workspace"})
 
         # Built-in skills
         if self.builtin_skills and self.builtin_skills.exists():
-            for skill_dir in self.builtin_skills.iterdir():
+            for skill_dir in sorted(self.builtin_skills.iterdir(), key=lambda path: path.name.lower()):
                 if skill_dir.is_dir():
-                    skill_file = skill_dir / "SKILL.md"
-                    if skill_file.exists() and not any(s["name"] == skill_dir.name for s in skills):
+                    skill_file = self._skill_file(self.builtin_skills, skill_dir.name)
+                    if skill_file is not None and not any(s["name"] == skill_dir.name for s in skills):
                         skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "builtin"})
 
         # Filter by requirements
@@ -66,20 +80,24 @@ class SkillsLoader:
         Returns:
             Skill content or None if not found.
         """
-        # Check workspace first
-        workspace_skill = self.workspace_skills / name / "SKILL.md"
-        if workspace_skill.exists():
+        workspace_skill = self._skill_file(self.workspace_skills, name)
+        if workspace_skill is not None:
             return workspace_skill.read_text(encoding="utf-8")
 
-        # Check built-in
         if self.builtin_skills:
-            builtin_skill = self.builtin_skills / name / "SKILL.md"
-            if builtin_skill.exists():
+            builtin_skill = self._skill_file(self.builtin_skills, name)
+            if builtin_skill is not None:
                 return builtin_skill.read_text(encoding="utf-8")
 
         return None
 
-    def load_skills_for_context(self, skill_names: list[str]) -> str:
+    def load_skills_for_context(
+        self,
+        skill_names: list[str],
+        *,
+        max_total_chars: int = 24_000,
+        max_skill_chars: int = 12_000,
+    ) -> str:
         """
         Load specific skills for inclusion in agent context.
 
@@ -90,11 +108,39 @@ class SkillsLoader:
             Formatted skills content.
         """
         parts = []
+        used_chars = 0
+        seen: set[str] = set()
+        available = {
+            item["name"]
+            for item in self.list_skills(filter_unavailable=True)
+        }
         for name in skill_names:
+            if not isinstance(name, str):
+                continue
+            if name in seen or name not in available:
+                continue
+            seen.add(name)
             content = self.load_skill(name)
             if content:
                 content = self._strip_frontmatter(content)
-                parts.append(f"### Skill: {name}\n\n{content}")
+                content = _truncate_with_marker(
+                    content,
+                    max_skill_chars,
+                    "\n\n... (skill truncated)",
+                )
+                section = f"### Skill: {name}\n\n{content}"
+                separator_chars = len("\n\n---\n\n") if parts else 0
+                remaining = max_total_chars - used_chars - separator_chars
+                if remaining <= 0:
+                    break
+                if len(section) > remaining:
+                    section = _truncate_with_marker(
+                        section,
+                        remaining,
+                        "\n\n... (skills truncated)",
+                    )
+                parts.append(section)
+                used_chars += separator_chars + len(section)
 
         return "\n\n---\n\n".join(parts) if parts else ""
 
@@ -118,7 +164,7 @@ class SkillsLoader:
         lines = ["<skills>"]
         for s in all_skills:
             name = escape_xml(s["name"])
-            path = s["path"]
+            path = escape_xml(s["path"])
             desc = escape_xml(self._get_skill_description(s["name"]))
             skill_meta = self._get_skill_meta(s["name"])
             available = self._check_requirements(skill_meta)
@@ -142,6 +188,9 @@ class SkillsLoader:
     def _get_missing_requirements(self, skill_meta: dict) -> str:
         """Get a description of missing requirements."""
         missing = []
+        supported_os = self._supported_os(skill_meta)
+        if supported_os and not self._matches_current_os(supported_os):
+            missing.append(f"OS: {', '.join(supported_os)}")
         requires = skill_meta.get("requires", {})
         for b in requires.get("bins", []):
             if not shutil.which(b):
@@ -155,27 +204,30 @@ class SkillsLoader:
         """Get the description of a skill from its frontmatter."""
         meta = self.get_skill_metadata(name)
         if meta and meta.get("description"):
-            return meta["description"]
+            return str(meta["description"])
         return name  # Fallback to skill name
 
     def _strip_frontmatter(self, content: str) -> str:
         """Remove YAML frontmatter from markdown content."""
         if content.startswith("---"):
-            match = re.match(r"^---\n.*?\n---\n", content, re.DOTALL)
+            match = re.match(r"^---\r?\n.*?\r?\n---(?:\r?\n|$)", content, re.DOTALL)
             if match:
                 return content[match.end():].strip()
         return content
 
-    def _parse_nanobot_metadata(self, raw: str) -> dict:
+    def _parse_nanobot_metadata(self, raw: Any) -> dict:
         """Parse skill metadata JSON from frontmatter (supports yuanclaw and openclaw keys)."""
         try:
-            data = json.loads(raw)
+            data = raw if isinstance(raw, dict) else json.loads(raw)
             return data.get("yuanclaw", data.get("openclaw", {})) if isinstance(data, dict) else {}
         except (json.JSONDecodeError, TypeError):
             return {}
 
     def _check_requirements(self, skill_meta: dict) -> bool:
-        """Check if skill requirements are met (bins, env vars)."""
+        """Check if skill requirements are met (platform, bins, env vars)."""
+        supported_os = self._supported_os(skill_meta)
+        if supported_os and not self._matches_current_os(supported_os):
+            return False
         requires = skill_meta.get("requires", {})
         for b in requires.get("bins", []):
             if not shutil.which(b):
@@ -184,6 +236,27 @@ class SkillsLoader:
             if not os.environ.get(env):
                 return False
         return True
+
+    @staticmethod
+    def _supported_os(skill_meta: dict) -> list[str]:
+        raw = skill_meta.get("os", [])
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list):
+            return []
+        return [item.strip().lower() for item in raw if isinstance(item, str) and item.strip()]
+
+    @staticmethod
+    def _matches_current_os(supported_os: list[str]) -> bool:
+        if sys.platform.startswith("win"):
+            aliases = {"win", "win32", "windows"}
+        elif sys.platform == "darwin":
+            aliases = {"darwin", "mac", "macos", "osx"}
+        elif sys.platform.startswith("linux"):
+            aliases = {"linux"}
+        else:
+            aliases = {sys.platform.lower()}
+        return bool(aliases.intersection(supported_os))
 
     def _get_skill_meta(self, name: str) -> dict:
         """Get yuanclaw metadata for a skill (cached in frontmatter)."""
@@ -215,14 +288,22 @@ class SkillsLoader:
             return None
 
         if content.startswith("---"):
-            match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
+            match = re.match(r"^---\r?\n(.*?)\r?\n---(?:\r?\n|$)", content, re.DOTALL)
             if match:
-                # Simple YAML parsing
-                metadata = {}
-                for line in match.group(1).split("\n"):
-                    if ":" in line:
-                        key, value = line.split(":", 1)
-                        metadata[key.strip()] = value.strip().strip('"\'')
-                return metadata
+                try:
+                    metadata = yaml.safe_load(match.group(1))
+                except yaml.YAMLError:
+                    return None
+                return metadata if isinstance(metadata, dict) else None
 
         return None
+
+    @classmethod
+    def _skill_file(cls, root: Path, name: str) -> Path | None:
+        if not cls._VALID_NAME.fullmatch(name) or name in {".", ".."}:
+            return None
+        root_resolved = root.resolve()
+        candidate = (root / name / "SKILL.md").resolve()
+        if candidate.parent.parent != root_resolved or not candidate.is_file():
+            return None
+        return candidate

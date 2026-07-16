@@ -55,12 +55,27 @@ class CustomProvider(LLMProvider):
     def _handle_error(self, e: Exception) -> LLMResponse:
         body = getattr(e, "doc", None) or getattr(getattr(e, "response", None), "text", None)
         msg = f"Error: {body.strip()[:500]}" if body and body.strip() else f"Error: {e}"
-        return LLMResponse(content=msg, finish_reason="error")
+        return self._error_response(
+            content=msg,
+            exc=e,
+            error_code=str(getattr(e, "code", "") or "") or None,
+        )
 
     async def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
                    model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7,
                    reasoning_effort: str | None = None, on_text_delta=None,
                    tool_choice: str | dict[str, Any] | None = None) -> LLMResponse:
+        if on_text_delta is not None:
+            return await self.chat_stream(
+                messages=messages,
+                tools=tools,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                tool_choice=tool_choice,
+                on_content_delta=on_text_delta,
+            )
         kwargs = self._build_kwargs(messages, tools, model, max_tokens, temperature, reasoning_effort, tool_choice)
         try:
             return self._parse(await self._client.chat.completions.create(**kwargs))
@@ -80,6 +95,7 @@ class CustomProvider(LLMProvider):
     ) -> LLMResponse:
         kwargs = self._build_kwargs(messages, tools, model, max_tokens, temperature, reasoning_effort, tool_choice)
         kwargs["stream"] = True
+        kwargs["stream_options"] = {"include_usage": True}
         try:
             stream = await self._client.chat.completions.create(**kwargs)
             chunks: list[Any] = []
@@ -95,9 +111,9 @@ class CustomProvider(LLMProvider):
 
     def _parse(self, response: Any) -> LLMResponse:
         if not response.choices:
-            return LLMResponse(
+            return self._error_response(
                 content="Error: API returned empty choices.",
-                finish_reason="error",
+                error_type="InvalidResponseError",
             )
         choice = response.choices[0]
         msg = choice.message
@@ -170,3 +186,6 @@ class CustomProvider(LLMProvider):
 
     def get_default_model(self) -> str:
         return self.default_model
+
+    async def aclose(self) -> None:
+        await self._close_resource(self._client)

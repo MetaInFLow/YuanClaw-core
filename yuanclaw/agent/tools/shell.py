@@ -3,6 +3,7 @@
 import asyncio
 import os
 import re
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,8 @@ from yuanclaw.agent.tools.exec_session import (
     ExecSessionManager,
     clamp_session_int,
     format_session_poll,
+    subprocess_group_kwargs,
+    terminate_process_tree,
 )
 from yuanclaw.security.workspace_access import current_tool_workspace
 from yuanclaw.security.workspace_policy import WORKSPACE_BOUNDARY_NOTE, is_path_within
@@ -68,10 +71,13 @@ class ExecTool(Tool):
         self.restrict_to_workspace = restrict_to_workspace
         self.path_append = path_append
         self._session_manager = session_manager or DEFAULT_EXEC_SESSION_MANAGER
-        self._owner_key = "cli:direct"
+        self._owner_key: ContextVar[str] = ContextVar(
+            f"exec_owner_{id(self)}",
+            default="cli:direct",
+        )
 
     def set_context(self, channel: str, chat_id: str) -> None:
-        self._owner_key = f"{channel}:{chat_id}"
+        self._owner_key.set(f"{channel}:{chat_id}")
 
     @property
     def name(self) -> str:
@@ -158,7 +164,7 @@ class ExecTool(Tool):
             )
             if yield_time_ms is not None:
                 session_id, poll = await self._session_manager.start(
-                    owner_key=self._owner_key,
+                    owner_key=self._owner_key.get(),
                     command=command,
                     cwd=cwd,
                     env=env,
@@ -177,6 +183,7 @@ class ExecTool(Tool):
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
                 env=env,
+                **subprocess_group_kwargs(),
             )
 
             try:
@@ -185,14 +192,11 @@ class ExecTool(Tool):
                     timeout=self.timeout
                 )
             except asyncio.TimeoutError:
-                process.kill()
-                # Wait for the process to fully terminate so pipes are
-                # drained and file descriptors are released.
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    pass
+                await terminate_process_tree(process)
                 return f"Error: Command timed out after {self.timeout} seconds"
+            except asyncio.CancelledError:
+                await terminate_process_tree(process)
+                raise
 
             output_parts = []
 

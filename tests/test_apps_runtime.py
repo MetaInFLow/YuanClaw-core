@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -11,6 +13,7 @@ from yuanclaw.agent.tools.base import Tool
 from yuanclaw.agent.tools.cli_apps import CliAppsTool
 from yuanclaw.apps.cli import CliAppService
 from yuanclaw.apps.mcp_presets import (
+    MCP_PRESETS,
     McpPresetError,
     McpPresetService,
     mcp_preset_runtime_lines,
@@ -59,10 +62,16 @@ def _write_installed_app(workspace, name="echoer", entry_point="echoer"):
     app_dir = workspace / "apps" / "cli"
     app_dir.mkdir(parents=True, exist_ok=True)
     (app_dir / "installed.json").write_text(
-        (
-            '[{"name":"%s","display_name":"Echoer","entry_point":"%s",'
-            '"description":"Echo test"}]'
-        ) % (name, entry_point),
+        json.dumps(
+            [
+                {
+                    "name": name,
+                    "display_name": "Echoer",
+                    "entry_point": entry_point,
+                    "description": "Echo test",
+                }
+            ]
+        ),
         encoding="utf-8",
     )
 
@@ -127,22 +136,17 @@ def test_cli_app_service_catalog_install_settings_uninstall_roundtrip(tmp_path) 
     assert service.installed() == []
 
 
-def test_cli_app_service_tests_installed_entry_point(tmp_path, monkeypatch) -> None:
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    script = bin_dir / "echoer"
-    script.write_text(f"#!{sys.executable}\nprint('ok')\n", encoding="utf-8")
-    script.chmod(0o755)
-    monkeypatch.setenv("PATH", str(bin_dir))
+def test_cli_app_service_tests_installed_entry_point(tmp_path) -> None:
     service = CliAppService(tmp_path)
-    service.replace_catalog([{"name": "echoer", "entryPoint": "echoer"}])
+    service.replace_catalog([{"name": "echoer", "entryPoint": sys.executable}])
     service.install("echoer")
 
     ok = service.test_installed("echoer")
     missing = service.test_entry_point("missing")
 
     assert ok["ok"] is True
-    assert ok["entry_point"] == "echoer"
+    assert ok["entry_point"] == sys.executable
+    assert Path(ok["path"]).resolve() == Path(sys.executable).resolve()
     assert missing["ok"] is False
 
 
@@ -212,6 +216,28 @@ def test_mcp_preset_service_stdio_uses_managed_runtime_cwd(tmp_path, monkeypatch
     assert row["available"] is True
     assert config.tools.mcp_servers["playwright"].cwd == str(tmp_path / "mcp" / "playwright")
     assert (tmp_path / "mcp" / "playwright").is_dir()
+    assert config.tools.mcp_servers["playwright"].args == [
+        "-y",
+        "@playwright/mcp@0.0.78",
+    ]
+    assert row["package_version"] == "0.0.78"
+
+
+def test_builtin_npx_mcp_presets_use_pinned_versions(tmp_path) -> None:
+    payload = McpPresetService(config=Config(), runtime_root=tmp_path).payload()
+    npx_presets = [
+        preset for preset in MCP_PRESETS if preset.server and preset.server.command == "npx"
+    ]
+    npx_rows = {
+        row["name"]: row
+        for row in payload["presets"]
+        if row["name"] in {preset.name for preset in npx_presets}
+    }
+
+    assert {preset.name for preset in npx_presets} == {"playwright", "context7"}
+    assert all(preset.package_version for preset in npx_presets)
+    assert all("@latest" not in " ".join(preset.server.args) for preset in npx_presets)
+    assert all(npx_rows[preset.name]["package_version"] for preset in npx_presets)
 
 
 @pytest.mark.asyncio
@@ -238,8 +264,16 @@ async def test_mcp_preset_service_tests_connection_and_reports_tools(
     service.enable("playwright", {})
 
     async def fake_connect(servers, registry, stack):
+        from yuanclaw.agent.tools.mcp import MCPConnectionResult
+
         assert list(servers) == ["playwright"]
         registry.register(_FakeMcpTool())
+        return {
+            "playwright": MCPConnectionResult(
+                connected=True,
+                tool_names=("mcp_playwright_browser_navigate",),
+            )
+        }
 
     monkeypatch.setattr("yuanclaw.apps.mcp_presets.connect_mcp_servers", fake_connect)
 
@@ -248,6 +282,35 @@ async def test_mcp_preset_service_tests_connection_and_reports_tools(
     assert payload["last_action"]["ok"] is True
     assert payload["last_action"]["tool_count"] == 1
     assert payload["last_action"]["tool_names"] == ["mcp_playwright_browser_navigate"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_preset_service_reports_connection_failure(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from yuanclaw.agent.tools.mcp import MCPConnectionResult
+
+    monkeypatch.setattr("yuanclaw.apps.mcp_presets.shutil.which", lambda command: f"/bin/{command}")
+    config = Config()
+    service = McpPresetService(config=config, runtime_root=tmp_path)
+    service.enable("playwright", {})
+
+    async def fake_connect(servers, registry, stack):
+        return {
+            "playwright": MCPConnectionResult(
+                connected=False,
+                error_type="ConnectionError",
+            )
+        }
+
+    monkeypatch.setattr("yuanclaw.apps.mcp_presets.connect_mcp_servers", fake_connect)
+
+    payload = await service.test("playwright")
+
+    assert payload["last_action"]["ok"] is False
+    assert payload["last_action"]["error"] == "ConnectionError"
+    assert payload["last_action"]["tool_count"] == 0
 
 
 def test_mcp_runtime_lines_distinguish_configured_and_connected_state() -> None:
@@ -405,23 +468,20 @@ def test_agent_loop_registers_run_cli_app_when_enabled(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_run_cli_app_executes_installed_entry_point_without_shell(
     tmp_path,
-    monkeypatch,
 ) -> None:
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    script = bin_dir / "echoer"
+    script = tmp_path / "echoer.py"
     script.write_text(
-        f"#!{sys.executable}\n"
         "import json, sys\n"
         "print(json.dumps({'argv': sys.argv[1:]}))\n",
         encoding="utf-8",
     )
-    script.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bin_dir}")
-    _write_installed_app(tmp_path)
+    _write_installed_app(tmp_path, entry_point=sys.executable)
     tool = CliAppsTool(workspace=tmp_path)
 
-    result = await tool.execute(name="echoer", args=["a; echo unsafe", "b"])
+    result = await tool.execute(
+        name="echoer",
+        args=[str(script), "a; echo unsafe", "b"],
+    )
 
     assert '"a; echo unsafe"' in result
     assert "Exit code: 0" in result

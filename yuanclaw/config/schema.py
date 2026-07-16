@@ -265,6 +265,10 @@ class ChannelsConfig(Base):
 
     send_progress: bool = True  # stream agent's text progress to the channel
     send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
+    outbound_send_timeout_s: float = Field(default=30.0, gt=0, le=600)
+    outbound_retry_attempts: int = Field(default=2, ge=0, le=10)
+    outbound_retry_delay_s: float = Field(default=1.0, ge=0, le=60)
+    outbound_queue_size: int = Field(default=256, ge=1, le=10_000)
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
@@ -284,8 +288,8 @@ class MemoryConfig(Base):
 
     backend: Literal["legacy", "core"] = "legacy"
     daily_pages: bool = True
-    recent_days: int = 2
-    search_max_results: int = 8
+    recent_days: int = Field(default=2, ge=0, le=3650)
+    search_max_results: int = Field(default=8, ge=1, le=1000)
     extra_paths: list[str] = Field(default_factory=list)
 
 
@@ -293,13 +297,13 @@ class MemoryFlushConfig(Base):
     """Pre-compaction memory flush configuration."""
 
     enabled: bool = True
-    soft_threshold_tokens: int = 4000
+    soft_threshold_tokens: int = Field(default=4000, ge=1, le=10_000_000)
 
 
 class CompactionConfig(Base):
     """Compaction budget and flush thresholds."""
 
-    reserve_tokens_floor: int = 12000
+    reserve_tokens_floor: int = Field(default=12000, ge=0, le=10_000_000)
     memory_flush: MemoryFlushConfig = Field(default_factory=MemoryFlushConfig)
     session_ttl_minutes: int = Field(
         default=0,
@@ -316,9 +320,9 @@ class GenerationConfig(Base):
     provider: str = (
         "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
     )
-    max_tokens: int = 8192
-    context_window_tokens: int = 65536
-    temperature: float = 0.1
+    max_tokens: int = Field(default=8192, ge=1, le=10_000_000)
+    context_window_tokens: int = Field(default=65536, ge=1, le=10_000_000)
+    temperature: float = Field(default=0.1, ge=0, le=2)
     reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
 
 
@@ -327,9 +331,9 @@ class InlineFallbackConfig(Base):
 
     model: str
     provider: str = "auto"
-    max_tokens: int | None = None
-    context_window_tokens: int | None = None
-    temperature: float | None = None
+    max_tokens: int | None = Field(default=None, ge=1, le=10_000_000)
+    context_window_tokens: int | None = Field(default=None, ge=1, le=10_000_000)
+    temperature: float | None = Field(default=None, ge=0, le=2)
     reasoning_effort: str | None = None
 
 
@@ -350,9 +354,10 @@ class AgentDefaults(GenerationConfig):
     """Default agent configuration."""
 
     workspace: str = "~/.yuanclaw/workspace"
-    max_tool_iterations: int = 40
-    max_concurrent_subagents: int = Field(default=1, ge=1)
-    memory_window: int = 100
+    max_tool_iterations: int = Field(default=40, ge=1, le=1000)
+    max_concurrent_subagents: int = Field(default=1, ge=1, le=100)
+    subagent_timeout_s: float = Field(default=900.0, gt=0, le=86_400)
+    memory_window: int = Field(default=100, ge=2, le=100_000)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
     fallback_models: list[str | InlineFallbackConfig] = Field(default_factory=list)
@@ -432,14 +437,17 @@ class HeartbeatConfig(Base):
     """Heartbeat service configuration."""
 
     enabled: bool = True
-    interval_s: int = 30 * 60  # 30 minutes
+    interval_s: int = Field(default=30 * 60, ge=1, le=604_800)
+    decision_timeout_s: float = Field(default=60.0, gt=0, le=600)
+    execution_timeout_s: float = Field(default=600.0, gt=0, le=86_400)
+    notify_timeout_s: float = Field(default=30.0, gt=0, le=600)
 
 
 class GatewayConfig(Base):
     """Gateway/server configuration."""
 
     host: str = "0.0.0.0"
-    port: int = 18790
+    port: int = Field(default=18790, ge=1, le=65535)
     token: str = ""
     token_issue_path: str = "/api/auth/token"
     token_issue_secret: str = ""
@@ -462,10 +470,10 @@ class GatewayConfig(Base):
 class WebSearchConfig(Base):
     """Web search tool configuration."""
 
-    provider: str = "brave"  # brave, tavily, duckduckgo, searxng, jina
+    provider: Literal["brave", "tavily", "duckduckgo", "searxng", "jina"] = "brave"
     api_key: str = ""
     base_url: str = ""  # SearXNG base URL
-    max_results: int = 5
+    max_results: int = Field(default=5, ge=1, le=10)
 
 
 class WebToolsConfig(Base):
@@ -499,7 +507,7 @@ class CliAppsToolConfig(Base):
 class ExecToolConfig(Base):
     """Shell exec tool configuration."""
 
-    timeout: int = 60
+    timeout: int = Field(default=60, ge=1, le=86_400)
     path_append: str = ""
 
 
@@ -514,7 +522,9 @@ class MCPServerConfig(Base):
     url: str = ""  # HTTP/SSE: endpoint URL
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
     enabled_tools: list[str] = Field(default_factory=list)
-    tool_timeout: int = 30  # seconds before a tool call is cancelled
+    connect_timeout: float = Field(default=15.0, gt=0, le=600)
+    discovery_timeout: float = Field(default=15.0, gt=0, le=600)
+    tool_timeout: float = Field(default=30.0, gt=0, le=86_400)
 
 
 class ToolsConfig(Base):
@@ -665,4 +675,4 @@ class Config(BaseSettings):
                 return spec.default_api_base
         return None
 
-    model_config = ConfigDict(env_prefix="NANOBOT_", env_nested_delimiter="__")
+    model_config = ConfigDict(env_prefix="YUANCLAW_", env_nested_delimiter="__")

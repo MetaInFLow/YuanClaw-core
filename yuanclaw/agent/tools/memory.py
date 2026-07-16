@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -53,7 +54,11 @@ class MemorySearchTool(Tool):
 
     async def execute(self, query: str, max_results: int = 8, **kwargs: Any) -> str:
         try:
-            hits = self._backend.search(query, max_results=max_results)
+            hits = await asyncio.to_thread(
+                self._backend.search,
+                query,
+                max_results,
+            )
         except Exception as exc:
             return f"Error searching memory: {exc}"
 
@@ -115,7 +120,12 @@ class MemoryGetTool(Tool):
         **kwargs: Any,
     ) -> str:
         try:
-            doc = self._backend.get(path, start_line=start_line, end_line=end_line)
+            doc = await asyncio.to_thread(
+                self._backend.get,
+                path,
+                start_line,
+                end_line,
+            )
         except Exception as exc:
             return f"Error reading memory: {exc}"
 

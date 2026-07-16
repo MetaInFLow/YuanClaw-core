@@ -1,5 +1,6 @@
 """Session management for conversation history."""
 
+import hashlib
 import json
 import shutil
 from dataclasses import dataclass, field
@@ -10,7 +11,12 @@ from typing import Any
 from loguru import logger
 
 from yuanclaw.config.paths import get_legacy_sessions_dir
+from yuanclaw.utils.atomic import atomic_write_text, backup_path, quarantine_path
 from yuanclaw.utils.helpers import ensure_dir, safe_filename
+
+
+class SessionCorruptError(ValueError):
+    """Raised when a persisted session and its backup cannot be read safely."""
 
 
 def _usage_bucket() -> dict[str, Any]:
@@ -200,9 +206,21 @@ class SessionManager:
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
         self.legacy_sessions_dir = get_legacy_sessions_dir()
         self._cache: dict[str, Session] = {}
+        self._cache_signatures: dict[str, tuple[int, int, int]] = {}
+
+    @staticmethod
+    def _path_signature(path: Path) -> tuple[int, int, int]:
+        stat = path.stat()
+        return (stat.st_ino, stat.st_size, stat.st_mtime_ns)
 
     def _get_session_path(self, key: str) -> Path:
         """Get the file path for a session."""
+        safe_key = safe_filename(key.replace(":", "_"))[:80] or "session"
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+        return self.sessions_dir / f"{safe_key}-{digest}.jsonl"
+
+    def _get_old_workspace_session_path(self, key: str) -> Path:
+        """Return the pre-0.2.0 workspace filename used before keys were hashed."""
         safe_key = safe_filename(key.replace(":", "_"))
         return self.sessions_dir / f"{safe_key}.jsonl"
 
@@ -221,25 +239,54 @@ class SessionManager:
         Returns:
             The session.
         """
-        if key in self._cache:
-            return self._cache[key]
+        cached = self._cached_session(key)
+        if cached is not None:
+            return cached
 
         session = self._load(key)
         if session is None:
             session = Session(key=key)
 
         self._cache[key] = session
+        path = self._get_session_path(key)
+        if path.exists():
+            self._cache_signatures[key] = self._path_signature(path)
         return session
+
+    def _cached_session(self, key: str) -> Session | None:
+        session = self._cache.get(key)
+        if session is None:
+            return None
+        persisted_signature = self._cache_signatures.get(key)
+        if persisted_signature is None:
+            return session
+
+        path = self._get_session_path(key)
+        try:
+            current_signature = self._path_signature(path)
+        except FileNotFoundError:
+            self.invalidate(key)
+            return None
+        if current_signature == persisted_signature:
+            return session
+
+        self.invalidate(key)
+        return None
 
     def _load(self, key: str) -> Session | None:
         """Load a session from disk."""
         path = self._get_session_path(key)
         if not path.exists():
-            legacy_path = self._get_legacy_session_path(key)
-            if legacy_path.exists():
+            for legacy_path in (
+                self._get_old_workspace_session_path(key),
+                self._get_legacy_session_path(key),
+            ):
+                if not legacy_path.exists() or not self._path_belongs_to_key(legacy_path, key):
+                    continue
                 try:
                     shutil.move(str(legacy_path), str(path))
                     logger.info("Migrated session {} from legacy path", key)
+                    break
                 except Exception:
                     logger.exception("Failed to migrate session {}", key)
 
@@ -247,59 +294,111 @@ class SessionManager:
             return None
 
         try:
-            messages = []
-            metadata = {}
-            created_at = None
-            last_consolidated = 0
-
-            with open(path, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-
-                    data = json.loads(line)
-
-                    if data.get("_type") == "metadata":
-                        metadata = data.get("metadata", {})
-                        created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
-                        last_consolidated = data.get("last_consolidated", 0)
-                    else:
-                        messages.append(data)
-
-            return Session(
-                key=key,
-                messages=messages,
-                created_at=created_at or datetime.now(),
-                metadata=metadata,
-                last_consolidated=last_consolidated
-            )
-        except Exception as e:
-            logger.warning("Failed to load session {}: {}", key, e)
-            return None
+            return self._read_session(path, key)
+        except Exception as primary_error:
+            previous_path = backup_path(path)
+            if previous_path.exists():
+                try:
+                    recovered = self._read_session(previous_path, key)
+                except Exception:
+                    pass
+                else:
+                    quarantine_path(path)
+                    atomic_write_text(
+                        path,
+                        self._serialize(recovered),
+                        keep_backup=False,
+                    )
+                    return recovered
+            raise SessionCorruptError(f"Invalid session file for {key}: {path}") from primary_error
 
     def save(self, session: Session) -> None:
         """Save a session to disk."""
         path = self._get_session_path(session.key)
 
-        with open(path, "w", encoding="utf-8") as f:
-            metadata_line = {
-                "_type": "metadata",
-                "key": session.key,
-                "created_at": session.created_at.isoformat(),
-                "updated_at": session.updated_at.isoformat(),
-                "metadata": session.metadata,
-                "last_consolidated": session.last_consolidated
-            }
-            f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
-            for msg in session.messages:
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        atomic_write_text(path, self._serialize(session))
 
         self._cache[session.key] = session
+        self._cache_signatures[session.key] = self._path_signature(path)
+
+    @staticmethod
+    def _serialize(session: Session) -> str:
+        metadata_line = {
+            "_type": "metadata",
+            "key": session.key,
+            "created_at": session.created_at.isoformat(),
+            "updated_at": session.updated_at.isoformat(),
+            "metadata": session.metadata,
+            "last_consolidated": max(0, min(session.last_consolidated, len(session.messages))),
+        }
+        lines = [json.dumps(metadata_line, ensure_ascii=False)]
+        lines.extend(json.dumps(message, ensure_ascii=False) for message in session.messages)
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _path_belongs_to_key(path: Path, key: str) -> bool:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                for raw_line in handle:
+                    if not raw_line.strip():
+                        continue
+                    data = json.loads(raw_line)
+                    return data.get("_type") == "metadata" and data.get("key") == key
+        except Exception:
+            return False
+        return False
+
+    @staticmethod
+    def _read_session(path: Path, key: str) -> Session:
+        messages: list[dict[str, Any]] = []
+        metadata: dict[str, Any] = {}
+        created_at: datetime | None = None
+        updated_at: datetime | None = None
+        last_consolidated = 0
+        stored_key: str | None = None
+
+        with open(path, encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                data = json.loads(line)
+                if not isinstance(data, dict):
+                    raise TypeError("session record must be an object")
+                if data.get("_type") == "metadata":
+                    stored_key = data.get("key")
+                    metadata = data.get("metadata", {})
+                    if not isinstance(metadata, dict):
+                        raise TypeError("session metadata must be an object")
+                    created_at = (
+                        datetime.fromisoformat(data["created_at"])
+                        if data.get("created_at")
+                        else None
+                    )
+                    updated_at = (
+                        datetime.fromisoformat(data["updated_at"])
+                        if data.get("updated_at")
+                        else None
+                    )
+                    last_consolidated = int(data.get("last_consolidated", 0) or 0)
+                else:
+                    messages.append(data)
+
+        if stored_key != key:
+            raise ValueError(f"session key mismatch: expected {key!r}, found {stored_key!r}")
+        last_consolidated = max(0, min(last_consolidated, len(messages)))
+        return Session(
+            key=key,
+            messages=messages,
+            created_at=created_at or datetime.now(),
+            updated_at=updated_at or created_at or datetime.now(),
+            metadata=metadata,
+            last_consolidated=last_consolidated,
+        )
 
     def read_session_file(self, key: str) -> dict[str, Any] | None:
         """Read a session without creating it when missing."""
-        session = self._cache.get(key)
+        session = self._cached_session(key)
         if session is not None:
             return {
                 "key": session.key,
@@ -314,6 +413,8 @@ class SessionManager:
         if loaded is None:
             return None
         self._cache[key] = loaded
+        path = self._get_session_path(key)
+        self._cache_signatures[key] = self._path_signature(path)
         return {
             "key": loaded.key,
             "created_at": loaded.created_at.isoformat(),
@@ -326,6 +427,31 @@ class SessionManager:
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
         self._cache.pop(key, None)
+        self._cache_signatures.pop(key, None)
+
+    def delete(self, key: str) -> bool:
+        """Delete a persisted session and evict every cached copy."""
+        self.invalidate(key)
+        removed = False
+        current_path = self._get_session_path(key)
+        candidates = (
+            current_path,
+            backup_path(current_path),
+            self._get_old_workspace_session_path(key),
+            self._get_legacy_session_path(key),
+        )
+        for path in candidates:
+            if not path.exists():
+                continue
+            if path != current_path and path != backup_path(current_path):
+                if not self._path_belongs_to_key(path, key):
+                    continue
+            try:
+                path.unlink()
+                removed = True
+            except FileNotFoundError:
+                continue
+        return removed
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """

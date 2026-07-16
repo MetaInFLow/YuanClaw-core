@@ -789,3 +789,6 @@ class BedrockProvider(LLMProvider):
 
     def get_default_model(self) -> str:
         return self.default_model
+
+    async def aclose(self) -> None:
+        await self._close_resource(self._client)

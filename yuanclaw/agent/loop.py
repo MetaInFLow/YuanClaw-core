@@ -30,7 +30,7 @@ from yuanclaw.agent.tools.image_generation import ImageGenerationTool
 from yuanclaw.agent.tools.long_task import CompleteGoalTool, LongTaskTool
 from yuanclaw.agent.tools.memory import MemoryGetTool, MemorySearchTool
 from yuanclaw.agent.tools.message import MessageTool
-from yuanclaw.agent.tools.registry import ToolRegistry
+from yuanclaw.agent.tools.registry import ToolExecutionResult, ToolRegistry
 from yuanclaw.agent.tools.shell import ExecTool
 from yuanclaw.agent.tools.spawn import SpawnTool
 from yuanclaw.agent.tools.web import WebFetchTool, WebSearchTool
@@ -102,7 +102,8 @@ class AgentLoop:
     5. Sends responses back
     """
 
-    _TOOL_RESULT_MAX_CHARS = 500
+    _TOOL_RESULT_MAX_BYTES = 500
+    _TOOL_RESULT_TRUNCATION_SUFFIX = "\n... (truncated)"
 
     def __init__(
         self,
@@ -135,6 +136,8 @@ class AgentLoop:
         image_generation_provider_configs: dict[str, ProviderConfig] | None = None,
         cli_apps_config: CliAppsToolConfig | None = None,
         max_concurrent_subagents: int | None = None,
+        subagent_timeout_s: float | None = None,
+        restart_handler: Callable[[], bool | Awaitable[bool]] | None = None,
     ):
         from yuanclaw.config.schema import (
             CliAppsToolConfig,
@@ -158,6 +161,7 @@ class AgentLoop:
         self.memory_config = memory_config or MemoryConfig()
         self.compaction_config = compaction_config or CompactionConfig()
         self.reasoning_effort = reasoning_effort
+        self.restart_handler = restart_handler
         self.brave_api_key = brave_api_key
         self.web_search_provider = web_search_provider
         self.web_search_base_url = web_search_base_url
@@ -200,13 +204,16 @@ class AgentLoop:
                 session_key,
             ),
             max_concurrent_subagents=max_concurrent_subagents,
+            subagent_timeout_s=subagent_timeout_s,
         )
 
         self._running = False
         self._mcp_servers = mcp_servers or {}
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
-        self._mcp_connecting = False
+        self._mcp_connect_lock = asyncio.Lock()
+        self._mcp_connected_servers: set[str] = set()
+        self._mcp_tool_names: set[str] = set()
         self._consolidating: set[str] = set()  # Session keys with consolidation in progress
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
@@ -287,28 +294,51 @@ class AgentLoop:
             self.tools.register(CronTool(self.cron_service))
 
     async def _connect_mcp(self) -> None:
-        """Connect to configured MCP servers (one-time, lazy)."""
-        if self._mcp_connected or self._mcp_connecting or not self._mcp_servers:
+        """Connect configured MCP servers, retrying only servers that previously failed."""
+        if not self._mcp_servers:
             return
-        self._mcp_connecting = True
         from yuanclaw.agent.tools.mcp import connect_mcp_servers
-        try:
-            self._mcp_stack = AsyncExitStack()
-            await self._mcp_stack.__aenter__()
-            await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
-            self._mcp_connected = True
-        except Exception as e:
-            logger.error("Failed to connect MCP servers (will retry next message): {}", e)
-            if self._mcp_stack:
-                try:
-                    await self._mcp_stack.aclose()
-                except Exception:
-                    pass
-                self._mcp_stack = None
-        finally:
-            self._mcp_connecting = False
 
-    def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
+        async with self._mcp_connect_lock:
+            pending = {
+                name: cfg
+                for name, cfg in self._mcp_servers.items()
+                if name not in self._mcp_connected_servers
+            }
+            if not pending:
+                self._mcp_connected = True
+                return
+
+            if self._mcp_stack is None:
+                self._mcp_stack = AsyncExitStack()
+                await self._mcp_stack.__aenter__()
+
+            try:
+                results = await connect_mcp_servers(pending, self.tools, self._mcp_stack)
+            except Exception as exc:
+                self._mcp_connected = False
+                logger.error(
+                    "Failed to connect MCP servers; pending servers will retry ({})",
+                    type(exc).__name__,
+                )
+                return
+
+            for name, result in results.items():
+                if result.connected:
+                    self._mcp_connected_servers.add(name)
+                    self._mcp_tool_names.update(result.tool_names)
+
+            self._mcp_connected = (
+                self._mcp_connected_servers == set(self._mcp_servers)
+            )
+
+    def _set_tool_context(
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         """Update context for all tools that need routing info."""
         for name in (
             "message",
@@ -322,7 +352,17 @@ class AgentLoop:
         ):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
-                    tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+                    if name == "message":
+                        tool.set_context(channel, chat_id, message_id, metadata)
+                    else:
+                        tool.set_context(channel, chat_id)
+
+    @staticmethod
+    def _copy_reply_routing(msg: InboundMessage, response: OutboundMessage) -> None:
+        for key in ("message_id", "message_thread_id", "thread_ts"):
+            value = msg.metadata.get(key)
+            if value is not None:
+                response.metadata.setdefault(key, value)
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -391,27 +431,35 @@ class AgentLoop:
         }
 
     @classmethod
-    def _tool_event_finish(cls, tool_call: Any, result: Any) -> dict[str, Any]:
+    def _tool_event_finish(
+        cls,
+        tool_call: Any,
+        execution: ToolExecutionResult,
+    ) -> dict[str, Any]:
         start = cls._tool_event_start(tool_call)
-        is_error = isinstance(result, str) and result.startswith("Error")
-        start["phase"] = "error" if is_error else "end"
-        start["result"] = None if is_error else result
-        start["error"] = result if is_error else None
+        result = execution.content
+        start["phase"] = "end" if execution.ok else "error"
+        start["result"] = result if execution.ok else None
+        start["error"] = execution.error
         if isinstance(result, dict):
             start["files"] = result.get("files") if isinstance(result.get("files"), list) else []
             start["embeds"] = result.get("embeds") if isinstance(result.get("embeds"), list) else []
         return start
 
     @staticmethod
-    def _file_edit_events(tool_call: Any, *, phase: str, result: Any = None) -> list[dict[str, Any]]:
+    def _file_edit_events(
+        tool_call: Any,
+        *,
+        phase: str,
+        execution: ToolExecutionResult | None = None,
+    ) -> list[dict[str, Any]]:
         if getattr(tool_call, "name", "") != "apply_patch":
             return []
         arguments = getattr(tool_call, "arguments", {}) or {}
         edits = arguments.get("edits") if isinstance(arguments, dict) else None
         if not isinstance(edits, list):
             return []
-        is_error = isinstance(result, str) and result.startswith("Error")
-        effective_phase = "error" if phase == "end" and is_error else phase
+        effective_phase = "error" if phase == "end" and execution and not execution.ok else phase
         events: list[dict[str, Any]] = []
         for edit in edits:
             if not isinstance(edit, dict):
@@ -428,7 +476,7 @@ class AgentLoop:
                     "tool": "apply_patch",
                     "path": path,
                     "action": action,
-                    "error": result if effective_phase == "error" else None,
+                    "error": execution.error if effective_phase == "error" and execution else None,
                 }
             )
         return events
@@ -440,6 +488,21 @@ class AgentLoop:
             lock = asyncio.Lock()
             self._session_locks[session_key] = lock
         return lock
+
+    def _register_active_task(self, session_key: str, task: asyncio.Task) -> None:
+        tasks = self._active_tasks.setdefault(session_key, [])
+        if task not in tasks:
+            tasks.append(task)
+
+    def _unregister_active_task(self, session_key: str, task: asyncio.Task) -> None:
+        tasks = self._active_tasks.get(session_key)
+        if tasks is not None and task in tasks:
+            tasks.remove(task)
+        if not tasks:
+            self._active_tasks.pop(session_key, None)
+            lock = self._session_locks.get(session_key)
+            if lock is not None and not lock.locked():
+                self._session_locks.pop(session_key, None)
 
     def _schedule_background(self, awaitable: Awaitable[Any]) -> None:
         task = asyncio.create_task(awaitable)
@@ -476,7 +539,7 @@ class AgentLoop:
             loop=self,
         )
 
-    def _build_memory_context(
+    async def _build_memory_context(
         self,
         *,
         session_key: str,
@@ -485,11 +548,12 @@ class AgentLoop:
         metadata: dict | None = None,
     ) -> str:
         """Build scoped memory context for the current turn."""
-        return self.memory_backend.build_context(
-            session_key=session_key,
-            channel=channel,
-            chat_id=chat_id,
-            is_group=bool((metadata or {}).get("is_group", False)),
+        return await asyncio.to_thread(
+            self.memory_backend.build_context,
+            session_key,
+            channel,
+            chat_id,
+            bool((metadata or {}).get("is_group", False)),
         )
 
     async def _dispatch_command(self, msg: InboundMessage, session: Session, key: str) -> OutboundMessage | None:
@@ -626,16 +690,20 @@ class AgentLoop:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    execution = await self.tools.execute_result(
+                        tool_call.name,
+                        tool_call.arguments,
+                    )
+                    result = execution.content
                     if on_progress:
                         await self._invoke_progress(
                             on_progress,
                             "",
-                            tool_events=[self._tool_event_finish(tool_call, result)],
+                            tool_events=[self._tool_event_finish(tool_call, execution)],
                             file_edit_events=self._file_edit_events(
                                 tool_call,
                                 phase="end",
-                                result=result,
+                                execution=execution,
                             ),
                         )
                     messages = self.context.add_tool_result(
@@ -715,6 +783,12 @@ class AgentLoop:
                 f"I reached the maximum number of tool call iterations ({self.max_iterations}) "
                 "without completing the task. You can try breaking the task into smaller steps."
             )
+            messages = self.context.add_assistant_message(
+                messages,
+                final_content,
+                model=self.model,
+                provider=self.provider_name,
+            )
 
         return final_content, tools_used, messages, usage_totals
 
@@ -727,8 +801,6 @@ class AgentLoop:
     ) -> LLMResponse:
         """Await an LLM call with the runner wall timeout when applicable."""
         timeout_s = self.llm_timeout_s if llm_timeout_s is None else llm_timeout_s
-        if streaming:
-            timeout_s = None
         if timeout_s is not None and timeout_s <= 0:
             timeout_s = None
         try:
@@ -772,24 +844,34 @@ class AgentLoop:
                 continue
 
             task = asyncio.create_task(self._dispatch(msg))
-            self._active_tasks.setdefault(msg.session_key, []).append(task)
-            task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+            self._register_active_task(msg.session_key, task)
+            task.add_done_callback(
+                lambda completed, key=msg.session_key: self._unregister_active_task(key, completed)
+            )
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
         """Cancel all active tasks and subagents for the session."""
-        tasks = self._active_tasks.pop(msg.session_key, [])
-        cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
-        for t in tasks:
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):
-                pass
-        sub_cancelled = await self.subagents.cancel_by_session(msg.session_key)
-        total = cancelled + sub_cancelled
+        total = await self.cancel_session(msg.session_key)
         content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
         await self.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=content,
         ))
+
+    async def cancel_session(self, session_key: str) -> int:
+        """Cancel every tracked task and subprocess owned by one session."""
+        current = asyncio.current_task()
+        tasks = [
+            task
+            for task in self._active_tasks.get(session_key, [])
+            if task is not current and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        subagent_count = await self.subagents.cancel_by_session(session_key)
+        exec_count = await self._exec_session_manager.terminate_owner(session_key)
+        return len(tasks) + subagent_count + exec_count
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message with per-session locking."""
@@ -849,17 +931,56 @@ class AgentLoop:
 
     async def close_mcp(self) -> None:
         """Close MCP connections."""
-        if self._mcp_stack:
+        async with self._mcp_connect_lock:
+            stack = self._mcp_stack
+            self._mcp_stack = None
+            self._mcp_connected = False
+            self._mcp_connected_servers.clear()
+            tool_names = tuple(self._mcp_tool_names)
+            self._mcp_tool_names.clear()
+            for name in tool_names:
+                self.tools.unregister(name)
+
+        if stack:
             try:
-                await self._mcp_stack.aclose()
+                await stack.aclose()
             except (RuntimeError, BaseExceptionGroup):
                 pass  # MCP SDK cancel scope cleanup is noisy but harmless
-            self._mcp_stack = None
 
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
         logger.info("Agent loop stopping")
+
+    async def shutdown(self, *, close_provider: bool = True) -> None:
+        """Stop accepting work and await cleanup of all owned async resources."""
+        self.stop()
+        current = asyncio.current_task()
+        tasks = {
+            task
+            for session_tasks in self._active_tasks.values()
+            for task in session_tasks
+            if task is not current and not task.done()
+        }
+        tasks.update(
+            task
+            for task in self._background_tasks | self._consolidation_tasks
+            if task is not current and not task.done()
+        )
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._active_tasks.clear()
+        self._background_tasks.clear()
+        self._consolidation_tasks.clear()
+        self._consolidating.clear()
+        self._session_locks.clear()
+        await self.subagents.cancel_all()
+        await self._exec_session_manager.terminate_all()
+        await self.close_mcp()
+        if close_provider:
+            await self.provider.aclose()
 
     async def _process_message(
         self,
@@ -878,9 +999,14 @@ class AgentLoop:
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
             session, pending_summary = self.auto_compact.prepare_session(session, key)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+            self._set_tool_context(
+                channel,
+                chat_id,
+                msg.metadata.get("message_id"),
+                msg.metadata,
+            )
             history = session.get_history(max_messages=self.memory_window)
-            memory_context = self._build_memory_context(
+            memory_context = await self._build_memory_context(
                 session_key=key,
                 channel=channel,
                 chat_id=chat_id,
@@ -955,6 +1081,7 @@ class AgentLoop:
         if parsed:
             response = await self._dispatch_command(msg, session, key)
             if response is not None:
+                self._copy_reply_routing(msg, response)
                 return response
 
         unconsolidated = len(session.messages) - session.last_consolidated
@@ -978,7 +1105,12 @@ class AgentLoop:
             _task = asyncio.create_task(_consolidate_and_unlock())
             self._consolidation_tasks.add(_task)
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+        self._set_tool_context(
+            msg.channel,
+            msg.chat_id,
+            msg.metadata.get("message_id"),
+            msg.metadata,
+        )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
@@ -991,7 +1123,7 @@ class AgentLoop:
             skill_names = fixed_skills or None
 
         history = session.get_history(max_messages=self.memory_window)
-        memory_context = self._build_memory_context(
+        memory_context = await self._build_memory_context(
             session_key=key,
             channel=msg.channel,
             chat_id=msg.chat_id,
@@ -1069,8 +1201,8 @@ class AgentLoop:
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages — they poison session context
-            if role == "tool" and isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
-                entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+            if role == "tool":
+                entry["content"] = self._bounded_tool_result(content)
             elif role == "user":
                 if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
                     # Strip the runtime-context prefix, keep only the user text.
@@ -1107,6 +1239,27 @@ class AgentLoop:
             session.messages.append(entry)
         session.updated_at = datetime.now()
 
+    def _bounded_tool_result(self, content: Any) -> str:
+        """Serialize and bound a persisted tool result without splitting UTF-8 text."""
+        if isinstance(content, str):
+            serialized = content
+        else:
+            try:
+                serialized = json.dumps(content, ensure_ascii=False, default=str)
+            except (TypeError, ValueError):
+                serialized = str(content)
+
+        limit = self._TOOL_RESULT_MAX_BYTES
+        encoded = serialized.encode("utf-8")
+        if len(encoded) <= limit:
+            return serialized
+
+        suffix = self._TOOL_RESULT_TRUNCATION_SUFFIX.encode("utf-8")
+        if limit <= len(suffix):
+            return suffix[:limit].decode("utf-8", errors="ignore")
+        prefix = encoded[:limit - len(suffix)].decode("utf-8", errors="ignore")
+        return prefix + self._TOOL_RESULT_TRUNCATION_SUFFIX
+
     def _persist_runtime_attachments(self, session: Session, metadata: dict[str, Any]) -> None:
         cli_apps = normalize_cli_app_mentions(
             metadata.get("cli_apps") or metadata.get("cliApps")
@@ -1123,10 +1276,13 @@ class AgentLoop:
 
     async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
         """Delegate to MemoryStore.consolidate(). Returns True on success."""
-        return await MemoryStore(self.workspace).consolidate(
+        consolidated = await MemoryStore(self.workspace).consolidate(
             session, self.provider, self.model,
             archive_all=archive_all, memory_window=self.memory_window,
         )
+        if consolidated:
+            self.sessions.save(session)
+        return consolidated
 
     async def process_direct(
         self,
@@ -1141,23 +1297,30 @@ class AgentLoop:
         metadata: dict[str, Any] | None = None,
     ) -> str:
         """Process a message directly (for CLI or cron usage)."""
-        await self._connect_mcp()
-        async with self._get_session_lock(session_key):
-            metadata = dict(metadata or {})
-            if skill_names:
-                metadata["skill_names"] = skill_names
-            msg = InboundMessage(
-                channel=channel,
-                sender_id="user",
-                chat_id=chat_id,
-                content=content,
-                metadata=metadata,
-            )
-            response = await self._process_message(
-                msg,
-                session_key=session_key,
-                on_progress=on_progress,
-                on_stream=on_stream,
-                on_stream_end=on_stream_end,
-            )
-        return response.content if response else ""
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("process_direct requires an asyncio task")
+        self._register_active_task(session_key, task)
+        try:
+            await self._connect_mcp()
+            async with self._get_session_lock(session_key):
+                metadata = dict(metadata or {})
+                if skill_names:
+                    metadata["skill_names"] = skill_names
+                msg = InboundMessage(
+                    channel=channel,
+                    sender_id="user",
+                    chat_id=chat_id,
+                    content=content,
+                    metadata=metadata,
+                )
+                response = await self._process_message(
+                    msg,
+                    session_key=session_key,
+                    on_progress=on_progress,
+                    on_stream=on_stream,
+                    on_stream_end=on_stream_end,
+                )
+            return response.content if response else ""
+        finally:
+            self._unregister_active_task(session_key, task)

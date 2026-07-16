@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from datetime import datetime
 from typing import Any
 
@@ -24,18 +25,20 @@ class _GoalToolBase:
 
     def __init__(self, sessions: SessionManager) -> None:
         self._sessions = sessions
-        self._channel = ""
-        self._chat_id = ""
+        self._route: ContextVar[tuple[str, str]] = ContextVar(
+            f"goal_route_{id(self)}",
+            default=("", ""),
+        )
 
     def set_context(self, channel: str, chat_id: str) -> None:
         """Set current chat routing context."""
-        self._channel = channel
-        self._chat_id = chat_id
+        self._route.set((channel, chat_id))
 
     def _session(self):
-        if not self._channel or not self._chat_id:
+        channel, chat_id = self._route.get()
+        if not channel or not chat_id:
             return None
-        return self._sessions.get_or_create(f"{self._channel}:{self._chat_id}")
+        return self._sessions.get_or_create(f"{channel}:{chat_id}")
 
 
 class LongTaskTool(Tool, _GoalToolBase):

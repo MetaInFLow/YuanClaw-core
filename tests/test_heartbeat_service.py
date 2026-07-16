@@ -115,3 +115,88 @@ async def test_trigger_now_returns_none_when_decision_is_skip(tmp_path) -> None:
     )
 
     assert await service.trigger_now() is None
+
+
+@pytest.mark.asyncio
+async def test_decide_rejects_wrong_tool_name_and_empty_run_tasks(tmp_path) -> None:
+    provider = DummyProvider([
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCallRequest(
+                    id="wrong",
+                    name="other_tool",
+                    arguments={"action": "run", "tasks": "do work"},
+                )
+            ],
+        ),
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCallRequest(
+                    id="empty",
+                    name="heartbeat",
+                    arguments={"action": "run", "tasks": ""},
+                )
+            ],
+        ),
+    ])
+    service = HeartbeatService(tmp_path, provider, "test")
+
+    assert await service._decide("content") == ("skip", "")
+    assert await service._decide("content") == ("skip", "")
+
+
+@pytest.mark.asyncio
+async def test_overlapping_triggers_execute_once(tmp_path) -> None:
+    (tmp_path / "HEARTBEAT.md").write_text("- [ ] do thing", encoding="utf-8")
+    provider = DummyProvider([
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCallRequest(
+                    id="hb",
+                    name="heartbeat",
+                    arguments={"action": "run", "tasks": "work"},
+                )
+            ],
+        )
+    ])
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def execute(_tasks: str) -> str:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return "done"
+
+    service = HeartbeatService(tmp_path, provider, "test", on_execute=execute)
+    first = asyncio.create_task(service.trigger_now())
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+
+    assert await service.trigger_now() is None
+    release.set()
+    assert await first == "done"
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_decision_timeout_is_explicit(tmp_path) -> None:
+    (tmp_path / "HEARTBEAT.md").write_text("- [ ] do thing", encoding="utf-8")
+
+    class SlowProvider:
+        async def chat(self, *args, **kwargs):
+            await asyncio.Event().wait()
+
+    service = HeartbeatService(
+        tmp_path,
+        SlowProvider(),
+        "test",
+        decision_timeout_s=0.01,
+    )
+
+    with pytest.raises(TimeoutError, match="decision exceeded 0.01s"):
+        await service.trigger_now()

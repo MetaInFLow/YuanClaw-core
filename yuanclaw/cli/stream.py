@@ -118,3 +118,12 @@ class StreamRenderer:
                 self._spinner.__enter__()
         else:
             _make_console().print()
+
+    async def aclose(self) -> None:
+        """Release renderer resources without emitting additional output."""
+        if self._live is not None:
+            self._live.update(self._renderable())
+            self._live.refresh()
+            self._live.stop()
+            self._live = None
+        self._stop_spinner()

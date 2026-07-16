@@ -13,6 +13,8 @@ import httpx
 from yuanclaw.config.schema import Config, ProviderConfig
 from yuanclaw.utils.helpers import detect_image_mime
 
+MAX_REFERENCE_IMAGE_BYTES = 10 * 1024 * 1024
+
 
 class ImageGenerationError(RuntimeError):
     """Raised for image generation configuration or provider failures."""
@@ -46,7 +48,12 @@ _IMAGE_GEN_PROVIDERS: dict[str, type] = {}
 
 def image_path_to_data_url(path: str | Path) -> str:
     """Encode a local image file as a data URL."""
-    raw = Path(path).expanduser().read_bytes()
+    image_path = Path(path).expanduser()
+    if image_path.stat().st_size > MAX_REFERENCE_IMAGE_BYTES:
+        raise ImageGenerationError(
+            f"reference image exceeds {MAX_REFERENCE_IMAGE_BYTES} bytes: {path}"
+        )
+    raw = image_path.read_bytes()
     mime = detect_image_mime(raw) or mimetypes.guess_type(str(path))[0]
     if not mime or not mime.startswith("image/"):
         raise ImageGenerationError(f"unsupported reference image: {path}")

@@ -1,5 +1,7 @@
+import asyncio
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import quote
 
 import pytest
@@ -16,6 +18,7 @@ from yuanclaw.api.server import (
 )
 from yuanclaw.config.paths import get_media_dir
 from yuanclaw.config.schema import Config
+from yuanclaw.cron.types import CronJob, CronPayload
 from yuanclaw.providers.openai_compatible_provider import OpenAICompatibleProvider
 from yuanclaw.session.manager import SessionManager
 
@@ -32,7 +35,10 @@ class _RuntimeStub:
         self.port = 18789
         self.started_at = 0.0
         self.provider = SimpleNamespace(chat=AsyncMock())
-        self.agent = SimpleNamespace(process_direct=AsyncMock(return_value="stub reply"))
+        self.agent = SimpleNamespace(
+            process_direct=AsyncMock(return_value="stub reply"),
+            cancel_session=AsyncMock(return_value=0),
+        )
         self.applied_configs = []
         self.prepared_configs = []
         self.distill_payload = None
@@ -127,6 +133,80 @@ def test_sessions_api_includes_message_summary_fields(tmp_path) -> None:
     assert item["last_message_preview"] == (
         "I wired the runtime adapter and updated the desktop startup flow."
     )
+
+
+def test_skills_api_uses_workspace_overlaid_runtime_inventory(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    skill_dir = workspace / "skills" / "workspace-demo"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: workspace-demo\ndescription: Workspace demo skill\n---\nInstructions.",
+        encoding="utf-8",
+    )
+    runtime = _RuntimeStub(workspace)
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.get("/api/skills")
+
+    assert response.status_code == 200
+    workspace_skill = next(
+        item for item in response.json()["items"] if item["id"] == "workspace-demo"
+    )
+    assert workspace_skill == {
+        "id": "workspace-demo",
+        "name": "workspace-demo",
+        "description": "Workspace demo skill",
+        "version": "workspace",
+        "enabled": True,
+        "source": "workspace",
+    }
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (["not", "an", "object"], "payload must be an object"),
+        ({"type": "chat", "content": "x" * 200_001}, "content exceeds 200000 characters"),
+        (
+            {"type": "chat", "content": "hello", "skillNames": "demo"},
+            "skillNames must be an array",
+        ),
+    ],
+)
+def test_ws_chat_rejects_invalid_or_oversized_payloads(
+    tmp_path,
+    payload,
+    message,
+) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+
+    with TestClient(create_app(runtime)) as client:
+        with client.websocket_connect("/ws/chat") as websocket:
+            assert websocket.receive_json()["type"] == "ready"
+            websocket.send_json(payload)
+            error = websocket.receive_json()
+
+    assert error == {"type": "error", "message": message}
+    runtime.agent.process_direct.assert_not_awaited()
+
+
+def test_delete_session_api_cancels_work_and_removes_persistence(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    session = runtime.session_manager.get_or_create("studio:thread-delete")
+    session.add_message("user", "delete me")
+    runtime.session_manager.save(session)
+
+    with TestClient(create_app(runtime=runtime)) as client:
+        response = client.delete(f"/api/sessions/{quote(session.key, safe='')}")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True,
+        "deleted": True,
+        "cancelled_tasks": 0,
+    }
+    runtime.agent.cancel_session.assert_awaited_once_with(session.key)
+    assert runtime.session_manager.read_session_file(session.key) is None
 
 
 def test_sessions_api_uses_null_preview_for_empty_sessions(tmp_path) -> None:
@@ -283,6 +363,34 @@ def test_signed_media_route_supports_single_byte_range(tmp_path, monkeypatch) ->
     assert invalid.headers["content-range"] == "bytes */10"
 
 
+def test_signed_media_route_streams_without_path_read_bytes(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "yuanclaw.config.paths.get_config_path",
+        lambda: tmp_path / "instance" / "config.json",
+    )
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    media_path = get_media_dir("api") / "streamed.mp4"
+    expected = b"streamed-content"
+    media_path.write_bytes(expected)
+    session = runtime.session_manager.get_or_create("studio:thread-streamed")
+    session.add_message("user", "clip", media=[str(media_path)])
+    runtime.session_manager.save(session)
+
+    with TestClient(create_app(runtime)) as client:
+        replay = client.get(f"/api/sessions/{quote(session.key, safe='')}/messages")
+        media_url = replay.json()["messages"][0]["media_urls"][0]["url"]
+        monkeypatch.setattr(
+            Path,
+            "read_bytes",
+            lambda _self: (_ for _ in ()).throw(AssertionError("read_bytes is forbidden")),
+        )
+        response = client.get(media_url)
+
+    assert response.status_code == 200
+    assert response.content == expected
+    assert response.headers["content-length"] == str(len(expected))
+
+
 def test_session_messages_api_does_not_create_missing_session(tmp_path) -> None:
     runtime = _RuntimeStub(tmp_path / "workspace")
 
@@ -431,6 +539,44 @@ def test_ws_chat_forwards_workspace_scope_to_agent_metadata(tmp_path) -> None:
         "project_path": str(project),
         "access_mode": "restricted",
     }
+
+
+def test_ws_chat_stop_frame_cancels_running_session(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    started = asyncio.Event()
+
+    async def _slow_process(**_kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    runtime.agent.process_direct = AsyncMock(side_effect=_slow_process)
+    runtime.agent.cancel_session = AsyncMock(return_value=1)
+
+    with TestClient(create_app(runtime)) as client:
+        with client.websocket_connect("/ws/chat") as websocket:
+            assert websocket.receive_json()["type"] == "ready"
+            websocket.send_json(
+                {
+                    "type": "chat",
+                    "content": "long task",
+                    "sessionKey": "studio:thread-stop",
+                }
+            )
+            assert websocket.receive_json()["type"] == "goal_status"
+            websocket.send_json(
+                {
+                    "type": "stop",
+                    "sessionKey": "studio:thread-stop",
+                }
+            )
+            stopped = websocket.receive_json()
+
+    assert stopped == {
+        "type": "stopped",
+        "sessionKey": "studio:thread-stop",
+        "cancelled": 1,
+    }
+    runtime.agent.cancel_session.assert_awaited_once_with("studio:thread-stop")
 
 
 def test_session_summary_api_falls_back_to_input_without_api_key(tmp_path) -> None:
@@ -582,6 +728,58 @@ def test_write_config_api_rejects_enabled_runtime_channel_without_required_field
     mock_save_config.assert_not_called()
     assert runtime.prepared_configs == []
     assert runtime.applied_configs == []
+
+
+def test_config_api_masks_secrets_and_preserves_masks_on_write(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    runtime.config.providers.custom.api_key = "provider-value"
+    runtime.config.providers.custom.extra_headers = {
+        "Authorization": "Bearer value",
+        "X-Trace": "trace-value",
+    }
+    runtime.config.channels.telegram.token = "telegram-value"
+
+    with patch("yuanclaw.api.server.save_config") as mock_save_config:
+        with TestClient(create_app(runtime)) as client:
+            read_response = client.get("/api/config")
+            raw = read_response.json()["raw"]
+            write_response = client.put("/api/config", json=raw)
+
+    assert read_response.status_code == 200
+    assert "provider-value" not in read_response.text
+    assert "Bearer value" not in read_response.text
+    assert "trace-value" not in read_response.text
+    assert "telegram-value" not in read_response.text
+    assert raw["providers"]["custom"]["apiKey"] == "prov...ue"
+    assert raw["providers"]["custom"]["extraHeaders"]["Authorization"] == "Bear...ue"
+    assert raw["providers"]["custom"]["extraHeaders"]["X-Trace"] == "trac...ue"
+    assert raw["channels"]["telegram"]["token"] == "tele...ue"
+    assert write_response.status_code == 200
+    saved = mock_save_config.call_args.args[0]
+    assert saved.providers.custom.api_key == "provider-value"
+    assert saved.providers.custom.extra_headers["Authorization"] == "Bearer value"
+    assert saved.providers.custom.extra_headers["X-Trace"] == "trace-value"
+    assert saved.channels.telegram.token == "telegram-value"
+
+
+def test_write_config_api_restores_disk_config_when_runtime_apply_fails(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    previous_model = runtime.config.agents.defaults.model
+    payload = runtime.config.model_dump(by_alias=True)
+    payload["agents"]["defaults"]["model"] = "openai/gpt-test"
+    runtime.apply_config = AsyncMock(side_effect=RuntimeError("simulated start failure"))
+
+    with patch("yuanclaw.api.server.save_config") as mock_save_config:
+        with TestClient(create_app(runtime)) as client:
+            response = client.put("/api/config", json=payload)
+
+    assert response.status_code == 500
+    assert "simulated start failure" in response.json()["detail"]
+    assert mock_save_config.call_count == 2
+    assert mock_save_config.call_args_list[0].args[0].agents.defaults.model == "openai/gpt-test"
+    assert mock_save_config.call_args_list[1].args[0].agents.defaults.model == previous_model
+
+
 def test_usage_api_aggregates_session_usage(tmp_path) -> None:
     runtime = _RuntimeStub(tmp_path / "workspace")
     first = runtime.session_manager.get_or_create("studio:cowboy-biaoge:thread-1")
@@ -725,6 +923,7 @@ async def test_core_runtime_apply_config_refreshes_provider_and_tool_snapshot(
     updated.tools.image_generation.enabled = True
 
     old_agent = runtime.agent
+    old_bus = runtime.bus
     old_session_manager = runtime.session_manager
     await runtime.apply_config(updated)
 
@@ -738,6 +937,159 @@ async def test_core_runtime_apply_config_refreshes_provider_and_tool_snapshot(
     assert runtime.agent.tools.get("run_cli_app") is not None
     assert runtime.agent.tools.get("generate_image") is not None
     assert runtime.agent.tools.get("run_cli_app") is not old_agent.tools.get("run_cli_app")
+    assert old_bus.closed is True
+
+
+@pytest.mark.asyncio
+async def test_core_runtime_apply_config_restores_running_components_on_start_failure(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "yuanclaw.config.paths.get_config_path",
+        lambda: tmp_path / "instance" / "config.json",
+    )
+    initial = Config()
+    initial.agents.defaults.workspace = str(tmp_path / "workspace-a")
+    runtime = CoreRuntime(initial, host="127.0.0.1", port=18789, with_channels=False)
+    await runtime.start()
+    previous_agent = runtime.agent
+    previous_bus = runtime.bus
+    previous_provider = runtime.provider
+    original_start_locked = runtime._start_locked
+    start_attempts = 0
+
+    async def fail_new_runtime_once() -> None:
+        nonlocal start_attempts
+        start_attempts += 1
+        if start_attempts == 1:
+            raise RuntimeError("simulated start failure")
+        await original_start_locked()
+
+    monkeypatch.setattr(runtime, "_start_locked", fail_new_runtime_once)
+    updated = Config.model_validate(initial.model_dump(by_alias=True))
+    updated.agents.defaults.workspace = str(tmp_path / "workspace-b")
+
+    with pytest.raises(RuntimeError, match="simulated start failure"):
+        await runtime.apply_config(updated)
+
+    assert runtime.running is True
+    assert runtime.config is initial
+    assert runtime.agent is previous_agent
+    assert runtime.bus is previous_bus
+    assert runtime.bus.closed is False
+    assert runtime.provider is previous_provider
+    await runtime.stop()
+    assert previous_bus.closed is True
+
+
+def test_core_runtime_running_reflects_background_task_liveness(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "yuanclaw.config.paths.get_config_path",
+        lambda: tmp_path / "instance" / "config.json",
+    )
+    config = Config()
+    config.agents.defaults.workspace = str(tmp_path / "workspace")
+    runtime = CoreRuntime(config, host="127.0.0.1", port=18789, with_channels=True)
+    runtime._started = True
+    runtime._agent_task = SimpleNamespace(done=lambda: False)
+    runtime._channels_task = SimpleNamespace(done=lambda: False)
+    assert runtime.running is True
+
+    runtime._channels_task = SimpleNamespace(done=lambda: True)
+    assert runtime.running is False
+
+
+@pytest.mark.asyncio
+async def test_core_runtime_restart_request_uses_config_apply_lifecycle(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "yuanclaw.config.paths.get_config_path",
+        lambda: tmp_path / "instance" / "config.json",
+    )
+    config = Config()
+    config.agents.defaults.workspace = str(tmp_path / "workspace")
+    runtime = CoreRuntime(config, host="127.0.0.1", port=18789, with_channels=False)
+    runtime._started = True
+    runtime._RESTART_DELAY_S = 0
+    prepared = {"prepared": True}
+    runtime.prepare_config = MagicMock(return_value=prepared)
+    runtime.apply_config = AsyncMock()
+
+    assert runtime.request_restart() is True
+    restart_task = runtime._restart_task
+    assert restart_task is not None
+    await restart_task
+
+    runtime.prepare_config.assert_called_once_with(config)
+    runtime.apply_config.assert_awaited_once_with(config, prepared)
+
+
+@pytest.mark.asyncio
+async def test_core_runtime_cron_delivers_final_response(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "yuanclaw.config.paths.get_config_path",
+        lambda: tmp_path / "instance" / "config.json",
+    )
+    config = Config()
+    config.agents.defaults.workspace = str(tmp_path / "workspace")
+    runtime = CoreRuntime(config, host="127.0.0.1", port=18789, with_channels=False)
+    runtime.agent.process_direct = AsyncMock(return_value="scheduled result")
+    job = CronJob(
+        id="job-1",
+        name="daily report",
+        payload=CronPayload(
+            message="prepare the report",
+            deliver=True,
+            channel="telegram",
+            to="chat-1",
+        ),
+    )
+
+    response = await runtime._on_cron_job(job)
+    delivered = await runtime.bus.consume_outbound()
+
+    assert response == "scheduled result"
+    assert delivered.channel == "telegram"
+    assert delivered.chat_id == "chat-1"
+    assert delivered.content == "scheduled result"
+    prompt = runtime.agent.process_direct.await_args.args[0]
+    assert "daily report" in prompt
+    assert "prepare the report" in prompt
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_core_runtime_cron_avoids_duplicate_message_delivery(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "yuanclaw.config.paths.get_config_path",
+        lambda: tmp_path / "instance" / "config.json",
+    )
+    config = Config()
+    config.agents.defaults.workspace = str(tmp_path / "workspace")
+    runtime = CoreRuntime(config, host="127.0.0.1", port=18789, with_channels=False)
+    runtime.agent.process_direct = AsyncMock(return_value="already sent")
+    runtime.agent.tools.get("message")._sent_in_turn = True
+    job = CronJob(
+        id="job-2",
+        name="notify",
+        payload=CronPayload(
+            message="send notification",
+            deliver=True,
+            channel="telegram",
+            to="chat-2",
+        ),
+    )
+
+    await runtime._on_cron_job(job)
+
+    assert runtime.bus.outbound_size == 0
+    await runtime.stop()
 
 
 def test_api_requires_gateway_token_when_configured(tmp_path) -> None:
@@ -779,6 +1131,31 @@ def test_gateway_token_issue_endpoint_mints_short_lived_api_token(tmp_path) -> N
     assert authorized.status_code == 200
 
 
+def test_gateway_token_issue_path_tracks_hot_config(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    original_path = runtime.config.gateway.token_issue_path
+    app = create_app(runtime)
+
+    with TestClient(app) as client:
+        runtime.config.gateway.token_issue_path = "/api/token-after-hot-config"
+        runtime.config.gateway.token_issue_secret = "issue-secret"
+        issued = client.get(
+            runtime.config.gateway.token_issue_path,
+            headers={"Authorization": "Bearer issue-secret"},
+        )
+        old_path = client.get(original_path)
+        issued_token = issued.json()["token"]
+        unknown = client.get(
+            "/api/not-a-real-route",
+            headers={"Authorization": f"Bearer {issued_token}"},
+        )
+
+    assert issued.status_code == 200
+    assert isinstance(issued_token, str)
+    assert old_path.status_code == 401
+    assert unknown.status_code == 404
+
+
 def test_websocket_requires_gateway_token_when_configured(tmp_path) -> None:
     runtime = _RuntimeStub(tmp_path / "workspace")
     runtime.config.gateway.token = "static-token"
@@ -794,3 +1171,73 @@ def test_websocket_requires_gateway_token_when_configured(tmp_path) -> None:
 
         with client.websocket_connect("/ws/events?token=static-token") as websocket:
             assert websocket.receive_json()["type"] == "ready"
+
+
+def test_session_summary_api_rejects_oversized_content(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.post(
+            "/api/sessions/studio%3Athread/summary",
+            json={"content": "x" * 100_001},
+        )
+
+    assert response.status_code == 400
+    assert "at most 100000 characters" in response.json()["detail"]
+
+
+def test_session_summary_api_times_out(monkeypatch, tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+
+    async def wait_forever(**_kwargs):
+        await asyncio.Event().wait()
+
+    runtime.generate_thread_summary = wait_forever
+    monkeypatch.setattr("yuanclaw.api.server._THREAD_SUMMARY_TIMEOUT_S", 0.01)
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.post(
+            "/api/sessions/studio%3Athread/summary",
+            json={"content": "summarize this"},
+        )
+
+    assert response.status_code == 504
+    assert response.json()["detail"] == "thread summary timed out"
+
+
+def test_internal_knowledge_distill_api_rejects_too_many_sessions(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.post(
+            "/api/internal/knowledge/distill",
+            json={
+                "sessions": [
+                    {"sessionKey": f"studio:thread:{index}"} for index in range(41)
+                ],
+                "existingInsights": [],
+                "collectionPrompt": "",
+                "systemPrompt": "",
+                "archivePrompt": "",
+            },
+        )
+
+    assert response.status_code == 400
+    assert "at most 40 items" in response.json()["detail"]
+
+
+def test_oauth_status_refresh_runs_outside_event_loop(monkeypatch, tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+
+    def status_off_event_loop(_self, provider_id):
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        return {"provider_id": provider_id, "offloaded": True}
+
+    monkeypatch.setattr("yuanclaw.api.server.OAuthLoginManager.status", status_off_event_loop)
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.get("/api/providers/oauth/openai_codex")
+
+    assert response.status_code == 200
+    assert response.json()["offloaded"] is True
