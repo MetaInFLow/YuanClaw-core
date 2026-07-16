@@ -13,6 +13,7 @@ from yuanclaw.agent.tools.base import Tool
 from yuanclaw.agent.tools.cli_apps import CliAppsTool
 from yuanclaw.apps.cli import CliAppService
 from yuanclaw.apps.mcp_presets import (
+    MCP_PRESETS,
     McpPresetError,
     McpPresetService,
     mcp_preset_runtime_lines,
@@ -215,6 +216,28 @@ def test_mcp_preset_service_stdio_uses_managed_runtime_cwd(tmp_path, monkeypatch
     assert row["available"] is True
     assert config.tools.mcp_servers["playwright"].cwd == str(tmp_path / "mcp" / "playwright")
     assert (tmp_path / "mcp" / "playwright").is_dir()
+    assert config.tools.mcp_servers["playwright"].args == [
+        "-y",
+        "@playwright/mcp@0.0.78",
+    ]
+    assert row["package_version"] == "0.0.78"
+
+
+def test_builtin_npx_mcp_presets_use_pinned_versions(tmp_path) -> None:
+    payload = McpPresetService(config=Config(), runtime_root=tmp_path).payload()
+    npx_presets = [
+        preset for preset in MCP_PRESETS if preset.server and preset.server.command == "npx"
+    ]
+    npx_rows = {
+        row["name"]: row
+        for row in payload["presets"]
+        if row["name"] in {preset.name for preset in npx_presets}
+    }
+
+    assert {preset.name for preset in npx_presets} == {"playwright", "context7"}
+    assert all(preset.package_version for preset in npx_presets)
+    assert all("@latest" not in " ".join(preset.server.args) for preset in npx_presets)
+    assert all(npx_rows[preset.name]["package_version"] for preset in npx_presets)
 
 
 @pytest.mark.asyncio

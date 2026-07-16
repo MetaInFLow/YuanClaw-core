@@ -66,6 +66,7 @@ class McpPreset:
     fields: tuple[McpPresetField, ...] = ()
     requires: str = ""
     note: str = ""
+    package_version: str = ""
 
 
 def _favicon_url(domain: str) -> str:
@@ -110,10 +111,11 @@ MCP_PRESETS: tuple[McpPreset, ...] = (
         brand_domain="playwright.dev",
         brand_color="#2EAD33",
         requires="Node.js and npx",
+        package_version="0.0.78",
         server=MCPServerConfig(
             type="stdio",
             command="npx",
-            args=["-y", "@playwright/mcp@latest"],
+            args=["-y", "@playwright/mcp@0.0.78"],
             tool_timeout=60,
         ),
     ),
@@ -128,10 +130,11 @@ MCP_PRESETS: tuple[McpPreset, ...] = (
         brand_domain="context7.com",
         brand_color="#111827",
         requires="Node.js and npx; API key optional",
+        package_version="3.2.3",
         server=MCPServerConfig(
             type="stdio",
             command="npx",
-            args=["-y", "@upstash/context7-mcp@latest"],
+            args=["-y", "@upstash/context7-mcp@3.2.3"],
             tool_timeout=45,
         ),
         fields=(
@@ -628,6 +631,7 @@ class McpPresetService:
             "transport": preset.transport,
             "requires": preset.requires,
             "note": preset.note,
+            "package_version": preset.package_version or None,
             "install_supported": preset.install_supported,
             "installed": cfg is not None,
             "configured": configured,
