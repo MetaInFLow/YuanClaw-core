@@ -199,6 +199,14 @@ _MEDIA_ALLOWED_MIMES = {
     "video/quicktime",
 }
 _BYTE_RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+_THREAD_SUMMARY_TIMEOUT_S = 30.0
+_KNOWLEDGE_DISTILL_TIMEOUT_S = 120.0
+_MAX_SESSION_KEY_CHARS = 512
+_MAX_SUMMARY_CONTENT_CHARS = 100_000
+_MAX_COWBOY_NAME_CHARS = 200
+_MAX_DISTILL_SESSIONS = 40
+_MAX_DISTILL_INSIGHTS = 80
+_MAX_DISTILL_PROMPT_CHARS = 20_000
 
 
 @dataclass
@@ -418,7 +426,7 @@ class OAuthLoginManager:
                     pass
 
         session.task = asyncio.create_task(_complete_login(), name=f"oauth-login-{provider_id}")
-        return self.status(provider_id)
+        return await asyncio.to_thread(self.status, provider_id)
 
     def status(self, provider_id: str) -> dict[str, Any]:
         status = self._token_status(provider_id, refresh=True)
@@ -982,6 +990,42 @@ def _render_session_messages(messages: list[dict[str, Any]], limit: int = 10) ->
             continue
         rendered.append(f"- {role}: {content}")
     return "\n".join(rendered) if rendered else "- (no persisted messages)"
+
+
+def _validate_distill_payload_bounds(payload: dict[str, Any]) -> None:
+    sessions = payload.get("sessions")
+    if not isinstance(sessions, list) or not sessions:
+        raise ValueError("sessions are required")
+    if len(sessions) > _MAX_DISTILL_SESSIONS:
+        raise ValueError(f"sessions must contain at most {_MAX_DISTILL_SESSIONS} items")
+
+    insights = payload.get("existingInsights", [])
+    if not isinstance(insights, list):
+        raise ValueError("existingInsights must be an array")
+    if len(insights) > _MAX_DISTILL_INSIGHTS:
+        raise ValueError(
+            f"existingInsights must contain at most {_MAX_DISTILL_INSIGHTS} items"
+        )
+
+    for field_name in ("collectionPrompt", "systemPrompt", "archivePrompt"):
+        value = payload.get(field_name, "")
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} must be a string")
+        if len(value) > _MAX_DISTILL_PROMPT_CHARS:
+            raise ValueError(
+                f"{field_name} must be at most {_MAX_DISTILL_PROMPT_CHARS} characters"
+            )
+
+    for raw in sessions:
+        if not isinstance(raw, dict):
+            raise ValueError("each session must be an object")
+        session_key = raw.get("sessionKey")
+        if not isinstance(session_key, str) or not session_key.strip():
+            raise ValueError("each session requires a sessionKey")
+        if len(session_key) > _MAX_SESSION_KEY_CHARS:
+            raise ValueError(
+                f"sessionKey must be at most {_MAX_SESSION_KEY_CHARS} characters"
+            )
 
 
 def _channel_is_configured(channel_id: str, cfg: Any) -> bool:
@@ -1638,24 +1682,47 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
         key = unquote(session_key)
         if not key:
             raise HTTPException(status_code=400, detail="session key is required")
+        if len(key) > _MAX_SESSION_KEY_CHARS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"session key must be at most {_MAX_SESSION_KEY_CHARS} characters",
+            )
 
         content = str(payload.get("content") or "").strip()
         if not content:
             raise HTTPException(status_code=400, detail="content is required")
+        if len(content) > _MAX_SUMMARY_CONTENT_CHARS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"content must be at most {_MAX_SUMMARY_CONTENT_CHARS} characters",
+            )
 
         cowboy_name = str(payload.get("cowboyName") or "").strip() or None
-        return await runtime.generate_thread_summary(
-            session_key=key,
-            content=content,
-            cowboy_name=cowboy_name,
-        )
+        if cowboy_name and len(cowboy_name) > _MAX_COWBOY_NAME_CHARS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"cowboyName must be at most {_MAX_COWBOY_NAME_CHARS} characters",
+            )
+        try:
+            async with asyncio.timeout(_THREAD_SUMMARY_TIMEOUT_S):
+                return await runtime.generate_thread_summary(
+                    session_key=key,
+                    content=content,
+                    cowboy_name=cowboy_name,
+                )
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail="thread summary timed out") from exc
 
     @app.post("/api/internal/knowledge/distill")
     async def knowledge_distill(payload: dict[str, Any]) -> dict[str, Any]:
         try:
-            return await runtime.distill_knowledge(payload)
+            _validate_distill_payload_bounds(payload)
+            async with asyncio.timeout(_KNOWLEDGE_DISTILL_TIMEOUT_S):
+                return await runtime.distill_knowledge(payload)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail="knowledge distill timed out") from exc
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -1694,10 +1761,12 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
 
     @app.get("/api/config")
     async def read_config() -> dict[str, Any]:
+        oauth_specs = [spec for spec in PROVIDERS if spec.is_oauth]
+        oauth_results = await asyncio.gather(
+            *(asyncio.to_thread(oauth_manager.status, spec.name) for spec in oauth_specs)
+        )
         oauth_statuses = {
-            spec.name: oauth_manager.status(spec.name)
-            for spec in PROVIDERS
-            if spec.is_oauth
+            spec.name: result for spec, result in zip(oauth_specs, oauth_results, strict=True)
         }
         return {
             "model": runtime.config.agents.defaults.model,
@@ -1713,7 +1782,9 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
     @app.get("/api/providers/oauth/{provider_id}")
     async def oauth_provider_status(provider_id: str) -> dict[str, Any]:
         try:
-            return oauth_manager.status(provider_id.replace("-", "_"))
+            return await asyncio.to_thread(
+                oauth_manager.status, provider_id.replace("-", "_")
+            )
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1727,7 +1798,9 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
     @app.post("/api/providers/oauth/{provider_id}/logout")
     async def oauth_provider_logout(provider_id: str) -> dict[str, Any]:
         try:
-            return oauth_manager.logout(provider_id.replace("-", "_"))
+            return await asyncio.to_thread(
+                oauth_manager.logout, provider_id.replace("-", "_")
+            )
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

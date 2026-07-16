@@ -959,3 +959,73 @@ def test_websocket_requires_gateway_token_when_configured(tmp_path) -> None:
 
         with client.websocket_connect("/ws/events?token=static-token") as websocket:
             assert websocket.receive_json()["type"] == "ready"
+
+
+def test_session_summary_api_rejects_oversized_content(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.post(
+            "/api/sessions/studio%3Athread/summary",
+            json={"content": "x" * 100_001},
+        )
+
+    assert response.status_code == 400
+    assert "at most 100000 characters" in response.json()["detail"]
+
+
+def test_session_summary_api_times_out(monkeypatch, tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+
+    async def wait_forever(**_kwargs):
+        await asyncio.Event().wait()
+
+    runtime.generate_thread_summary = wait_forever
+    monkeypatch.setattr("yuanclaw.api.server._THREAD_SUMMARY_TIMEOUT_S", 0.01)
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.post(
+            "/api/sessions/studio%3Athread/summary",
+            json={"content": "summarize this"},
+        )
+
+    assert response.status_code == 504
+    assert response.json()["detail"] == "thread summary timed out"
+
+
+def test_internal_knowledge_distill_api_rejects_too_many_sessions(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.post(
+            "/api/internal/knowledge/distill",
+            json={
+                "sessions": [
+                    {"sessionKey": f"studio:thread:{index}"} for index in range(41)
+                ],
+                "existingInsights": [],
+                "collectionPrompt": "",
+                "systemPrompt": "",
+                "archivePrompt": "",
+            },
+        )
+
+    assert response.status_code == 400
+    assert "at most 40 items" in response.json()["detail"]
+
+
+def test_oauth_status_refresh_runs_outside_event_loop(monkeypatch, tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+
+    def status_off_event_loop(_self, provider_id):
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        return {"provider_id": provider_id, "offloaded": True}
+
+    monkeypatch.setattr("yuanclaw.api.server.OAuthLoginManager.status", status_off_event_loop)
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.get("/api/providers/oauth/openai_codex")
+
+    assert response.status_code == 200
+    assert response.json()["offloaded"] is True
