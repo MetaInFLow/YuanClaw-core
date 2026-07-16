@@ -1287,8 +1287,15 @@ class CoreRuntime:
         async with self._lifecycle_lock:
             await self._start_locked()
 
-    async def _stop_locked(self, *, close_provider: bool = True) -> None:
+    async def _stop_locked(
+        self,
+        *,
+        close_provider: bool = True,
+        close_bus: bool = True,
+    ) -> None:
         if not self._started:
+            if close_bus:
+                self.bus.close()
             if close_provider:
                 await self.agent.provider.aclose()
             return
@@ -1308,6 +1315,8 @@ class CoreRuntime:
         self._agent_task = None
         self._channels_task = None
         self._started = False
+        if close_bus:
+            self.bus.close()
         self.events.publish({"type": "core.stopped"})
         logger.info("Studio API runtime stopped")
 
@@ -1337,7 +1346,7 @@ class CoreRuntime:
             }
             try:
                 if was_running:
-                    await self._stop_locked(close_provider=False)
+                    await self._stop_locked(close_provider=False, close_bus=False)
 
                 self._install_components(config, components)
 
@@ -1350,6 +1359,7 @@ class CoreRuntime:
                         "Previous provider cleanup failed after reconfigure ({})",
                         type(close_error).__name__,
                     )
+                previous_components["bus"].close()
             except BaseException as apply_error:
                 try:
                     if self._started:

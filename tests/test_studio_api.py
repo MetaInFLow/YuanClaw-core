@@ -834,6 +834,7 @@ async def test_core_runtime_apply_config_refreshes_provider_and_tool_snapshot(
     updated.tools.image_generation.enabled = True
 
     old_agent = runtime.agent
+    old_bus = runtime.bus
     old_session_manager = runtime.session_manager
     await runtime.apply_config(updated)
 
@@ -847,6 +848,7 @@ async def test_core_runtime_apply_config_refreshes_provider_and_tool_snapshot(
     assert runtime.agent.tools.get("run_cli_app") is not None
     assert runtime.agent.tools.get("generate_image") is not None
     assert runtime.agent.tools.get("run_cli_app") is not old_agent.tools.get("run_cli_app")
+    assert old_bus.closed is True
 
 
 @pytest.mark.asyncio
@@ -863,6 +865,7 @@ async def test_core_runtime_apply_config_restores_running_components_on_start_fa
     runtime = CoreRuntime(initial, host="127.0.0.1", port=18789, with_channels=False)
     await runtime.start()
     previous_agent = runtime.agent
+    previous_bus = runtime.bus
     previous_provider = runtime.provider
     original_start_locked = runtime._start_locked
     start_attempts = 0
@@ -884,8 +887,11 @@ async def test_core_runtime_apply_config_restores_running_components_on_start_fa
     assert runtime.running is True
     assert runtime.config is initial
     assert runtime.agent is previous_agent
+    assert runtime.bus is previous_bus
+    assert runtime.bus.closed is False
     assert runtime.provider is previous_provider
     await runtime.stop()
+    assert previous_bus.closed is True
 
 
 def test_core_runtime_running_reflects_background_task_liveness(tmp_path, monkeypatch) -> None:
