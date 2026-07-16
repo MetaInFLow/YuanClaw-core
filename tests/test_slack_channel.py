@@ -13,7 +13,7 @@ class _FakeAsyncWebClient:
         self.chat_post_calls: list[dict[str, object | None]] = []
         self.file_upload_calls: list[dict[str, object | None]] = []
 
-    async def chat_postMessage(
+    async def chat_postMessage(  # noqa: N802 - mirrors the Slack SDK method name
         self,
         *,
         channel: str,

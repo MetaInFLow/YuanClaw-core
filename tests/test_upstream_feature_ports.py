@@ -206,4 +206,4 @@ async def test_channel_manager_routes_stream_markers_to_send_delta():
     finally:
         task.cancel()
         with suppress(asyncio.CancelledError):
-            await task
+            await asyncio.wait_for(task, timeout=1.0)

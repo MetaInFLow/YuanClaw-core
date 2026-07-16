@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
 import time
 import uuid
 from contextlib import suppress
@@ -102,6 +104,22 @@ class _ExecSession:
             await self.process.stdin.wait_closed()
         return None
 
+    async def _finish_io(self) -> None:
+        """Reap the process and close reader tasks before releasing the session."""
+        if self.process.stdin is not None and not self.process.stdin.is_closing():
+            self.process.stdin.close()
+            with suppress(BrokenPipeError, ConnectionResetError):
+                await self.process.stdin.wait_closed()
+
+        with suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self.process.wait(), timeout=2.0)
+
+        readers = (self._stdout_task, self._stderr_task)
+        done, pending = await asyncio.wait(readers, timeout=2.0)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*done, *pending, return_exceptions=True)
+
     async def poll(
         self,
         yield_time_ms: int,
@@ -119,11 +137,7 @@ class _ExecSession:
             await self.kill()
 
         if self.process.returncode is not None:
-            with suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(
-                    asyncio.gather(self._stdout_task, self._stderr_task),
-                    timeout=2.0,
-                )
+            await self._finish_io()
 
         async with self._lock:
             output = "".join(self._chunks)
@@ -142,11 +156,21 @@ class _ExecSession:
         )
 
     async def kill(self) -> None:
-        if self.process.returncode is not None:
-            return
-        self.process.kill()
-        with suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(self.process.wait(), timeout=5.0)
+        if self.process.returncode is None:
+            if os.name == "nt":
+                await asyncio.to_thread(
+                    subprocess.run,
+                    ["taskkill", "/PID", str(self.process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+            if self.process.returncode is None:
+                self.process.kill()
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self.process.wait(), timeout=5.0)
+        await self._finish_io()
 
 
 class ExecSessionManager:

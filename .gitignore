@@ -6,6 +6,12 @@ _reference_repo/
 *.swp
 
 # Python cache artifacts
+.venv/
 __pycache__/
 *.pyc
 .pytest_cache/
+.ruff_cache/
+
+# Node.js build artifacts
+node_modules/
+bridge/dist/

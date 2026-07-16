@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 
-def _make_loop():
+def _make_loop(workspace):
     """Create a minimal AgentLoop with mocked dependencies."""
     from yuanclaw.agent.loop import AgentLoop
     from yuanclaw.bus.queue import MessageBus
@@ -16,33 +16,30 @@ def _make_loop():
     bus = MessageBus()
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
-    workspace = MagicMock()
-    workspace.__truediv__ = MagicMock(return_value=MagicMock())
-
     with patch("yuanclaw.agent.loop.ContextBuilder"), \
          patch("yuanclaw.agent.loop.SessionManager"), \
-         patch("yuanclaw.agent.loop.SubagentManager") as MockSubMgr:
-        MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
+         patch("yuanclaw.agent.loop.SubagentManager") as mock_subagent_manager:
+        mock_subagent_manager.return_value.cancel_by_session = AsyncMock(return_value=0)
         loop = AgentLoop(bus=bus, provider=provider, workspace=workspace)
     return loop, bus
 
 
 class TestHandleStop:
     @pytest.mark.asyncio
-    async def test_stop_no_active_task(self):
+    async def test_stop_no_active_task(self, tmp_path):
         from yuanclaw.bus.events import InboundMessage
 
-        loop, bus = _make_loop()
+        loop, bus = _make_loop(tmp_path)
         msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/stop")
         await loop._handle_stop(msg)
         out = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
         assert "No active task" in out.content
 
     @pytest.mark.asyncio
-    async def test_stop_cancels_active_task(self):
+    async def test_stop_cancels_active_task(self, tmp_path):
         from yuanclaw.bus.events import InboundMessage
 
-        loop, bus = _make_loop()
+        loop, bus = _make_loop(tmp_path)
         cancelled = asyncio.Event()
 
         async def slow_task():
@@ -64,10 +61,10 @@ class TestHandleStop:
         assert "stopped" in out.content.lower()
 
     @pytest.mark.asyncio
-    async def test_stop_cancels_multiple_tasks(self):
+    async def test_stop_cancels_multiple_tasks(self, tmp_path):
         from yuanclaw.bus.events import InboundMessage
 
-        loop, bus = _make_loop()
+        loop, bus = _make_loop(tmp_path)
         events = [asyncio.Event(), asyncio.Event()]
 
         async def slow(idx):
@@ -91,10 +88,10 @@ class TestHandleStop:
 
 class TestDispatch:
     @pytest.mark.asyncio
-    async def test_dispatch_processes_and_publishes(self):
+    async def test_dispatch_processes_and_publishes(self, tmp_path):
         from yuanclaw.bus.events import InboundMessage, OutboundMessage
 
-        loop, bus = _make_loop()
+        loop, bus = _make_loop(tmp_path)
         msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="hello")
         loop._process_message = AsyncMock(
             return_value=OutboundMessage(channel="test", chat_id="c1", content="hi")
@@ -104,10 +101,10 @@ class TestDispatch:
         assert out.content == "hi"
 
     @pytest.mark.asyncio
-    async def test_processing_lock_serializes(self):
+    async def test_processing_lock_serializes(self, tmp_path):
         from yuanclaw.bus.events import InboundMessage, OutboundMessage
 
-        loop, bus = _make_loop()
+        loop, bus = _make_loop(tmp_path)
         order = []
 
         async def mock_process(m, **kwargs):
@@ -128,14 +125,14 @@ class TestDispatch:
 
 class TestSubagentCancellation:
     @pytest.mark.asyncio
-    async def test_cancel_by_session(self):
+    async def test_cancel_by_session(self, tmp_path):
         from yuanclaw.agent.subagent import SubagentManager
         from yuanclaw.bus.queue import MessageBus
 
         bus = MessageBus()
         provider = MagicMock()
         provider.get_default_model.return_value = "test-model"
-        mgr = SubagentManager(provider=provider, workspace=MagicMock(), bus=bus)
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
 
         cancelled = asyncio.Event()
 
@@ -156,12 +153,12 @@ class TestSubagentCancellation:
         assert cancelled.is_set()
 
     @pytest.mark.asyncio
-    async def test_cancel_by_session_no_tasks(self):
+    async def test_cancel_by_session_no_tasks(self, tmp_path):
         from yuanclaw.agent.subagent import SubagentManager
         from yuanclaw.bus.queue import MessageBus
 
         bus = MessageBus()
         provider = MagicMock()
         provider.get_default_model.return_value = "test-model"
-        mgr = SubagentManager(provider=provider, workspace=MagicMock(), bus=bus)
+        mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
         assert await mgr.cancel_by_session("nonexistent") == 0

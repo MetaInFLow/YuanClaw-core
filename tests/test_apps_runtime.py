@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -59,10 +61,16 @@ def _write_installed_app(workspace, name="echoer", entry_point="echoer"):
     app_dir = workspace / "apps" / "cli"
     app_dir.mkdir(parents=True, exist_ok=True)
     (app_dir / "installed.json").write_text(
-        (
-            '[{"name":"%s","display_name":"Echoer","entry_point":"%s",'
-            '"description":"Echo test"}]'
-        ) % (name, entry_point),
+        json.dumps(
+            [
+                {
+                    "name": name,
+                    "display_name": "Echoer",
+                    "entry_point": entry_point,
+                    "description": "Echo test",
+                }
+            ]
+        ),
         encoding="utf-8",
     )
 
@@ -127,22 +135,17 @@ def test_cli_app_service_catalog_install_settings_uninstall_roundtrip(tmp_path) 
     assert service.installed() == []
 
 
-def test_cli_app_service_tests_installed_entry_point(tmp_path, monkeypatch) -> None:
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    script = bin_dir / "echoer"
-    script.write_text(f"#!{sys.executable}\nprint('ok')\n", encoding="utf-8")
-    script.chmod(0o755)
-    monkeypatch.setenv("PATH", str(bin_dir))
+def test_cli_app_service_tests_installed_entry_point(tmp_path) -> None:
     service = CliAppService(tmp_path)
-    service.replace_catalog([{"name": "echoer", "entryPoint": "echoer"}])
+    service.replace_catalog([{"name": "echoer", "entryPoint": sys.executable}])
     service.install("echoer")
 
     ok = service.test_installed("echoer")
     missing = service.test_entry_point("missing")
 
     assert ok["ok"] is True
-    assert ok["entry_point"] == "echoer"
+    assert ok["entry_point"] == sys.executable
+    assert Path(ok["path"]).resolve() == Path(sys.executable).resolve()
     assert missing["ok"] is False
 
 
@@ -405,23 +408,20 @@ def test_agent_loop_registers_run_cli_app_when_enabled(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_run_cli_app_executes_installed_entry_point_without_shell(
     tmp_path,
-    monkeypatch,
 ) -> None:
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    script = bin_dir / "echoer"
+    script = tmp_path / "echoer.py"
     script.write_text(
-        f"#!{sys.executable}\n"
         "import json, sys\n"
         "print(json.dumps({'argv': sys.argv[1:]}))\n",
         encoding="utf-8",
     )
-    script.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bin_dir}")
-    _write_installed_app(tmp_path)
+    _write_installed_app(tmp_path, entry_point=sys.executable)
     tool = CliAppsTool(workspace=tmp_path)
 
-    result = await tool.execute(name="echoer", args=["a; echo unsafe", "b"])
+    result = await tool.execute(
+        name="echoer",
+        args=[str(script), "a; echo unsafe", "b"],
+    )
 
     assert '"a; echo unsafe"' in result
     assert "Exit code: 0" in result
