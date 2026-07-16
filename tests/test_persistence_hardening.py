@@ -182,6 +182,53 @@ def test_session_reload_clamps_invalid_consolidation_offset(tmp_path) -> None:
     assert loaded.last_consolidated == 1
 
 
+def test_session_cache_reloads_external_disk_update(tmp_path) -> None:
+    manager = SessionManager(tmp_path)
+    session = manager.get_or_create("studio:thread")
+    session.add_message("user", "first")
+    manager.save(session)
+
+    external = SessionManager(tmp_path)
+    changed = external.get_or_create(session.key)
+    changed.add_message("assistant", "external")
+    external.save(changed)
+
+    reloaded = manager.get_or_create(session.key)
+    assert [message["content"] for message in reloaded.messages] == ["first", "external"]
+
+
+def test_session_cache_does_not_revive_externally_deleted_file(tmp_path) -> None:
+    manager = SessionManager(tmp_path)
+    session = manager.get_or_create("studio:thread")
+    session.add_message("user", "old")
+    manager.save(session)
+    manager._get_session_path(session.key).unlink()
+
+    replacement = manager.get_or_create(session.key)
+
+    assert replacement is not session
+    assert replacement.messages == []
+
+
+def test_session_delete_evicts_cache_and_removes_backup(tmp_path) -> None:
+    manager = SessionManager(tmp_path)
+    session = manager.get_or_create("studio:thread")
+    session.add_message("user", "first")
+    manager.save(session)
+    session.add_message("assistant", "second")
+    manager.save(session)
+    path = manager._get_session_path(session.key)
+    previous = atomic.backup_path(path)
+    assert path.exists()
+    assert previous.exists()
+
+    assert manager.delete(session.key) is True
+
+    assert not path.exists()
+    assert not previous.exists()
+    assert manager.get_or_create(session.key).messages == []
+
+
 @pytest.mark.asyncio
 async def test_memory_consolidation_serializes_workspace_updates(tmp_path) -> None:
     first = Session(key="studio:first")

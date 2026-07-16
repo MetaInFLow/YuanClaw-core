@@ -133,6 +133,25 @@ def test_sessions_api_includes_message_summary_fields(tmp_path) -> None:
     )
 
 
+def test_delete_session_api_cancels_work_and_removes_persistence(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    session = runtime.session_manager.get_or_create("studio:thread-delete")
+    session.add_message("user", "delete me")
+    runtime.session_manager.save(session)
+
+    with TestClient(create_app(runtime=runtime)) as client:
+        response = client.delete(f"/api/sessions/{quote(session.key, safe='')}")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True,
+        "deleted": True,
+        "cancelled_tasks": 0,
+    }
+    runtime.agent.cancel_session.assert_awaited_once_with(session.key)
+    assert runtime.session_manager.read_session_file(session.key) is None
+
+
 def test_sessions_api_uses_null_preview_for_empty_sessions(tmp_path) -> None:
     runtime = _RuntimeStub(tmp_path / "workspace")
     session = runtime.session_manager.get_or_create("studio:cowboy-biaoge:thread-empty")

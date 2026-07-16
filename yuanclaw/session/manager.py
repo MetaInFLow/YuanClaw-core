@@ -206,6 +206,7 @@ class SessionManager:
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
         self.legacy_sessions_dir = get_legacy_sessions_dir()
         self._cache: dict[str, Session] = {}
+        self._cache_mtime_ns: dict[str, int] = {}
 
     def _get_session_path(self, key: str) -> Path:
         """Get the file path for a session."""
@@ -233,15 +234,39 @@ class SessionManager:
         Returns:
             The session.
         """
-        if key in self._cache:
-            return self._cache[key]
+        cached = self._cached_session(key)
+        if cached is not None:
+            return cached
 
         session = self._load(key)
         if session is None:
             session = Session(key=key)
 
         self._cache[key] = session
+        path = self._get_session_path(key)
+        if path.exists():
+            self._cache_mtime_ns[key] = path.stat().st_mtime_ns
         return session
+
+    def _cached_session(self, key: str) -> Session | None:
+        session = self._cache.get(key)
+        if session is None:
+            return None
+        persisted_mtime = self._cache_mtime_ns.get(key)
+        if persisted_mtime is None:
+            return session
+
+        path = self._get_session_path(key)
+        try:
+            current_mtime = path.stat().st_mtime_ns
+        except FileNotFoundError:
+            self.invalidate(key)
+            return None
+        if current_mtime == persisted_mtime:
+            return session
+
+        self.invalidate(key)
+        return None
 
     def _load(self, key: str) -> Session | None:
         """Load a session from disk."""
@@ -289,6 +314,7 @@ class SessionManager:
         atomic_write_text(path, self._serialize(session))
 
         self._cache[session.key] = session
+        self._cache_mtime_ns[session.key] = path.stat().st_mtime_ns
 
     @staticmethod
     def _serialize(session: Session) -> str:
@@ -367,7 +393,7 @@ class SessionManager:
 
     def read_session_file(self, key: str) -> dict[str, Any] | None:
         """Read a session without creating it when missing."""
-        session = self._cache.get(key)
+        session = self._cached_session(key)
         if session is not None:
             return {
                 "key": session.key,
@@ -382,6 +408,8 @@ class SessionManager:
         if loaded is None:
             return None
         self._cache[key] = loaded
+        path = self._get_session_path(key)
+        self._cache_mtime_ns[key] = path.stat().st_mtime_ns
         return {
             "key": loaded.key,
             "created_at": loaded.created_at.isoformat(),
@@ -394,6 +422,31 @@ class SessionManager:
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
         self._cache.pop(key, None)
+        self._cache_mtime_ns.pop(key, None)
+
+    def delete(self, key: str) -> bool:
+        """Delete a persisted session and evict every cached copy."""
+        self.invalidate(key)
+        removed = False
+        current_path = self._get_session_path(key)
+        candidates = (
+            current_path,
+            backup_path(current_path),
+            self._get_old_workspace_session_path(key),
+            self._get_legacy_session_path(key),
+        )
+        for path in candidates:
+            if not path.exists():
+                continue
+            if path != current_path and path != backup_path(current_path):
+                if not self._path_belongs_to_key(path, key):
+                    continue
+            try:
+                path.unlink()
+                removed = True
+            except FileNotFoundError:
+                continue
+        return removed
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """

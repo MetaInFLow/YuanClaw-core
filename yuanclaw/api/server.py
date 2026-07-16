@@ -1624,6 +1624,15 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
         items = runtime.session_manager.list_sessions()
         return {"items": items, "total": len(items)}
 
+    @app.delete("/api/sessions/{session_key:path}")
+    async def delete_session(session_key: str) -> dict[str, Any]:
+        key = unquote(session_key)
+        if not key:
+            raise HTTPException(status_code=400, detail="session key is required")
+        cancelled = await runtime.agent.cancel_session(key)
+        deleted = runtime.session_manager.delete(key)
+        return {"ok": True, "deleted": deleted, "cancelled_tasks": cancelled}
+
     @app.post("/api/sessions/{session_key:path}/summary")
     async def session_summary(session_key: str, payload: dict[str, Any]) -> dict[str, Any]:
         key = unquote(session_key)
