@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import datetime, timedelta
 
 import pytest
@@ -187,11 +188,14 @@ def test_session_cache_reloads_external_disk_update(tmp_path) -> None:
     session = manager.get_or_create("studio:thread")
     session.add_message("user", "first")
     manager.save(session)
+    path = manager._get_session_path(session.key)
+    original_stat = path.stat()
 
     external = SessionManager(tmp_path)
     changed = external.get_or_create(session.key)
     changed.add_message("assistant", "external")
     external.save(changed)
+    os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
 
     reloaded = manager.get_or_create(session.key)
     assert [message["content"] for message in reloaded.messages] == ["first", "external"]

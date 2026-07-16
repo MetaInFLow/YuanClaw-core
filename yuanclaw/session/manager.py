@@ -206,7 +206,12 @@ class SessionManager:
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
         self.legacy_sessions_dir = get_legacy_sessions_dir()
         self._cache: dict[str, Session] = {}
-        self._cache_mtime_ns: dict[str, int] = {}
+        self._cache_signatures: dict[str, tuple[int, int, int]] = {}
+
+    @staticmethod
+    def _path_signature(path: Path) -> tuple[int, int, int]:
+        stat = path.stat()
+        return (stat.st_ino, stat.st_size, stat.st_mtime_ns)
 
     def _get_session_path(self, key: str) -> Path:
         """Get the file path for a session."""
@@ -245,24 +250,24 @@ class SessionManager:
         self._cache[key] = session
         path = self._get_session_path(key)
         if path.exists():
-            self._cache_mtime_ns[key] = path.stat().st_mtime_ns
+            self._cache_signatures[key] = self._path_signature(path)
         return session
 
     def _cached_session(self, key: str) -> Session | None:
         session = self._cache.get(key)
         if session is None:
             return None
-        persisted_mtime = self._cache_mtime_ns.get(key)
-        if persisted_mtime is None:
+        persisted_signature = self._cache_signatures.get(key)
+        if persisted_signature is None:
             return session
 
         path = self._get_session_path(key)
         try:
-            current_mtime = path.stat().st_mtime_ns
+            current_signature = self._path_signature(path)
         except FileNotFoundError:
             self.invalidate(key)
             return None
-        if current_mtime == persisted_mtime:
+        if current_signature == persisted_signature:
             return session
 
         self.invalidate(key)
@@ -314,7 +319,7 @@ class SessionManager:
         atomic_write_text(path, self._serialize(session))
 
         self._cache[session.key] = session
-        self._cache_mtime_ns[session.key] = path.stat().st_mtime_ns
+        self._cache_signatures[session.key] = self._path_signature(path)
 
     @staticmethod
     def _serialize(session: Session) -> str:
@@ -409,7 +414,7 @@ class SessionManager:
             return None
         self._cache[key] = loaded
         path = self._get_session_path(key)
-        self._cache_mtime_ns[key] = path.stat().st_mtime_ns
+        self._cache_signatures[key] = self._path_signature(path)
         return {
             "key": loaded.key,
             "created_at": loaded.created_at.isoformat(),
@@ -422,7 +427,7 @@ class SessionManager:
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
         self._cache.pop(key, None)
-        self._cache_mtime_ns.pop(key, None)
+        self._cache_signatures.pop(key, None)
 
     def delete(self, key: str) -> bool:
         """Delete a persisted session and evict every cached copy."""

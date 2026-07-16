@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 
 import pytest
 
@@ -208,11 +209,16 @@ async def test_idle_service_discovers_external_job(tmp_path) -> None:
     service._STORE_POLL_INTERVAL_S = 0.05
     await service.start()
     try:
+        original_stat = store_path.stat()
         external = CronService(store_path)
         external.add_job(
             name="external",
             schedule=CronSchedule(kind="every", every_ms=50),
             message="hello",
+        )
+        os.utime(
+            store_path,
+            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
         )
         await asyncio.wait_for(called.wait(), timeout=1.0)
     finally:

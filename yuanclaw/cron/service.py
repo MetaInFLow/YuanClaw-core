@@ -92,15 +92,18 @@ class CronService:
         self.job_timeout_s = job_timeout_s
         self._job_semaphore = asyncio.Semaphore(max(1, max_concurrent_jobs))
         self._store: CronStore | None = None
-        self._last_mtime_ns = 0
+        self._last_store_signature: tuple[int, int, int] | None = None
         self._timer_task: asyncio.Task | None = None
         self._running = False
+
+    def _store_signature(self) -> tuple[int, int, int]:
+        stat = self.store_path.stat()
+        return (stat.st_ino, stat.st_size, stat.st_mtime_ns)
 
     def _load_store(self) -> CronStore:
         """Load jobs from disk. Reloads automatically if file was modified externally."""
         if self._store and self.store_path.exists():
-            mtime_ns = self.store_path.stat().st_mtime_ns
-            if mtime_ns != self._last_mtime_ns:
+            if self._store_signature() != self._last_store_signature:
                 logger.info("Cron: jobs.json modified externally, reloading")
                 self._store = None
         if self._store:
@@ -231,7 +234,7 @@ class CronService:
             json.dumps(data, indent=2, ensure_ascii=False),
             keep_backup=keep_backup,
         )
-        self._last_mtime_ns = self.store_path.stat().st_mtime_ns
+        self._last_store_signature = self._store_signature()
 
     async def start(self) -> None:
         """Start the cron service."""
