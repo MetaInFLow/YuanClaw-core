@@ -1,3 +1,4 @@
+import asyncio
 import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -5,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from typer.testing import CliRunner
 
-from yuanclaw.cli.commands import app
+from yuanclaw.cli.commands import _wait_for_cli_turn, app
 from yuanclaw.config.schema import Config
 from yuanclaw.pairing import generate_code, is_approved
 from yuanclaw.providers.litellm_provider import LiteLLMProvider
@@ -227,6 +228,59 @@ def test_agent_uses_default_config_when_no_workspace_or_config_flags(mock_agent_
     mock_agent_runtime["agent_loop"].process_direct.assert_awaited_once()
     mock_agent_runtime["agent_loop"].shutdown.assert_awaited_once()
     mock_agent_runtime["print_response"].assert_called_once_with("mock-response", render_markdown=True)
+
+
+def test_agent_single_message_failure_still_shuts_down(mock_agent_runtime) -> None:
+    mock_agent_runtime["agent_loop"].process_direct.side_effect = RuntimeError("turn failed")
+
+    result = runner.invoke(app, ["agent", "-m", "hello"])
+
+    assert result.exit_code != 0
+    mock_agent_runtime["agent_loop"].shutdown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_wait_for_cli_turn_reports_agent_task_failure() -> None:
+    async def fail() -> None:
+        raise RuntimeError("agent failed")
+
+    async def wait_forever() -> None:
+        await asyncio.Event().wait()
+
+    bus_task = asyncio.create_task(fail())
+    outbound_task = asyncio.create_task(wait_forever())
+    try:
+        with pytest.raises(RuntimeError, match="agent task failed"):
+            await _wait_for_cli_turn(
+                asyncio.Event(),
+                bus_task,
+                outbound_task,
+                timeout_s=1,
+            )
+    finally:
+        outbound_task.cancel()
+        await asyncio.gather(outbound_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_wait_for_cli_turn_times_out() -> None:
+    async def wait_forever() -> None:
+        await asyncio.Event().wait()
+
+    bus_task = asyncio.create_task(wait_forever())
+    outbound_task = asyncio.create_task(wait_forever())
+    try:
+        with pytest.raises(TimeoutError, match="timed out"):
+            await _wait_for_cli_turn(
+                asyncio.Event(),
+                bus_task,
+                outbound_task,
+                timeout_s=0.001,
+            )
+    finally:
+        bus_task.cancel()
+        outbound_task.cancel()
+        await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
 
 
 def test_agent_uses_explicit_config_path(mock_agent_runtime, tmp_path: Path):

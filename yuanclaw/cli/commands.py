@@ -557,6 +557,40 @@ def gateway(
 # ============================================================================
 
 
+async def _wait_for_cli_turn(
+    turn_done: asyncio.Event,
+    bus_task: asyncio.Task,
+    outbound_task: asyncio.Task,
+    *,
+    timeout_s: float = 600.0,
+) -> None:
+    """Wait for a turn while monitoring the two background CLI tasks."""
+    waiter = asyncio.create_task(turn_done.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {waiter, bus_task, outbound_task},
+            timeout=timeout_s,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if waiter in done:
+            return
+        if not done:
+            raise TimeoutError(f"Agent turn timed out after {timeout_s:g} seconds")
+        for name, task in (("agent", bus_task), ("outbound", outbound_task)):
+            if task not in done:
+                continue
+            if task.cancelled():
+                raise RuntimeError(f"CLI {name} task was cancelled before the turn completed")
+            error = task.exception()
+            if error is not None:
+                raise RuntimeError(f"CLI {name} task failed before the turn completed") from error
+            raise RuntimeError(f"CLI {name} task stopped before the turn completed")
+    finally:
+        if not waiter.done():
+            waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
+
+
 @app.command()
 def agent(
     message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
@@ -631,17 +665,22 @@ def agent(
         # Single message mode — direct call, no bus needed
         async def run_once():
             renderer = StreamRenderer(render_markdown=markdown)
-            response = await agent_loop.process_direct(
-                message,
-                session_id,
-                on_progress=_cli_progress,
-                on_stream=renderer.on_delta,
-                on_stream_end=renderer.on_end,
-            )
-            if not renderer.streamed:
-                await renderer.on_end()
-                _print_agent_response(response, render_markdown=markdown)
-            await agent_loop.shutdown()
+            try:
+                response = await agent_loop.process_direct(
+                    message,
+                    session_id,
+                    on_progress=_cli_progress,
+                    on_stream=renderer.on_delta,
+                    on_stream_end=renderer.on_end,
+                )
+                if not renderer.streamed:
+                    await renderer.on_end()
+                    _print_agent_response(response, render_markdown=markdown)
+            finally:
+                try:
+                    await renderer.aclose()
+                finally:
+                    await agent_loop.shutdown()
 
         asyncio.run(run_once())
     else:
@@ -750,7 +789,7 @@ def agent(
                             metadata={"_wants_stream": True},
                         ))
 
-                        await turn_done.wait()
+                        await _wait_for_cli_turn(turn_done, bus_task, outbound_task)
 
                         if turn_response:
                             content = turn_response[0]
@@ -766,9 +805,14 @@ def agent(
                         console.print("\nGoodbye!")
                         break
             finally:
+                bus_task.cancel()
                 outbound_task.cancel()
                 await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
-                await agent_loop.shutdown()
+                try:
+                    if renderer is not None:
+                        await renderer.aclose()
+                finally:
+                    await agent_loop.shutdown()
 
         asyncio.run(run_interactive())
 
