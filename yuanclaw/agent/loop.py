@@ -102,7 +102,8 @@ class AgentLoop:
     5. Sends responses back
     """
 
-    _TOOL_RESULT_MAX_CHARS = 500
+    _TOOL_RESULT_MAX_BYTES = 500
+    _TOOL_RESULT_TRUNCATION_SUFFIX = "\n... (truncated)"
 
     def __init__(
         self,
@@ -1191,8 +1192,8 @@ class AgentLoop:
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages — they poison session context
-            if role == "tool" and isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
-                entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+            if role == "tool":
+                entry["content"] = self._bounded_tool_result(content)
             elif role == "user":
                 if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
                     # Strip the runtime-context prefix, keep only the user text.
@@ -1228,6 +1229,27 @@ class AgentLoop:
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
         session.updated_at = datetime.now()
+
+    def _bounded_tool_result(self, content: Any) -> str:
+        """Serialize and bound a persisted tool result without splitting UTF-8 text."""
+        if isinstance(content, str):
+            serialized = content
+        else:
+            try:
+                serialized = json.dumps(content, ensure_ascii=False, default=str)
+            except (TypeError, ValueError):
+                serialized = str(content)
+
+        limit = self._TOOL_RESULT_MAX_BYTES
+        encoded = serialized.encode("utf-8")
+        if len(encoded) <= limit:
+            return serialized
+
+        suffix = self._TOOL_RESULT_TRUNCATION_SUFFIX.encode("utf-8")
+        if limit <= len(suffix):
+            return suffix[:limit].decode("utf-8", errors="ignore")
+        prefix = encoded[:limit - len(suffix)].decode("utf-8", errors="ignore")
+        return prefix + self._TOOL_RESULT_TRUNCATION_SUFFIX
 
     def _persist_runtime_attachments(self, session: Session, metadata: dict[str, Any]) -> None:
         cli_apps = normalize_cli_app_mentions(
