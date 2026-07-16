@@ -1243,14 +1243,16 @@ class CoreRuntime:
         async with self._lifecycle_lock:
             await self._start_locked()
 
-    async def _stop_locked(self) -> None:
+    async def _stop_locked(self, *, close_provider: bool = True) -> None:
         if not self._started:
+            if close_provider:
+                await self.agent.provider.aclose()
             return
 
         self.cron.stop()
         if self.channels is not None:
             await self.channels.stop_all()
-        await self.agent.shutdown()
+        await self.agent.shutdown(close_provider=close_provider)
 
         tasks = [t for t in (self._agent_task, self._channels_task) if t is not None]
         for task in tasks:
@@ -1291,12 +1293,19 @@ class CoreRuntime:
             }
             try:
                 if was_running:
-                    await self._stop_locked()
+                    await self._stop_locked(close_provider=False)
 
                 self._install_components(config, components)
 
                 if was_running:
                     await self._start_locked()
+                try:
+                    await previous_components["agent"].provider.aclose()
+                except Exception as close_error:
+                    logger.warning(
+                        "Previous provider cleanup failed after reconfigure ({})",
+                        type(close_error).__name__,
+                    )
             except BaseException as apply_error:
                 try:
                     if self._started:
@@ -1735,6 +1744,13 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
             save_config(next_config)
             await runtime.apply_config(next_config, prepared_components=prepared_components)
         except Exception as exc:
+            try:
+                await prepared_components["agent"].shutdown()
+            except Exception as cleanup_error:
+                logger.warning(
+                    "Prepared runtime cleanup failed after config error ({})",
+                    type(cleanup_error).__name__,
+                )
             try:
                 save_config(previous_config)
             except Exception as rollback_error:

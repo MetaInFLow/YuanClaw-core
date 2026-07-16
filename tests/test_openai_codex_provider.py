@@ -15,6 +15,15 @@ class _FakeResponse:
             yield ""
 
 
+class _RawLinesResponse:
+    def __init__(self, lines):
+        self._lines = lines
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+
 def test_extract_usage_accepts_responses_api_shape() -> None:
     usage = _extract_usage(
         {
@@ -62,3 +71,38 @@ async def test_consume_sse_reads_usage_from_response_completed() -> None:
         "completion_tokens": 9,
         "total_tokens": 30,
     }
+
+
+@pytest.mark.asyncio
+async def test_consume_sse_flushes_final_event_without_blank_line() -> None:
+    completed = {
+        "type": "response.completed",
+        "response": {
+            "status": "completed",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        },
+    }
+    response = _RawLinesResponse([
+        'data: {"type":"response.output_text.delta","delta":"done"}',
+        "",
+        f"data: {json.dumps(completed)}",
+    ])
+
+    content, _tool_calls, finish_reason, usage = await _consume_sse(response)
+
+    assert content == "done"
+    assert finish_reason == "stop"
+    assert usage["total_tokens"] == 2
+
+
+@pytest.mark.asyncio
+async def test_consume_sse_marks_early_eof_as_error() -> None:
+    response = _RawLinesResponse([
+        'data: {"type":"response.output_text.delta","delta":"partial"}',
+    ])
+
+    content, _tool_calls, finish_reason, usage = await _consume_sse(response)
+
+    assert content == "partial"
+    assert finish_reason == "error"
+    assert usage == {}

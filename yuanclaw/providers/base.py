@@ -3,6 +3,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from inspect import isawaitable
 from typing import Any
 
 
@@ -62,6 +63,18 @@ class LLMProvider(ABC):
         self.api_key = api_key
         self.api_base = api_base
         self.generation: GenerationSettings = GenerationSettings()
+
+    async def aclose(self) -> None:
+        """Release provider-owned resources."""
+
+    @staticmethod
+    async def _close_resource(resource: Any) -> None:
+        close = getattr(resource, "close", None)
+        if not callable(close):
+            return
+        result = close()
+        if isawaitable(result):
+            await result
 
     @staticmethod
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

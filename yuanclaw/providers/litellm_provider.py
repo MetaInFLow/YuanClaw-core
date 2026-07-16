@@ -275,9 +275,26 @@ class LiteLLMProvider(LLMProvider):
             if on_text_delta is not None:
                 stream_kwargs = dict(kwargs)
                 stream_kwargs["stream"] = True
+                emitted = False
+
+                async def tracked_delta(delta: str) -> None:
+                    nonlocal emitted
+                    emitted = True
+                    await on_text_delta(delta)
+
                 try:
-                    return await self._parse_streaming_response(stream_kwargs, on_text_delta)
+                    return await self._parse_streaming_response(stream_kwargs, tracked_delta)
                 except Exception as stream_error:
+                    if emitted:
+                        logger.warning(
+                            "LiteLLM streaming failed after output; non-streaming retry suppressed"
+                        )
+                        return LLMResponse(
+                            content="Error calling LLM: stream interrupted after output",
+                            finish_reason="error",
+                            error_kind="connection",
+                            error_should_retry=True,
+                        )
                     logger.warning("LiteLLM streaming failed, falling back to non-streaming: {}", stream_error)
             response = await acompletion(**kwargs)
             return self._parse_response(response)
@@ -301,6 +318,13 @@ class LiteLLMProvider(LLMProvider):
 
         async for chunk in stream:
             choices = getattr(chunk, "choices", None) or []
+            chunk_usage = getattr(chunk, "usage", None)
+            if chunk_usage:
+                usage = {
+                    "prompt_tokens": int(getattr(chunk_usage, "prompt_tokens", 0) or 0),
+                    "completion_tokens": int(getattr(chunk_usage, "completion_tokens", 0) or 0),
+                    "total_tokens": int(getattr(chunk_usage, "total_tokens", 0) or 0),
+                }
             if not choices:
                 continue
 
@@ -337,14 +361,6 @@ class LiteLLMProvider(LLMProvider):
 
             if getattr(choice, "finish_reason", None):
                 finish_reason = choice.finish_reason or finish_reason
-
-            chunk_usage = getattr(chunk, "usage", None)
-            if chunk_usage:
-                usage = {
-                    "prompt_tokens": int(getattr(chunk_usage, "prompt_tokens", 0) or 0),
-                    "completion_tokens": int(getattr(chunk_usage, "completion_tokens", 0) or 0),
-                    "total_tokens": int(getattr(chunk_usage, "total_tokens", 0) or 0),
-                }
 
         tool_calls = []
         for index in sorted(tool_call_buffers):

@@ -18,11 +18,18 @@ from yuanclaw.session.manager import SessionManager
 
 
 class _Provider(LLMProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.closed = False
+
     def get_default_model(self) -> str:
         return "test"
 
     async def chat(self, messages, tools=None, **kwargs) -> LLMResponse:
         return LLMResponse(content="ok")
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 @pytest.mark.asyncio
@@ -111,7 +118,8 @@ async def test_process_direct_is_registered_and_cancelled_by_session(tmp_path) -
 
 @pytest.mark.asyncio
 async def test_shutdown_cancels_and_awaits_background_tasks(tmp_path) -> None:
-    loop = AgentLoop(bus=MessageBus(), provider=_Provider(), workspace=tmp_path)
+    provider = _Provider()
+    loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path)
     started = asyncio.Event()
     cancelled = asyncio.Event()
 
@@ -129,6 +137,7 @@ async def test_shutdown_cancels_and_awaits_background_tasks(tmp_path) -> None:
 
     assert cancelled.is_set()
     assert loop._background_tasks == set()
+    assert provider.closed is True
 
 
 @pytest.mark.asyncio

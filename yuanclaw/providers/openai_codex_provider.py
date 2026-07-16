@@ -276,22 +276,32 @@ def _prompt_cache_key(messages: list[dict[str, Any]]) -> str:
 
 async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], None]:
     buffer: list[str] = []
+
+    def decode_buffer() -> dict[str, Any] | None:
+        data_lines = [entry[5:].strip() for entry in buffer if entry.startswith("data:")]
+        if not data_lines:
+            return None
+        data = "\n".join(data_lines).strip()
+        if not data or data == "[DONE]":
+            return None
+        try:
+            return json.loads(data)
+        except Exception:
+            return None
+
     async for line in response.aiter_lines():
         if line == "":
             if buffer:
-                data_lines = [entry[5:].strip() for entry in buffer if entry.startswith("data:")]
+                event = decode_buffer()
                 buffer = []
-                if not data_lines:
-                    continue
-                data = "\n".join(data_lines).strip()
-                if not data or data == "[DONE]":
-                    continue
-                try:
-                    yield json.loads(data)
-                except Exception:
-                    continue
+                if event is not None:
+                    yield event
             continue
         buffer.append(line)
+    if buffer:
+        event = decode_buffer()
+        if event is not None:
+            yield event
 
 
 async def _consume_sse(
@@ -301,7 +311,7 @@ async def _consume_sse(
     content = ""
     tool_calls: list[ToolCallRequest] = []
     tool_call_buffers: dict[str, dict[str, Any]] = {}
-    finish_reason = "stop"
+    finish_reason = "error"
     usage: dict[str, int] = {}
 
     async for event in _iter_sse(response):
@@ -391,11 +401,16 @@ def _extract_usage(response_payload: dict[str, Any] | None) -> dict[str, int]:
     }
 
 
-_FINISH_REASON_MAP = {"completed": "stop", "incomplete": "length", "failed": "error", "cancelled": "error"}
+_FINISH_REASON_MAP = {
+    "completed": "stop",
+    "incomplete": "length",
+    "failed": "error",
+    "cancelled": "error",
+}
 
 
 def _map_finish_reason(status: str | None) -> str:
-    return _FINISH_REASON_MAP.get(status or "completed", "stop")
+    return _FINISH_REASON_MAP.get(status or "completed", "error")
 
 
 def _friendly_error(status_code: int, raw: str) -> str:

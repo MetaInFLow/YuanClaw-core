@@ -930,7 +930,7 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
 
-    async def shutdown(self) -> None:
+    async def shutdown(self, *, close_provider: bool = True) -> None:
         """Stop accepting work and await cleanup of all owned async resources."""
         self.stop()
         current = asyncio.current_task()
@@ -957,6 +957,8 @@ class AgentLoop:
         await self.subagents.cancel_all()
         await self._exec_session_manager.terminate_all()
         await self.close_mcp()
+        if close_provider:
+            await self.provider.aclose()
 
     async def _process_message(
         self,

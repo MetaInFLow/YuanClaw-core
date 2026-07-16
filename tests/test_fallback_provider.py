@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -8,6 +9,7 @@ from yuanclaw.providers.base import LLMProvider, LLMResponse
 from yuanclaw.providers.bedrock_provider import BedrockProvider
 from yuanclaw.providers.factory import build_provider_snapshot, make_provider
 from yuanclaw.providers.fallback_provider import FallbackProvider
+from yuanclaw.providers.litellm_provider import LiteLLMProvider
 from yuanclaw.providers.openai_compatible_provider import OpenAICompatibleProvider
 
 
@@ -17,10 +19,32 @@ class _FakeProvider(LLMProvider):
         self.model = model
         self.responses = list(responses)
         self.calls: list[dict[str, Any]] = []
+        self.closed = False
 
     async def chat(self, **kwargs: Any) -> LLMResponse:
         self.calls.append(dict(kwargs))
         return self.responses.pop(0)
+
+    def get_default_model(self) -> str:
+        return self.model
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _RaisingProvider(LLMProvider):
+    def __init__(self, model: str, error: Exception, *, delta: str | None = None) -> None:
+        super().__init__()
+        self.model = model
+        self.error = error
+        self.delta = delta
+        self.calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> LLMResponse:
+        self.calls.append(dict(kwargs))
+        if self.delta and kwargs.get("on_text_delta"):
+            await kwargs["on_text_delta"](self.delta)
+        raise self.error
 
     def get_default_model(self) -> str:
         return self.model
@@ -90,6 +114,7 @@ async def test_fallback_provider_uses_next_model_for_retryable_primary_error() -
     assert fallback.calls[0]["max_tokens"] == 512
     assert fallback.calls[0]["temperature"] == 0.4
     assert "reasoning_effort" not in fallback.calls[0]
+    assert fallback.closed is True
 
 
 @pytest.mark.asyncio
@@ -117,6 +142,188 @@ async def test_fallback_provider_does_not_retry_authentication_errors() -> None:
 
     assert response.content == "bad key"
     assert fallback.calls == []
+
+
+@pytest.mark.asyncio
+async def test_fallback_provider_recovers_from_primary_exception() -> None:
+    primary = _RaisingProvider("primary-model", ConnectionError("offline"))
+    fallback = _FakeProvider("fallback-model", [LLMResponse(content="fallback-ok")])
+    wrapper = FallbackProvider(
+        primary=primary,
+        fallback_presets=[_FallbackPreset(model="fallback-model")],
+        provider_factory=lambda _preset: fallback,
+    )
+
+    response = await wrapper.chat(messages=[{"role": "user", "content": "hi"}])
+
+    assert response.content == "fallback-ok"
+    assert len(primary.calls) == 1
+    assert len(fallback.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_fallback_provider_continues_after_fallback_exception() -> None:
+    primary = _FakeProvider(
+        "primary-model",
+        [
+            LLMResponse(
+                content="unavailable",
+                finish_reason="error",
+                error_kind="server_error",
+            )
+        ],
+    )
+    first = _RaisingProvider("first", ConnectionError("offline"))
+    second = _FakeProvider("second", [LLMResponse(content="second-ok")])
+    providers = {"first": first, "second": second}
+    wrapper = FallbackProvider(
+        primary=primary,
+        fallback_presets=[
+            _FallbackPreset(model="first"),
+            _FallbackPreset(model="second"),
+        ],
+        provider_factory=lambda preset: providers[preset.model],
+    )
+
+    response = await wrapper.chat(messages=[{"role": "user", "content": "hi"}])
+
+    assert response.content == "second-ok"
+    assert len(first.calls) == 1
+    assert len(second.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_fallback_provider_does_not_retry_after_stream_output() -> None:
+    primary = _RaisingProvider(
+        "primary-model",
+        ConnectionError("stream interrupted"),
+        delta="partial",
+    )
+    fallback = _FakeProvider("fallback-model", [LLMResponse(content="duplicate")])
+    wrapper = FallbackProvider(
+        primary=primary,
+        fallback_presets=[_FallbackPreset(model="fallback-model")],
+        provider_factory=lambda _preset: fallback,
+    )
+    deltas: list[str] = []
+
+    async def on_delta(delta: str) -> None:
+        deltas.append(delta)
+
+    response = await wrapper.chat(
+        messages=[{"role": "user", "content": "hi"}],
+        on_text_delta=on_delta,
+    )
+
+    assert deltas == ["partial"]
+    assert response.finish_reason == "error"
+    assert response.error_kind == "connection"
+    assert fallback.calls == []
+
+
+@pytest.mark.asyncio
+async def test_fallback_provider_treats_structured_error_as_failure() -> None:
+    primary = _FakeProvider(
+        "primary-model",
+        [LLMResponse(content="limited", error_kind="rate_limit")],
+    )
+    fallback = _FakeProvider("fallback-model", [LLMResponse(content="fallback-ok")])
+    wrapper = FallbackProvider(
+        primary=primary,
+        fallback_presets=[_FallbackPreset(model="fallback-model")],
+        provider_factory=lambda _preset: fallback,
+    )
+
+    response = await wrapper.chat(messages=[{"role": "user", "content": "hi"}])
+
+    assert response.content == "fallback-ok"
+
+
+@pytest.mark.asyncio
+async def test_litellm_does_not_reissue_request_after_stream_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def interrupted_stream():
+        yield SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content="partial", tool_calls=[]),
+                    finish_reason=None,
+                )
+            ],
+            usage=None,
+        )
+        raise ConnectionError("stream interrupted")
+
+    async def fake_acompletion(**kwargs):
+        nonlocal calls
+        calls += 1
+        return interrupted_stream()
+
+    monkeypatch.setattr("yuanclaw.providers.litellm_provider.acompletion", fake_acompletion)
+    provider = LiteLLMProvider(default_model="openai/test")
+    deltas: list[str] = []
+
+    async def on_delta(delta: str) -> None:
+        deltas.append(delta)
+
+    response = await provider.chat(
+        messages=[{"role": "user", "content": "hi"}],
+        on_text_delta=on_delta,
+    )
+
+    assert calls == 1
+    assert deltas == ["partial"]
+    assert response.finish_reason == "error"
+    assert response.error_kind == "connection"
+
+
+@pytest.mark.asyncio
+async def test_litellm_stream_keeps_usage_only_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def usage_stream():
+        yield SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content="ok", tool_calls=[]),
+                    finish_reason="stop",
+                )
+            ],
+            usage=None,
+        )
+        yield SimpleNamespace(
+            choices=[],
+            usage=SimpleNamespace(
+                prompt_tokens=2,
+                completion_tokens=1,
+                total_tokens=3,
+            ),
+        )
+
+    async def fake_acompletion(**kwargs):
+        return usage_stream()
+
+    monkeypatch.setattr("yuanclaw.providers.litellm_provider.acompletion", fake_acompletion)
+    provider = LiteLLMProvider(default_model="openai/test")
+
+    response = await provider.chat(
+        messages=[{"role": "user", "content": "hi"}],
+        on_text_delta=lambda _delta: _async_noop(),
+    )
+
+    assert response.content == "ok"
+    assert response.usage == {
+        "prompt_tokens": 2,
+        "completion_tokens": 1,
+        "total_tokens": 3,
+    }
+
+
+async def _async_noop() -> None:
+    return None
 
 
 def test_make_provider_wraps_configured_fallback_models() -> None:

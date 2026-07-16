@@ -636,7 +636,7 @@ def agent(
             if not renderer.streamed:
                 await renderer.on_end()
                 _print_agent_response(response, render_markdown=markdown)
-            await agent_loop.close_mcp()
+            await agent_loop.shutdown()
 
         asyncio.run(run_once())
     else:

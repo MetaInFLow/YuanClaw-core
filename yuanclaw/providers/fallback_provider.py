@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -12,7 +13,6 @@ from yuanclaw.providers.base import LLMProvider, LLMResponse
 
 _PRIMARY_FAILURE_THRESHOLD = 3
 _PRIMARY_COOLDOWN_S = 60
-_MISSING = object()
 _FALLBACK_ERROR_KINDS = frozenset({
     "timeout",
     "connection",
@@ -98,12 +98,21 @@ class FallbackProvider(LLMProvider):
         kwargs: dict[str, Any],
     ) -> LLMResponse:
         primary_model = kwargs.get("model") or self._primary.get_default_model()
+        last_response: LLMResponse | None = None
 
         if self._primary_available():
-            response = await call(self._primary, kwargs)
-            if response.finish_reason != "error":
+            response, emitted = await self._attempt(call, self._primary, kwargs)
+            last_response = response
+            if not self._is_error_response(response):
                 self._primary_failures = 0
                 self._primary_tripped_at = None
+                return response
+
+            if emitted:
+                logger.warning(
+                    "Primary model '{}' failed after streaming output; fallback suppressed",
+                    primary_model,
+                )
                 return response
 
             if not self._should_fallback(response):
@@ -125,7 +134,6 @@ class FallbackProvider(LLMProvider):
         else:
             logger.debug("Primary model '{}' circuit open; skipping", primary_model)
 
-        last_response: LLMResponse | None = None
         primary_skipped = not self._primary_available()
         for idx, fallback in enumerate(self._fallback_presets):
             fallback_model = fallback.model
@@ -154,27 +162,31 @@ class FallbackProvider(LLMProvider):
                 logger.warning("Failed to create provider for fallback '{}': {}", fallback_model, exc)
                 continue
 
-            original_values = {
-                name: kwargs.get(name, _MISSING)
-                for name in ("model", "max_tokens", "temperature", "reasoning_effort")
-            }
-            kwargs["model"] = fallback_model
-            kwargs["max_tokens"] = fallback.max_tokens
-            kwargs["temperature"] = fallback.temperature
+            fallback_kwargs = dict(kwargs)
+            fallback_kwargs["model"] = fallback_model
+            fallback_kwargs["max_tokens"] = fallback.max_tokens
+            fallback_kwargs["temperature"] = fallback.temperature
             if fallback.reasoning_effort is None:
-                kwargs.pop("reasoning_effort", None)
+                fallback_kwargs.pop("reasoning_effort", None)
             else:
-                kwargs["reasoning_effort"] = fallback.reasoning_effort
+                fallback_kwargs["reasoning_effort"] = fallback.reasoning_effort
             try:
-                fallback_response = await call(fallback_provider, kwargs)
+                fallback_response, emitted = await self._attempt(
+                    call,
+                    fallback_provider,
+                    fallback_kwargs,
+                )
             finally:
-                for name, value in original_values.items():
-                    if value is _MISSING:
-                        kwargs.pop(name, None)
-                    else:
-                        kwargs[name] = value
+                try:
+                    await fallback_provider.aclose()
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to close fallback provider '{}' ({})",
+                        fallback_model,
+                        type(exc).__name__,
+                    )
 
-            if fallback_response.finish_reason != "error":
+            if not self._is_error_response(fallback_response):
                 logger.info(
                     "Fallback '{}' succeeded after primary '{}' failed",
                     fallback_model,
@@ -183,6 +195,12 @@ class FallbackProvider(LLMProvider):
                 return fallback_response
 
             last_response = fallback_response
+            if emitted:
+                logger.warning(
+                    "Fallback '{}' failed after streaming output; further fallback suppressed",
+                    fallback_model,
+                )
+                return fallback_response
             logger.warning(
                 "Fallback '{}' also failed: {}",
                 fallback_model,
@@ -194,6 +212,71 @@ class FallbackProvider(LLMProvider):
             content=f"Primary model '{primary_model}' circuit open and no fallbacks available",
             finish_reason="error",
         )
+
+    @staticmethod
+    async def _attempt(
+        call: Callable[[LLMProvider, dict[str, Any]], Awaitable[LLMResponse]],
+        provider: LLMProvider,
+        kwargs: dict[str, Any],
+    ) -> tuple[LLMResponse, bool]:
+        emitted = False
+        attempt_kwargs = dict(kwargs)
+        on_text_delta = attempt_kwargs.get("on_text_delta")
+        if on_text_delta is not None:
+            async def tracked_delta(delta: str) -> None:
+                nonlocal emitted
+                emitted = True
+                await on_text_delta(delta)
+
+            attempt_kwargs["on_text_delta"] = tracked_delta
+        try:
+            return await call(provider, attempt_kwargs), emitted
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return FallbackProvider._response_from_exception(exc), emitted
+
+    @staticmethod
+    def _response_from_exception(exc: Exception) -> LLMResponse:
+        name = type(exc).__name__
+        lowered = name.lower()
+        status = getattr(exc, "status_code", None)
+        kind: str | None = None
+        should_retry: bool | None = None
+        if "timeout" in lowered:
+            kind, should_retry = "timeout", True
+        elif "connection" in lowered:
+            kind, should_retry = "connection", True
+        elif "ratelimit" in lowered or status == 429:
+            kind, should_retry = "rate_limit", True
+        elif "authentication" in lowered or status == 401:
+            kind, should_retry = "authentication", False
+        elif "permission" in lowered or status == 403:
+            kind, should_retry = "permission", False
+        elif isinstance(status, int) and status >= 500:
+            kind, should_retry = "server_error", True
+        return LLMResponse(
+            content=f"Provider request failed ({name})",
+            finish_reason="error",
+            error_status_code=status if isinstance(status, int) else None,
+            error_kind=kind,
+            error_type=name,
+            error_should_retry=should_retry,
+        )
+
+    @staticmethod
+    def _is_error_response(response: LLMResponse) -> bool:
+        return (
+            response.finish_reason == "error"
+            or response.error_kind is not None
+            or response.error_status_code is not None
+            or response.error_type is not None
+            or response.error_code is not None
+        )
+
+    async def aclose(self) -> None:
+        """Close the primary provider owned by this wrapper."""
+        await self._primary.aclose()
 
     @staticmethod
     def _should_fallback(response: LLMResponse) -> bool:
