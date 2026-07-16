@@ -7,33 +7,67 @@ import secrets
 import string
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from filelock import FileLock
+
 from yuanclaw.config.paths import get_data_dir
+from yuanclaw.utils.atomic import atomic_write_text, backup_path, quarantine_path
 
 _LOCK = threading.Lock()
 _ALPHABET = string.ascii_uppercase + string.digits
 _CODE_LENGTH = 8
 
 
+class PairingStoreCorruptError(ValueError):
+    """Raised when pairing state and its backup cannot be read safely."""
+
+
 def _store_path() -> Path:
     return get_data_dir() / "pairing.json"
 
 
+def _read(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise TypeError("pairing store root must be an object")
+    approved = data.get("approved", {})
+    pending = data.get("pending", {})
+    if not isinstance(approved, dict) or not isinstance(pending, dict):
+        raise TypeError("pairing store approved and pending fields must be objects")
+    normalized_approved: dict[str, set[str]] = {}
+    for channel, users in approved.items():
+        if not isinstance(users, list):
+            raise TypeError("pairing approved users must be arrays")
+        normalized_approved[str(channel)] = {str(user) for user in users}
+    if any(not isinstance(info, dict) for info in pending.values()):
+        raise TypeError("pairing pending entries must be objects")
+    return {"approved": normalized_approved, "pending": dict(pending)}
+
+
 def _load() -> dict[str, Any]:
-    try:
-        data = json.loads(_store_path().read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    path = _store_path()
+    if not path.exists():
         return {"approved": {}, "pending": {}}
-    approved = data.setdefault("approved", {})
-    for channel, users in list(approved.items()):
-        approved[channel] = set(users or [])
-    data.setdefault("pending", {})
-    return data
+    try:
+        return _read(path)
+    except (json.JSONDecodeError, OSError, TypeError, ValueError) as primary_error:
+        previous = backup_path(path)
+        if previous.exists():
+            try:
+                recovered = _read(previous)
+            except (json.JSONDecodeError, OSError, TypeError, ValueError):
+                pass
+            else:
+                quarantine_path(path)
+                _save(recovered, keep_backup=False)
+                return recovered
+        raise PairingStoreCorruptError(f"Invalid pairing store: {path}") from primary_error
 
 
-def _save(data: dict[str, Any]) -> None:
+def _save(data: dict[str, Any], *, keep_backup: bool = True) -> None:
     path = _store_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -43,7 +77,19 @@ def _save(data: dict[str, Any]) -> None:
         },
         "pending": dict(data.get("pending", {})),
     }
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_text(
+        path,
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        keep_backup=keep_backup,
+    )
+
+
+@contextmanager
+def _locked_store():
+    path = _store_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _LOCK, FileLock(str(path.with_name(f"{path.name}.lock")), timeout=10):
+        yield
 
 
 def _gc_pending(data: dict[str, Any]) -> None:
@@ -55,7 +101,7 @@ def _gc_pending(data: dict[str, Any]) -> None:
 
 
 def generate_code(channel: str, sender_id: str, ttl: int = 600) -> str:
-    with _LOCK:
+    with _locked_store():
         data = _load()
         _gc_pending(data)
         raw = "".join(secrets.choice(_ALPHABET) for _ in range(_CODE_LENGTH))
@@ -71,7 +117,7 @@ def generate_code(channel: str, sender_id: str, ttl: int = 600) -> str:
 
 
 def approve_code(code: str) -> tuple[str, str] | None:
-    with _LOCK:
+    with _locked_store():
         data = _load()
         _gc_pending(data)
         info = data.get("pending", {}).pop(code, None)
@@ -86,7 +132,7 @@ def approve_code(code: str) -> tuple[str, str] | None:
 
 
 def deny_code(code: str) -> bool:
-    with _LOCK:
+    with _locked_store():
         data = _load()
         existed = code in data.get("pending", {})
         data.get("pending", {}).pop(code, None)
@@ -95,13 +141,13 @@ def deny_code(code: str) -> bool:
 
 
 def is_approved(channel: str, sender_id: str) -> bool:
-    with _LOCK:
+    with _locked_store():
         data = _load()
         return str(sender_id) in data.get("approved", {}).get(channel, set())
 
 
 def list_pending() -> list[dict[str, Any]]:
-    with _LOCK:
+    with _locked_store():
         data = _load()
         _gc_pending(data)
         _save(data)
@@ -109,7 +155,7 @@ def list_pending() -> list[dict[str, Any]]:
 
 
 def revoke(channel: str, sender_id: str) -> bool:
-    with _LOCK:
+    with _locked_store():
         data = _load()
         users = data.get("approved", {}).get(channel, set())
         existed = str(sender_id) in users
@@ -119,7 +165,7 @@ def revoke(channel: str, sender_id: str) -> bool:
 
 
 def get_approved(channel: str) -> list[str]:
-    with _LOCK:
+    with _locked_store():
         data = _load()
         return sorted(data.get("approved", {}).get(channel, set()))
 
