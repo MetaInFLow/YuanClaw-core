@@ -12,10 +12,20 @@ PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"demo-bytes"
 
 
 class _FakeResponse:
-    def __init__(self, url: str, content_type: str, body: bytes) -> None:
+    def __init__(
+        self,
+        url: str,
+        content_type: str,
+        body: bytes,
+        *,
+        status_code: int = 200,
+        location: str | None = None,
+    ) -> None:
         self.url = url
-        self.status_code = 200
+        self.status_code = status_code
         self.headers = {"content-type": content_type}
+        if location is not None:
+            self.headers["location"] = location
         self.content = body
         self._body = body
 
@@ -54,6 +64,30 @@ class _FakeAsyncClient:
 
     def stream(self, method: str, url: str, headers: dict[str, str]) -> _FakeStream:
         return _FakeStream(self._response)
+
+
+class _SequenceAsyncClient(_FakeAsyncClient):
+    def __init__(self, *args, responses: list[_FakeResponse], **kwargs) -> None:
+        self._responses = iter(responses)
+        self.requested_urls: list[str] = []
+
+    def stream(self, method: str, url: str, headers: dict[str, str]) -> _FakeStream:
+        self.requested_urls.append(url)
+        return _FakeStream(next(self._responses))
+
+
+def test_url_validation_rejects_domain_with_non_public_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        web_tools.socket,
+        "getaddrinfo",
+        lambda *args: [(2, 1, 6, "", ("127.0.0.1", 0))],
+    )
+
+    is_valid, _ = web_tools._validate_url_target("https://example.com/page")
+
+    assert is_valid is False
 
 
 @pytest.mark.asyncio
@@ -108,6 +142,32 @@ async def test_web_fetch_blocks_private_redirect(monkeypatch: pytest.MonkeyPatch
     assert isinstance(result, str)
     payload = json.loads(result)
     assert payload["error"].startswith("Redirect blocked")
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_validates_redirect_before_following(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _FakeResponse(
+        "https://example.com/start",
+        "text/plain",
+        b"",
+        status_code=302,
+        location="http://127.0.0.1/private",
+    )
+    client = _SequenceAsyncClient(responses=[response])
+    monkeypatch.setattr(web_tools, "_validate_url_target", lambda url: (True, ""))
+    monkeypatch.setattr(
+        web_tools,
+        "_validate_resolved_url",
+        lambda url: (False, "blocked target") if "127.0.0.1" in url else (True, ""),
+    )
+    monkeypatch.setattr(web_tools.httpx, "AsyncClient", lambda *a, **kw: client)
+
+    result = await WebFetchTool().execute("https://example.com/start")
+
+    assert json.loads(result)["error"].startswith("Redirect blocked")
+    assert client.requested_urls == ["https://example.com/start"]
 
 
 @pytest.mark.asyncio

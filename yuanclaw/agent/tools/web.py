@@ -9,9 +9,10 @@ import json
 import os
 import re
 import socket
+from contextlib import asynccontextmanager
 from functools import partial
-from typing import Any
-from urllib.parse import urlparse
+from typing import Any, AsyncIterator
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from loguru import logger
@@ -128,7 +129,13 @@ def _validate_url_target(url: str) -> tuple[bool, str]:
         if host in {"localhost"} or host.endswith(".localhost"):
             return False, f"Blocked local host: {host}"
         if any(ch.isalpha() for ch in host):
-            socket.getaddrinfo(host, None)
+            addresses = {
+                result[4][0]
+                for result in socket.getaddrinfo(host, None)
+                if result[4]
+            }
+            if not addresses or any(not _is_public_ip(address) for address in addresses):
+                return False, f"Blocked resolved target: {host}"
             return True, ""
         return False, f"Blocked IP target: {host}"
     except Exception as exc:
@@ -138,6 +145,38 @@ def _validate_url_target(url: str) -> tuple[bool, str]:
 def _validate_resolved_url(url: str) -> tuple[bool, str]:
     """Validate the final URL after redirects."""
     return _validate_url_target(url)
+
+
+@asynccontextmanager
+async def _stream_validated_response(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    headers: dict[str, str],
+) -> AsyncIterator[httpx.Response]:
+    """Open a response while validating every redirect target before requesting it."""
+    current_url = url
+    for _ in range(MAX_REDIRECTS + 1):
+        is_valid, error_msg = _validate_resolved_url(current_url)
+        if not is_valid:
+            raise ValueError(f"Redirect blocked: {error_msg}")
+
+        async with client.stream("GET", current_url, headers=headers) as response:
+            response_valid, response_error = _validate_resolved_url(str(response.url))
+            if not response_valid:
+                raise ValueError(f"Redirect blocked: {response_error}")
+
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = response.headers.get("location")
+                if not location:
+                    raise ValueError("Redirect response is missing a location")
+                current_url = urljoin(str(response.url), location)
+                continue
+
+            yield response
+            return
+
+    raise ValueError(f"Too many redirects (maximum {MAX_REDIRECTS})")
 
 
 def _format_results(
@@ -437,19 +476,15 @@ class WebFetchTool(Tool):
     async def _fetch_image_payload(self, url: str) -> Any | None:
         """Fetch images directly and return native image blocks."""
         async with httpx.AsyncClient(
-            follow_redirects=True,
-            max_redirects=MAX_REDIRECTS,
+            follow_redirects=False,
             timeout=15.0,
             proxy=self.proxy,
         ) as client:
-            async with client.stream("GET", url, headers={"User-Agent": USER_AGENT}) as response:
-                redir_ok, redir_err = _validate_resolved_url(str(response.url))
-                if not redir_ok:
-                    return json.dumps(
-                        {"error": f"Redirect blocked: {redir_err}", "url": url},
-                        ensure_ascii=False,
-                    )
-
+            async with _stream_validated_response(
+                client,
+                url,
+                headers={"User-Agent": USER_AGENT},
+            ) as response:
                 content_type = response.headers.get("content-type", "")
                 if not content_type.startswith("image/"):
                     return None
@@ -519,23 +554,16 @@ class WebFetchTool(Tool):
 
         try:
             async with httpx.AsyncClient(
-                follow_redirects=True,
-                max_redirects=MAX_REDIRECTS,
+                follow_redirects=False,
                 timeout=30.0,
                 proxy=self.proxy,
             ) as client:
-                async with client.stream(
-                    "GET",
+                async with _stream_validated_response(
+                    client,
                     url,
                     headers={"User-Agent": USER_AGENT},
                 ) as response:
                     response.raise_for_status()
-                    redir_ok, redir_err = _validate_resolved_url(str(response.url))
-                    if not redir_ok:
-                        return json.dumps(
-                            {"error": f"Redirect blocked: {redir_err}", "url": url},
-                            ensure_ascii=False,
-                        )
                     content_type = response.headers.get("content-type", "")
                     byte_limit = (
                         MAX_FETCH_IMAGE_BYTES
