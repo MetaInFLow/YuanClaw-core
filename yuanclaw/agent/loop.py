@@ -308,7 +308,13 @@ class AgentLoop:
         finally:
             self._mcp_connecting = False
 
-    def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
+    def _set_tool_context(
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         """Update context for all tools that need routing info."""
         for name in (
             "message",
@@ -322,7 +328,17 @@ class AgentLoop:
         ):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
-                    tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+                    if name == "message":
+                        tool.set_context(channel, chat_id, message_id, metadata)
+                    else:
+                        tool.set_context(channel, chat_id)
+
+    @staticmethod
+    def _copy_reply_routing(msg: InboundMessage, response: OutboundMessage) -> None:
+        for key in ("message_id", "message_thread_id", "thread_ts"):
+            value = msg.metadata.get(key)
+            if value is not None:
+                response.metadata.setdefault(key, value)
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -440,6 +456,21 @@ class AgentLoop:
             lock = asyncio.Lock()
             self._session_locks[session_key] = lock
         return lock
+
+    def _register_active_task(self, session_key: str, task: asyncio.Task) -> None:
+        tasks = self._active_tasks.setdefault(session_key, [])
+        if task not in tasks:
+            tasks.append(task)
+
+    def _unregister_active_task(self, session_key: str, task: asyncio.Task) -> None:
+        tasks = self._active_tasks.get(session_key)
+        if tasks is not None and task in tasks:
+            tasks.remove(task)
+        if not tasks:
+            self._active_tasks.pop(session_key, None)
+            lock = self._session_locks.get(session_key)
+            if lock is not None and not lock.locked():
+                self._session_locks.pop(session_key, None)
 
     def _schedule_background(self, awaitable: Awaitable[Any]) -> None:
         task = asyncio.create_task(awaitable)
@@ -727,8 +758,6 @@ class AgentLoop:
     ) -> LLMResponse:
         """Await an LLM call with the runner wall timeout when applicable."""
         timeout_s = self.llm_timeout_s if llm_timeout_s is None else llm_timeout_s
-        if streaming:
-            timeout_s = None
         if timeout_s is not None and timeout_s <= 0:
             timeout_s = None
         try:
@@ -772,24 +801,34 @@ class AgentLoop:
                 continue
 
             task = asyncio.create_task(self._dispatch(msg))
-            self._active_tasks.setdefault(msg.session_key, []).append(task)
-            task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+            self._register_active_task(msg.session_key, task)
+            task.add_done_callback(
+                lambda completed, key=msg.session_key: self._unregister_active_task(key, completed)
+            )
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
         """Cancel all active tasks and subagents for the session."""
-        tasks = self._active_tasks.pop(msg.session_key, [])
-        cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
-        for t in tasks:
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):
-                pass
-        sub_cancelled = await self.subagents.cancel_by_session(msg.session_key)
-        total = cancelled + sub_cancelled
+        total = await self.cancel_session(msg.session_key)
         content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
         await self.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=content,
         ))
+
+    async def cancel_session(self, session_key: str) -> int:
+        """Cancel every tracked task and subprocess owned by one session."""
+        current = asyncio.current_task()
+        tasks = [
+            task
+            for task in self._active_tasks.get(session_key, [])
+            if task is not current and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        subagent_count = await self.subagents.cancel_by_session(session_key)
+        exec_count = await self._exec_session_manager.terminate_owner(session_key)
+        return len(tasks) + subagent_count + exec_count
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message with per-session locking."""
@@ -861,6 +900,34 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
 
+    async def shutdown(self) -> None:
+        """Stop accepting work and await cleanup of all owned async resources."""
+        self.stop()
+        current = asyncio.current_task()
+        tasks = {
+            task
+            for session_tasks in self._active_tasks.values()
+            for task in session_tasks
+            if task is not current and not task.done()
+        }
+        tasks.update(
+            task
+            for task in self._background_tasks | self._consolidation_tasks
+            if task is not current and not task.done()
+        )
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._active_tasks.clear()
+        self._background_tasks.clear()
+        self._consolidation_tasks.clear()
+        self._consolidating.clear()
+        self._session_locks.clear()
+        await self.subagents.cancel_all()
+        await self._exec_session_manager.terminate_all()
+        await self.close_mcp()
+
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -878,7 +945,12 @@ class AgentLoop:
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
             session, pending_summary = self.auto_compact.prepare_session(session, key)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+            self._set_tool_context(
+                channel,
+                chat_id,
+                msg.metadata.get("message_id"),
+                msg.metadata,
+            )
             history = session.get_history(max_messages=self.memory_window)
             memory_context = self._build_memory_context(
                 session_key=key,
@@ -955,6 +1027,7 @@ class AgentLoop:
         if parsed:
             response = await self._dispatch_command(msg, session, key)
             if response is not None:
+                self._copy_reply_routing(msg, response)
                 return response
 
         unconsolidated = len(session.messages) - session.last_consolidated
@@ -978,7 +1051,12 @@ class AgentLoop:
             _task = asyncio.create_task(_consolidate_and_unlock())
             self._consolidation_tasks.add(_task)
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+        self._set_tool_context(
+            msg.channel,
+            msg.chat_id,
+            msg.metadata.get("message_id"),
+            msg.metadata,
+        )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
@@ -1144,23 +1222,30 @@ class AgentLoop:
         metadata: dict[str, Any] | None = None,
     ) -> str:
         """Process a message directly (for CLI or cron usage)."""
-        await self._connect_mcp()
-        async with self._get_session_lock(session_key):
-            metadata = dict(metadata or {})
-            if skill_names:
-                metadata["skill_names"] = skill_names
-            msg = InboundMessage(
-                channel=channel,
-                sender_id="user",
-                chat_id=chat_id,
-                content=content,
-                metadata=metadata,
-            )
-            response = await self._process_message(
-                msg,
-                session_key=session_key,
-                on_progress=on_progress,
-                on_stream=on_stream,
-                on_stream_end=on_stream_end,
-            )
-        return response.content if response else ""
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("process_direct requires an asyncio task")
+        self._register_active_task(session_key, task)
+        try:
+            await self._connect_mcp()
+            async with self._get_session_lock(session_key):
+                metadata = dict(metadata or {})
+                if skill_names:
+                    metadata["skill_names"] = skill_names
+                msg = InboundMessage(
+                    channel=channel,
+                    sender_id="user",
+                    chat_id=chat_id,
+                    content=content,
+                    metadata=metadata,
+                )
+                response = await self._process_message(
+                    msg,
+                    session_key=session_key,
+                    on_progress=on_progress,
+                    on_stream=on_stream,
+                    on_stream_end=on_stream_end,
+                )
+            return response.content if response else ""
+        finally:
+            self._unregister_active_task(session_key, task)

@@ -1087,41 +1087,6 @@ class CoreRuntime:
         self.started_at = 0.0
         self.events = RuntimeEventBroker()
         self.config = config
-        self.bus = MessageBus()
-        self.provider = _make_provider(config)
-        self.session_manager = SessionManager(config.workspace_path)
-        self.cron = CronService(get_cron_dir() / "jobs.json")
-        self.agent = AgentLoop(
-            bus=self.bus,
-            provider=self.provider,
-            workspace=config.workspace_path,
-            model=config.agents.defaults.model,
-            provider_name=config.get_provider_name(config.agents.defaults.model),
-            temperature=config.agents.defaults.temperature,
-            max_tokens=config.agents.defaults.max_tokens,
-            context_window_tokens=config.agents.defaults.context_window_tokens,
-            max_iterations=config.agents.defaults.max_tool_iterations,
-            memory_window=config.agents.defaults.memory_window,
-            memory_config=config.agents.defaults.memory,
-            compaction_config=config.agents.defaults.compaction,
-            reasoning_effort=config.agents.defaults.reasoning_effort,
-            brave_api_key=config.tools.web.search.api_key or None,
-            web_search_provider=config.tools.web.search.provider,
-            web_search_base_url=config.tools.web.search.base_url or None,
-            web_search_max_results=config.tools.web.search.max_results,
-            web_proxy=config.tools.web.proxy or None,
-            exec_config=config.tools.exec,
-            cron_service=self.cron,
-            restrict_to_workspace=config.tools.restrict_to_workspace,
-            session_manager=self.session_manager,
-            mcp_servers=config.tools.mcp_servers,
-            channels_config=config.channels,
-            image_generation_config=config.tools.image_generation,
-            image_generation_provider_configs=_image_gen_provider_configs(config),
-            cli_apps_config=config.tools.cli_apps,
-            max_concurrent_subagents=config.agents.defaults.max_concurrent_subagents,
-        )
-        self.channels = None
         self._agent_task: asyncio.Task | None = None
         self._channels_task: asyncio.Task | None = None
         self._started = False
@@ -1284,8 +1249,7 @@ class CoreRuntime:
         self.cron.stop()
         if self.channels is not None:
             await self.channels.stop_all()
-        self.agent.stop()
-        await self.agent.close_mcp()
+        await self.agent.shutdown()
 
         tasks = [t for t in (self._agent_task, self._channels_task) if t is not None]
         for task in tasks:
@@ -1338,8 +1302,7 @@ class CoreRuntime:
                         await self._stop_locked()
                     else:
                         self.cron.stop()
-                        self.agent.stop()
-                        await self.agent.close_mcp()
+                        await self.agent.shutdown()
                     self._install_components(previous_config, previous_components)
                     if was_running:
                         await self._start_locked()
@@ -1364,7 +1327,12 @@ class CoreRuntime:
 
     @property
     def running(self) -> bool:
-        return self._started
+        if not self._started:
+            return False
+        if not self.with_channels:
+            return True
+        tasks = (self._agent_task, self._channels_task)
+        return all(task is not None and not task.done() for task in tasks)
 
     def status_payload(self) -> dict[str, Any]:
         """Build dashboard status response."""
@@ -1807,6 +1775,17 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
             if event_type == "ping":
                 await websocket.send_json({"type": "pong"})
                 continue
+            if event_type == "stop":
+                stop_key = str(payload.get("sessionKey") or "studio:default")
+                stopped_count = await runtime.agent.cancel_session(stop_key)
+                await websocket.send_json(
+                    {
+                        "type": "stopped",
+                        "sessionKey": stop_key,
+                        "cancelled": stopped_count,
+                    }
+                )
+                continue
             if event_type != "chat":
                 await websocket.send_json({"type": "error", "message": f"unknown event type: {event_type}"})
                 continue
@@ -1908,15 +1887,76 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
                         "session_key": session_key,
                     }
                 )
-                final = await runtime.agent.process_direct(
-                    content=content,
-                    session_key=session_key,
-                    channel="studio",
-                    chat_id=chat_id or "default",
-                    skill_names=skill_names,
-                    on_progress=on_progress,
-                    metadata=runtime_metadata,
+                turn_task = asyncio.create_task(
+                    runtime.agent.process_direct(
+                        content=content,
+                        session_key=session_key,
+                        channel="studio",
+                        chat_id=chat_id or "default",
+                        skill_names=skill_names,
+                        on_progress=on_progress,
+                        metadata=runtime_metadata,
+                    ),
+                    name=f"studio-turn:{session_key}",
                 )
+                turn_stopped = False
+                while not turn_task.done():
+                    control_task = asyncio.create_task(websocket.receive_json())
+                    completed, _ = await asyncio.wait(
+                        {turn_task, control_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if turn_task in completed:
+                        control_task.cancel()
+                        await asyncio.gather(control_task, return_exceptions=True)
+                        break
+
+                    try:
+                        control = control_task.result()
+                    except WebSocketDisconnect:
+                        await runtime.agent.cancel_session(session_key)
+                        turn_task.cancel()
+                        await asyncio.gather(turn_task, return_exceptions=True)
+                        raise
+
+                    control_type = str(control.get("type") or "")
+                    if control_type == "ping":
+                        await websocket.send_json({"type": "pong"})
+                        continue
+                    if control_type == "stop":
+                        stop_key = str(control.get("sessionKey") or session_key)
+                        stopped_count = await runtime.agent.cancel_session(stop_key)
+                        if not turn_task.done():
+                            turn_task.cancel()
+                        await asyncio.gather(turn_task, return_exceptions=True)
+                        await websocket.send_json(
+                            {
+                                "type": "stopped",
+                                "sessionKey": stop_key,
+                                "cancelled": stopped_count,
+                            }
+                        )
+                        runtime.events.publish(
+                            {
+                                "type": "agent.turn_end",
+                                "status": "stopped",
+                                "channel": "studio",
+                                "chat_id": chat_id or "default",
+                                "session_key": session_key,
+                            }
+                        )
+                        turn_stopped = True
+                        break
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "message": "a chat turn is already running; send stop first",
+                        }
+                    )
+
+                if turn_stopped:
+                    continue
+                final = await turn_task
                 if not final:
                     final = "\n".join(progress_lines).strip()
                 session_data = runtime.session_manager.read_session_file(session_key) or {}

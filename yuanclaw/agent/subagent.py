@@ -308,6 +308,15 @@ Stay focused on the assigned task. Your final response will be reported back to 
             await asyncio.gather(*tasks, return_exceptions=True)
         return len(tasks)
 
+    async def cancel_all(self) -> int:
+        """Cancel and await every running subagent."""
+        tasks = [task for task in self._running_tasks.values() if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return len(tasks)
+
     def get_running_count(self) -> int:
         """Return the number of currently running subagents."""
         return len(self._running_tasks)

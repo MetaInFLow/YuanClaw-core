@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import subprocess
 import time
 import uuid
 from contextlib import suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,6 +19,37 @@ DEFAULT_YIELD_MS = 1000
 MAX_YIELD_MS = 30_000
 DEFAULT_MAX_OUTPUT_CHARS = 10_000
 MAX_OUTPUT_CHARS = 50_000
+
+
+def subprocess_group_kwargs() -> dict[str, Any]:
+    """Start a shell in a group that can be terminated with all descendants."""
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+async def terminate_process_tree(process: asyncio.subprocess.Process) -> None:
+    """Terminate a subprocess and all descendants, then reap the root process."""
+    if process.returncode is not None:
+        await process.wait()
+        return
+    if os.name == "nt":
+        await asyncio.to_thread(
+            subprocess.run,
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    else:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+    if process.returncode is None:
+        with suppress(ProcessLookupError):
+            process.kill()
+    with suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(process.wait(), timeout=5.0)
 
 
 @dataclass(slots=True)
@@ -63,9 +96,22 @@ class _ExecSession:
         self.last_access = time.monotonic()
         self._chunks: list[str] = []
         self._lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
+        self._io_finished = False
         self._timed_out = False
         self._stdout_task = asyncio.create_task(self._read_stream(process.stdout, ""))
         self._stderr_task = asyncio.create_task(self._read_stream(process.stderr, "STDERR:\n"))
+        self._deadline_task = (
+            asyncio.create_task(self._watch_deadline(timeout))
+            if timeout is not None and timeout > 0
+            else None
+        )
+
+    async def _watch_deadline(self, timeout: int) -> None:
+        await asyncio.sleep(timeout)
+        if self.process.returncode is None:
+            self._timed_out = True
+            await self.kill()
 
     async def _read_stream(self, stream: asyncio.StreamReader | None, prefix: str) -> None:
         if stream is None:
@@ -106,6 +152,20 @@ class _ExecSession:
 
     async def _finish_io(self) -> None:
         """Reap the process and close reader tasks before releasing the session."""
+        async with self._lifecycle_lock:
+            await self._finish_io_locked()
+
+    async def _finish_io_locked(self) -> None:
+        if self._io_finished:
+            return
+        current = asyncio.current_task()
+        if (
+            self._deadline_task is not None
+            and self._deadline_task is not current
+            and not self._deadline_task.done()
+        ):
+            self._deadline_task.cancel()
+            await asyncio.gather(self._deadline_task, return_exceptions=True)
         if self.process.stdin is not None and not self.process.stdin.is_closing():
             self.process.stdin.close()
             with suppress(BrokenPipeError, ConnectionResetError):
@@ -119,6 +179,7 @@ class _ExecSession:
         for task in pending:
             task.cancel()
         await asyncio.gather(*done, *pending, return_exceptions=True)
+        self._io_finished = True
 
     async def poll(
         self,
@@ -156,21 +217,10 @@ class _ExecSession:
         )
 
     async def kill(self) -> None:
-        if self.process.returncode is None:
-            if os.name == "nt":
-                await asyncio.to_thread(
-                    subprocess.run,
-                    ["taskkill", "/PID", str(self.process.pid), "/T", "/F"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                )
+        async with self._lifecycle_lock:
             if self.process.returncode is None:
-                self.process.kill()
-            with suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(self.process.wait(), timeout=5.0)
-        await self._finish_io()
+                await terminate_process_tree(self.process)
+            await self._finish_io_locked()
 
 
 class ExecSessionManager:
@@ -202,6 +252,7 @@ class ExecSessionManager:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
                 env=env,
+                **subprocess_group_kwargs(),
             )
             session_id = uuid.uuid4().hex[:12]
             session = _ExecSession(
@@ -278,6 +329,27 @@ class ExecSessionManager:
                 if session.owner_key == owner_key
             ]
 
+    async def terminate_owner(self, owner_key: str) -> int:
+        """Terminate and remove every session owned by one chat session."""
+        async with self._lock:
+            sessions = [
+                self._sessions.pop(session_id)
+                for session_id, session in list(self._sessions.items())
+                if session.owner_key == owner_key
+            ]
+        if sessions:
+            await asyncio.gather(*(session.kill() for session in sessions), return_exceptions=True)
+        return len(sessions)
+
+    async def terminate_all(self) -> int:
+        """Terminate and remove all managed exec sessions."""
+        async with self._lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        if sessions:
+            await asyncio.gather(*(session.kill() for session in sessions), return_exceptions=True)
+        return len(sessions)
+
     async def _cleanup_locked(self) -> None:
         now = time.monotonic()
         stale = [
@@ -335,10 +407,13 @@ class WriteStdinTool(Tool):
 
     def __init__(self, *, manager: ExecSessionManager | None = None) -> None:
         self._manager = manager or DEFAULT_EXEC_SESSION_MANAGER
-        self._owner_key = "cli:direct"
+        self._owner_key: ContextVar[str] = ContextVar(
+            f"exec_session_owner_{id(self)}",
+            default="cli:direct",
+        )
 
     def set_context(self, channel: str, chat_id: str) -> None:
-        self._owner_key = f"{channel}:{chat_id}"
+        self._owner_key.set(f"{channel}:{chat_id}")
 
     @property
     def name(self) -> str:
@@ -383,7 +458,7 @@ class WriteStdinTool(Tool):
             if max_output_chars is None:
                 max_output_chars = max_output_tokens
             poll = await self._manager.write(
-                owner_key=self._owner_key,
+                owner_key=self._owner_key.get(),
                 session_id=session_id,
                 chars=chars,
                 close_stdin=close_stdin,
@@ -416,7 +491,7 @@ class ListExecSessionsTool(WriteStdinTool):
         return {"type": "object", "properties": {}}
 
     async def execute(self, **_kwargs: Any) -> str:
-        sessions = await self._manager.list(owner_key=self._owner_key)
+        sessions = await self._manager.list(owner_key=self._owner_key.get())
         if not sessions:
             return "No active exec sessions."
         lines = []

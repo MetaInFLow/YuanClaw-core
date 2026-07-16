@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from urllib.parse import quote
@@ -32,7 +33,10 @@ class _RuntimeStub:
         self.port = 18789
         self.started_at = 0.0
         self.provider = SimpleNamespace(chat=AsyncMock())
-        self.agent = SimpleNamespace(process_direct=AsyncMock(return_value="stub reply"))
+        self.agent = SimpleNamespace(
+            process_direct=AsyncMock(return_value="stub reply"),
+            cancel_session=AsyncMock(return_value=0),
+        )
         self.applied_configs = []
         self.prepared_configs = []
         self.distill_payload = None
@@ -433,6 +437,44 @@ def test_ws_chat_forwards_workspace_scope_to_agent_metadata(tmp_path) -> None:
     }
 
 
+def test_ws_chat_stop_frame_cancels_running_session(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    started = asyncio.Event()
+
+    async def _slow_process(**_kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    runtime.agent.process_direct = AsyncMock(side_effect=_slow_process)
+    runtime.agent.cancel_session = AsyncMock(return_value=1)
+
+    with TestClient(create_app(runtime)) as client:
+        with client.websocket_connect("/ws/chat") as websocket:
+            assert websocket.receive_json()["type"] == "ready"
+            websocket.send_json(
+                {
+                    "type": "chat",
+                    "content": "long task",
+                    "sessionKey": "studio:thread-stop",
+                }
+            )
+            assert websocket.receive_json()["type"] == "goal_status"
+            websocket.send_json(
+                {
+                    "type": "stop",
+                    "sessionKey": "studio:thread-stop",
+                }
+            )
+            stopped = websocket.receive_json()
+
+    assert stopped == {
+        "type": "stopped",
+        "sessionKey": "studio:thread-stop",
+        "cancelled": 1,
+    }
+    runtime.agent.cancel_session.assert_awaited_once_with("studio:thread-stop")
+
+
 def test_session_summary_api_falls_back_to_input_without_api_key(tmp_path) -> None:
     runtime = _RuntimeStub(tmp_path / "workspace")
 
@@ -797,6 +839,23 @@ async def test_core_runtime_apply_config_restores_running_components_on_start_fa
     assert runtime.agent is previous_agent
     assert runtime.provider is previous_provider
     await runtime.stop()
+
+
+def test_core_runtime_running_reflects_background_task_liveness(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "yuanclaw.config.paths.get_config_path",
+        lambda: tmp_path / "instance" / "config.json",
+    )
+    config = Config()
+    config.agents.defaults.workspace = str(tmp_path / "workspace")
+    runtime = CoreRuntime(config, host="127.0.0.1", port=18789, with_channels=True)
+    runtime._started = True
+    runtime._agent_task = SimpleNamespace(done=lambda: False)
+    runtime._channels_task = SimpleNamespace(done=lambda: False)
+    assert runtime.running is True
+
+    runtime._channels_task = SimpleNamespace(done=lambda: True)
+    assert runtime.running is False
 
 
 def test_api_requires_gateway_token_when_configured(tmp_path) -> None:
