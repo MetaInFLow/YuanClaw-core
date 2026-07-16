@@ -1797,6 +1797,9 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
                 await websocket.send_json({"type": "error", "message": f"invalid payload: {exc}"})
                 continue
 
+            if not isinstance(payload, dict):
+                await websocket.send_json({"type": "error", "message": "payload must be an object"})
+                continue
             event_type = str(payload.get("type") or "chat")
             if event_type == "ping":
                 await websocket.send_json({"type": "pong"})
@@ -1820,13 +1823,29 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
             if not content:
                 await websocket.send_json({"type": "error", "message": "content is required"})
                 continue
+            if len(content) > 200_000:
+                await websocket.send_json(
+                    {"type": "error", "message": "content exceeds 200000 characters"}
+                )
+                continue
 
             session_key = str(payload.get("sessionKey") or "studio:default")
+            if len(session_key) > 512:
+                await websocket.send_json(
+                    {"type": "error", "message": "sessionKey exceeds 512 characters"}
+                )
+                continue
+            raw_skill_names = payload.get("skillNames") or []
+            if not isinstance(raw_skill_names, list):
+                await websocket.send_json(
+                    {"type": "error", "message": "skillNames must be an array"}
+                )
+                continue
             skill_names = [
                 str(name).strip()
-                for name in (payload.get("skillNames") or [])
-                if str(name).strip()
-            ]
+                for name in raw_skill_names[:16]
+                if isinstance(name, str) and str(name).strip()
+            ][:16]
             runtime_metadata: dict[str, Any] = {}
             if payload.get("cliApps") is not None:
                 runtime_metadata["cliApps"] = payload.get("cliApps")
@@ -1869,7 +1888,16 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
                 file_edit_events: list[dict[str, Any]] | None = None,
                 **_kwargs: Any,
             ) -> None:
+                text = str(text)[:20_000]
                 progress_lines.append(text)
+                if len(progress_lines) > 200:
+                    del progress_lines[:-200]
+                tool_events = tool_events[:100] if isinstance(tool_events, list) else None
+                file_edit_events = (
+                    file_edit_events[:100]
+                    if isinstance(file_edit_events, list)
+                    else None
+                )
                 event = {
                     "type": "agent.tool_hint" if tool_hint else "agent.progress",
                     "channel": "studio",
@@ -1945,6 +1973,11 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
                         await asyncio.gather(turn_task, return_exceptions=True)
                         raise
 
+                    if not isinstance(control, dict):
+                        await websocket.send_json(
+                            {"type": "error", "message": "control payload must be an object"}
+                        )
+                        continue
                     control_type = str(control.get("type") or "")
                     if control_type == "ping":
                         await websocket.send_json({"type": "pong"})

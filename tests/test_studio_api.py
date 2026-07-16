@@ -133,6 +133,34 @@ def test_sessions_api_includes_message_summary_fields(tmp_path) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (["not", "an", "object"], "payload must be an object"),
+        ({"type": "chat", "content": "x" * 200_001}, "content exceeds 200000 characters"),
+        (
+            {"type": "chat", "content": "hello", "skillNames": "demo"},
+            "skillNames must be an array",
+        ),
+    ],
+)
+def test_ws_chat_rejects_invalid_or_oversized_payloads(
+    tmp_path,
+    payload,
+    message,
+) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+
+    with TestClient(create_app(runtime)) as client:
+        with client.websocket_connect("/ws/chat") as websocket:
+            assert websocket.receive_json()["type"] == "ready"
+            websocket.send_json(payload)
+            error = websocket.receive_json()
+
+    assert error == {"type": "error", "message": message}
+    runtime.agent.process_direct.assert_not_awaited()
+
+
 def test_delete_session_api_cancels_work_and_removes_persistence(tmp_path) -> None:
     runtime = _RuntimeStub(tmp_path / "workspace")
     session = runtime.session_manager.get_or_create("studio:thread-delete")
