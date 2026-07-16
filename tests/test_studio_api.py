@@ -582,6 +582,26 @@ def test_write_config_api_rejects_enabled_runtime_channel_without_required_field
     mock_save_config.assert_not_called()
     assert runtime.prepared_configs == []
     assert runtime.applied_configs == []
+
+
+def test_write_config_api_restores_disk_config_when_runtime_apply_fails(tmp_path) -> None:
+    runtime = _RuntimeStub(tmp_path / "workspace")
+    previous_model = runtime.config.agents.defaults.model
+    payload = runtime.config.model_dump(by_alias=True)
+    payload["agents"]["defaults"]["model"] = "openai/gpt-test"
+    runtime.apply_config = AsyncMock(side_effect=RuntimeError("simulated start failure"))
+
+    with patch("yuanclaw.api.server.save_config") as mock_save_config:
+        with TestClient(create_app(runtime)) as client:
+            response = client.put("/api/config", json=payload)
+
+    assert response.status_code == 500
+    assert "simulated start failure" in response.json()["detail"]
+    assert mock_save_config.call_count == 2
+    assert mock_save_config.call_args_list[0].args[0].agents.defaults.model == "openai/gpt-test"
+    assert mock_save_config.call_args_list[1].args[0].agents.defaults.model == previous_model
+
+
 def test_usage_api_aggregates_session_usage(tmp_path) -> None:
     runtime = _RuntimeStub(tmp_path / "workspace")
     first = runtime.session_manager.get_or_create("studio:cowboy-biaoge:thread-1")
@@ -738,6 +758,45 @@ async def test_core_runtime_apply_config_refreshes_provider_and_tool_snapshot(
     assert runtime.agent.tools.get("run_cli_app") is not None
     assert runtime.agent.tools.get("generate_image") is not None
     assert runtime.agent.tools.get("run_cli_app") is not old_agent.tools.get("run_cli_app")
+
+
+@pytest.mark.asyncio
+async def test_core_runtime_apply_config_restores_running_components_on_start_failure(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "yuanclaw.config.paths.get_config_path",
+        lambda: tmp_path / "instance" / "config.json",
+    )
+    initial = Config()
+    initial.agents.defaults.workspace = str(tmp_path / "workspace-a")
+    runtime = CoreRuntime(initial, host="127.0.0.1", port=18789, with_channels=False)
+    await runtime.start()
+    previous_agent = runtime.agent
+    previous_provider = runtime.provider
+    original_start_locked = runtime._start_locked
+    start_attempts = 0
+
+    async def fail_new_runtime_once() -> None:
+        nonlocal start_attempts
+        start_attempts += 1
+        if start_attempts == 1:
+            raise RuntimeError("simulated start failure")
+        await original_start_locked()
+
+    monkeypatch.setattr(runtime, "_start_locked", fail_new_runtime_once)
+    updated = Config.model_validate(initial.model_dump(by_alias=True))
+    updated.agents.defaults.workspace = str(tmp_path / "workspace-b")
+
+    with pytest.raises(RuntimeError, match="simulated start failure"):
+        await runtime.apply_config(updated)
+
+    assert runtime.running is True
+    assert runtime.config is initial
+    assert runtime.agent is previous_agent
+    assert runtime.provider is previous_provider
+    await runtime.stop()
 
 
 def test_api_requires_gateway_token_when_configured(tmp_path) -> None:

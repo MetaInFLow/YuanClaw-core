@@ -4,9 +4,14 @@ import json
 from pathlib import Path
 
 from yuanclaw.config.schema import Config
+from yuanclaw.utils.atomic import atomic_write_text, backup_path, quarantine_path
 
 # Global variable to store current config path (for multi-instance support)
 _current_config_path: Path | None = None
+
+
+class ConfigLoadError(ValueError):
+    """Raised when a persisted configuration and its backup cannot be validated."""
 
 
 def set_config_path(path: Path) -> None:
@@ -36,13 +41,27 @@ def load_config(config_path: Path | None = None) -> Config:
 
     if path.exists():
         try:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-            data = _migrate_config(data)
-            return Config.model_validate(data)
-        except (json.JSONDecodeError, ValueError) as e:
-            print(f"Warning: Failed to load config from {path}: {e}")
-            print("Using default configuration.")
+            return _load_config_file(path)
+        except (json.JSONDecodeError, ValueError, TypeError) as primary_error:
+            previous_path = backup_path(path)
+            if previous_path.exists():
+                try:
+                    recovered = _load_config_file(previous_path)
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    pass
+                else:
+                    quarantine_path(path)
+                    atomic_write_text(
+                        path,
+                        json.dumps(
+                            recovered.model_dump(by_alias=True),
+                            indent=2,
+                            ensure_ascii=False,
+                        ),
+                        keep_backup=False,
+                    )
+                    return recovered
+            raise ConfigLoadError(f"Invalid configuration file: {path}") from primary_error
 
     return Config()
 
@@ -60,8 +79,18 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
 
     data = config.model_dump(by_alias=True)
 
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    atomic_write_text(
+        path,
+        json.dumps(data, indent=2, ensure_ascii=False),
+    )
+
+
+def _load_config_file(path: Path) -> Config:
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise TypeError("configuration root must be an object")
+    return Config.model_validate(_migrate_config(data))
 
 
 def _migrate_config(data: dict) -> dict:

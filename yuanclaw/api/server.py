@@ -1315,13 +1315,39 @@ class CoreRuntime:
 
         async with self._lifecycle_lock:
             was_running = self._started
-            if was_running:
-                await self._stop_locked()
+            previous_config = self.config
+            previous_components = {
+                "bus": self.bus,
+                "provider": self.provider,
+                "session_manager": self.session_manager,
+                "cron": self.cron,
+                "agent": self.agent,
+                "channels": self.channels,
+            }
+            try:
+                if was_running:
+                    await self._stop_locked()
 
-            self._install_components(config, components)
+                self._install_components(config, components)
 
-            if was_running:
-                await self._start_locked()
+                if was_running:
+                    await self._start_locked()
+            except BaseException as apply_error:
+                try:
+                    if self._started:
+                        await self._stop_locked()
+                    else:
+                        self.cron.stop()
+                        self.agent.stop()
+                        await self.agent.close_mcp()
+                    self._install_components(previous_config, previous_components)
+                    if was_running:
+                        await self._start_locked()
+                except BaseException as rollback_error:
+                    raise RuntimeError(
+                        f"Runtime config apply failed and rollback failed: {rollback_error}"
+                    ) from apply_error
+                raise
 
         self.events.publish(
             {
@@ -1735,10 +1761,21 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"config is not applicable: {exc}") from exc
 
+        previous_config = runtime.config.model_copy(deep=True)
         try:
             save_config(next_config)
             await runtime.apply_config(next_config, prepared_components=prepared_components)
         except Exception as exc:
+            try:
+                save_config(previous_config)
+            except Exception as rollback_error:
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        f"failed to apply config: {exc}; "
+                        f"failed to restore previous config: {rollback_error}"
+                    ),
+                ) from exc
             raise HTTPException(status_code=500, detail=f"failed to apply config: {exc}") from exc
 
         return {

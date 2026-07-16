@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
+from yuanclaw.utils.atomic import atomic_write_text
 from yuanclaw.utils.helpers import ensure_dir
 
 if TYPE_CHECKING:
@@ -42,11 +44,15 @@ _SAVE_MEMORY_TOOL = [
     }
 ]
 
+_MEMORY_LOCKS: dict[str, asyncio.Lock] = {}
+
 
 class MemoryStore:
     """Two-layer memory: MEMORY.md (long-term facts) + daily pages + HISTORY.md legacy log."""
 
     def __init__(self, workspace: Path):
+        workspace_key = str(workspace.expanduser().resolve())
+        self._consolidation_lock = _MEMORY_LOCKS.setdefault(workspace_key, asyncio.Lock())
         self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "HISTORY.md"
@@ -79,26 +85,33 @@ class MemoryStore:
         return ""
 
     def write_long_term(self, content: str) -> None:
-        self.memory_file.write_text(content, encoding="utf-8")
+        atomic_write_text(self.memory_file, content)
 
     def _append_daily_page(self, entry: str) -> None:
         """Append a consolidation entry to the current daily page."""
         daily_page = self._daily_page_path()
         daily_page.parent.mkdir(parents=True, exist_ok=True)
-        if not daily_page.exists() or daily_page.stat().st_size == 0:
-            daily_page.write_text(f"# {self._today_key()}\n\n", encoding="utf-8")
-
         formatted = self._format_daily_entry(entry)
         if not formatted:
             return
-
-        with open(daily_page, "a", encoding="utf-8") as f:
-            f.write(formatted.rstrip() + "\n\n")
+        current = daily_page.read_text(encoding="utf-8") if daily_page.exists() else ""
+        rendered_block = formatted.rstrip() + "\n\n"
+        if rendered_block in current:
+            return
+        if not current:
+            current = f"# {self._today_key()}\n\n"
+        atomic_write_text(daily_page, current + rendered_block)
 
     def _append_legacy_history(self, entry: str) -> None:
         """Append a consolidation entry to the legacy HISTORY.md file."""
-        with open(self.history_file, "a", encoding="utf-8") as f:
-            f.write(entry.rstrip() + "\n\n")
+        rendered = entry.rstrip()
+        if not rendered:
+            return
+        current = self.history_file.read_text(encoding="utf-8") if self.history_file.exists() else ""
+        rendered_block = rendered + "\n\n"
+        if rendered_block in current:
+            return
+        atomic_write_text(self.history_file, current + rendered_block)
 
     def append_history(self, entry: str) -> None:
         """Append a consolidation entry to both daily pages and legacy HISTORY.md."""
@@ -166,23 +179,40 @@ class MemoryStore:
 
         Returns True on success (including no-op), False on failure.
         """
+        async with self._consolidation_lock:
+            return await self._consolidate_locked(
+                session,
+                provider,
+                model,
+                archive_all=archive_all,
+                memory_window=memory_window,
+            )
+
+    async def _consolidate_locked(
+        self,
+        session: Session,
+        provider: LLMProvider,
+        model: str,
+        *,
+        archive_all: bool,
+        memory_window: int,
+    ) -> bool:
+        snapshot_count = len(session.messages)
+        start = max(0, min(int(session.last_consolidated or 0), snapshot_count))
         if archive_all:
-            if hasattr(session, "get_consolidation_messages"):
-                old_messages = session.get_consolidation_messages(archive_all=True)
-            else:
-                old_messages = session.messages
+            start = 0
             keep_count = 0
-            logger.info("Memory consolidation (archive_all): {} messages", len(session.messages))
+            snapshot_end = snapshot_count
+            old_messages = list(session.messages[:snapshot_end])
+            logger.info("Memory consolidation (archive_all): {} messages", snapshot_count)
         else:
             keep_count = memory_window // 2
-            if len(session.messages) <= keep_count:
+            if snapshot_count <= keep_count:
                 return True
-            if len(session.messages) - session.last_consolidated <= 0:
+            if snapshot_count - start <= 0:
                 return True
-            if hasattr(session, "get_consolidation_messages"):
-                old_messages = session.get_consolidation_messages(keep_count=keep_count)
-            else:
-                old_messages = session.messages[session.last_consolidated:-keep_count]
+            snapshot_end = max(start, snapshot_count - keep_count)
+            old_messages = list(session.messages[start:snapshot_end])
             if not old_messages:
                 return True
             logger.info("Memory consolidation: {} to consolidate, {} keep", len(old_messages), keep_count)
@@ -234,11 +264,14 @@ class MemoryStore:
                 logger.warning("Memory consolidation: unexpected arguments type {}", type(args).__name__)
                 return False
 
+            wrote_result = False
             if entry := args.get("history_entry"):
                 if not isinstance(entry, str):
                     entry = json.dumps(entry, ensure_ascii=False)
-                self.append_history(entry)
-                if old_messages:
+                if entry.strip():
+                    self.append_history(entry)
+                    wrote_result = True
+                if entry.strip() and old_messages:
                     last_active = old_messages[-1].get("timestamp") or session.updated_at.isoformat()
                     session.metadata["_last_summary"] = {
                         "text": entry,
@@ -247,10 +280,15 @@ class MemoryStore:
             if update := args.get("memory_update"):
                 if not isinstance(update, str):
                     update = json.dumps(update, ensure_ascii=False)
-                if update != current_memory:
+                if update.strip() and update != current_memory:
                     self.write_long_term(update)
+                    wrote_result = True
 
-            session.last_consolidated = 0 if archive_all else len(session.messages) - keep_count
+            if not wrote_result:
+                logger.warning("Memory consolidation produced no persistent changes")
+                return False
+
+            session.last_consolidated = 0 if archive_all else snapshot_end
             logger.info("Memory consolidation done: {} messages, last_consolidated={}", len(session.messages), session.last_consolidated)
             return True
         except Exception:
