@@ -772,7 +772,8 @@ class FeishuChannel(BaseChannel):
                     filename = f"{filename}.opus"
 
         if data and filename:
-            safe_name = safe_filename(os.path.basename(filename)) or f"{msg_type}.bin"
+            portable_basename = str(filename).replace("\\", "/").rsplit("/", 1)[-1]
+            safe_name = safe_filename(portable_basename) or f"{msg_type}.bin"
             if len(data) > MAX_ATTACHMENT_BYTES:
                 return None, f"[{msg_type}: {safe_name} - too large]"
             message_prefix = safe_filename(str(message_id or "message"))[:32] or "message"
