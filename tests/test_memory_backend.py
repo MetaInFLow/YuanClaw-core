@@ -1,3 +1,4 @@
+import sqlite3
 from pathlib import Path
 
 from yuanclaw.memory import CoreMemoryBackend, LegacyMemoryBackend, MemoryHit
@@ -111,3 +112,44 @@ def test_legacy_memory_backend_only_uses_legacy_memory_dir(tmp_path: Path) -> No
     context = backend.build_context("session-1", "telegram", "chat-1")
     assert "legacy fact" in context
     assert "root fact" not in context
+
+
+def test_memory_index_records_size_and_content_digest(tmp_path: Path) -> None:
+    memory_file = tmp_path / "MEMORY.md"
+    _write(memory_file, "# MEMORY\n\nalpha fact\n")
+    backend = CoreMemoryBackend(tmp_path)
+
+    assert backend.search("alpha")
+
+    with sqlite3.connect(backend._index.db_path) as conn:
+        size_bytes, digest = conn.execute(
+            "SELECT size_bytes, content_sha256 FROM indexed_files WHERE path = 'MEMORY.md'"
+        ).fetchone()
+    assert size_bytes == memory_file.stat().st_size
+    assert len(digest) == 64
+
+
+def test_memory_index_preserves_corrupt_database_and_rebuilds(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir(parents=True)
+    index_path = memory_dir / ".memory-index.sqlite3"
+    index_path.write_bytes(b"not a sqlite database")
+    _write(tmp_path / "MEMORY.md", "# MEMORY\n\nrecoverable fact\n")
+
+    backend = CoreMemoryBackend(tmp_path)
+
+    assert backend.search("recoverable")
+    assert index_path.is_file()
+    assert list(memory_dir.glob(".memory-index.sqlite3.corrupt-*"))
+
+
+def test_memory_get_does_not_refresh_search_index(tmp_path: Path) -> None:
+    _write(tmp_path / "MEMORY.md", "# MEMORY\n\ndirect read\n")
+    backend = CoreMemoryBackend(tmp_path)
+    backend._refresh_index_if_needed = lambda: (_ for _ in ()).throw(
+        AssertionError("direct reads must not refresh the index")
+    )
+
+    doc = backend.get("MEMORY.md")
+
+    assert "direct read" in doc.content

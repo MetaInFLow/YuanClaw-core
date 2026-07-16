@@ -94,7 +94,6 @@ class CoreMemoryBackend:
         end_line: int | None = None,
     ) -> MemoryDoc:
         """Return a cited slice from a memory document."""
-        self._refresh_index_if_needed()
         doc_path = self._resolve_path(path)
         if not doc_path.exists():
             raise FileNotFoundError(f"memory document not found: {path}")

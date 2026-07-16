@@ -539,7 +539,7 @@ class AgentLoop:
             loop=self,
         )
 
-    def _build_memory_context(
+    async def _build_memory_context(
         self,
         *,
         session_key: str,
@@ -548,11 +548,12 @@ class AgentLoop:
         metadata: dict | None = None,
     ) -> str:
         """Build scoped memory context for the current turn."""
-        return self.memory_backend.build_context(
-            session_key=session_key,
-            channel=channel,
-            chat_id=chat_id,
-            is_group=bool((metadata or {}).get("is_group", False)),
+        return await asyncio.to_thread(
+            self.memory_backend.build_context,
+            session_key,
+            channel,
+            chat_id,
+            bool((metadata or {}).get("is_group", False)),
         )
 
     async def _dispatch_command(self, msg: InboundMessage, session: Session, key: str) -> OutboundMessage | None:
@@ -1005,7 +1006,7 @@ class AgentLoop:
                 msg.metadata,
             )
             history = session.get_history(max_messages=self.memory_window)
-            memory_context = self._build_memory_context(
+            memory_context = await self._build_memory_context(
                 session_key=key,
                 channel=channel,
                 chat_id=chat_id,
@@ -1122,7 +1123,7 @@ class AgentLoop:
             skill_names = fixed_skills or None
 
         history = session.get_history(max_messages=self.memory_window)
-        memory_context = self._build_memory_context(
+        memory_context = await self._build_memory_context(
             session_key=key,
             channel=msg.channel,
             chat_id=msg.chat_id,
