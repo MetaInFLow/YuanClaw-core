@@ -135,6 +135,33 @@ def test_sessions_api_includes_message_summary_fields(tmp_path) -> None:
     )
 
 
+def test_skills_api_uses_workspace_overlaid_runtime_inventory(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    skill_dir = workspace / "skills" / "workspace-demo"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: workspace-demo\ndescription: Workspace demo skill\n---\nInstructions.",
+        encoding="utf-8",
+    )
+    runtime = _RuntimeStub(workspace)
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.get("/api/skills")
+
+    assert response.status_code == 200
+    workspace_skill = next(
+        item for item in response.json()["items"] if item["id"] == "workspace-demo"
+    )
+    assert workspace_skill == {
+        "id": "workspace-demo",
+        "name": "workspace-demo",
+        "description": "Workspace demo skill",
+        "version": "workspace",
+        "enabled": True,
+        "source": "workspace",
+    }
+
+
 @pytest.mark.parametrize(
     ("payload", "message"),
     [

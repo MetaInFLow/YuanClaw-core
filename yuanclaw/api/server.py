@@ -28,6 +28,7 @@ from loguru import logger
 
 from yuanclaw import __version__
 from yuanclaw.agent.loop import AgentLoop
+from yuanclaw.agent.skills import SkillsLoader
 from yuanclaw.bus.queue import MessageBus
 from yuanclaw.channels.manager import ChannelManager
 from yuanclaw.config.loader import save_config
@@ -727,49 +728,24 @@ def _serve_signed_media(
     )
 
 
-def _extract_description(skill_file: Path) -> str:
-    """Extract skill description from frontmatter."""
-    try:
-        content = skill_file.read_text(encoding="utf-8")
-    except Exception:
-        return "No description"
-
-    if content.startswith("---"):
-        parts = content.split("---", 2)
-        if len(parts) >= 3:
-            for line in parts[1].splitlines():
-                line = line.strip()
-                if line.startswith("description:"):
-                    return line.split(":", 1)[1].strip().strip("'\"") or "No description"
-
-    for line in content.splitlines():
-        line = line.strip()
-        if line and not line.startswith("#"):
-            return line[:200]
-
-    return "No description"
-
-
-def _list_skills() -> list[dict[str, Any]]:
-    """List built-in skills from package directory."""
-    skills_dir = Path(__file__).resolve().parents[1] / "skills"
-    if not skills_dir.exists():
-        return []
-
+def _list_skills(workspace: Path) -> list[dict[str, Any]]:
+    """List the same workspace-overlaid skill inventory used by the agent runtime."""
+    loader = SkillsLoader(workspace)
+    skills = loader.list_skills(filter_unavailable=False)
+    available = {
+        item["name"] for item in loader.list_skills(filter_unavailable=True)
+    }
     items: list[dict[str, Any]] = []
-    for entry in sorted(skills_dir.iterdir()):
-        if not entry.is_dir():
-            continue
-        skill_file = entry / "SKILL.md"
-        if not skill_file.exists():
-            continue
+    for skill in skills:
+        metadata = loader.get_skill_metadata(skill["name"]) or {}
         items.append(
             {
-                "id": entry.name,
-                "name": entry.name,
-                "description": _extract_description(skill_file),
-                "version": "built-in",
-                "enabled": True,
+                "id": skill["name"],
+                "name": skill["name"],
+                "description": str(metadata.get("description") or skill["name"]),
+                "version": "built-in" if skill["source"] == "builtin" else "workspace",
+                "enabled": skill["name"] in available,
+                "source": skill["source"],
             }
         )
     return items
@@ -1447,7 +1423,7 @@ class CoreRuntime:
         channel_status = self.channels.get_status() if self.channels else {}
         channels = _channel_rows(self.config, channel_status)
         sessions = self.session_manager.list_sessions()
-        skills = _list_skills()
+        skills = _list_skills(self.config.workspace_path)
         cron_jobs = self.cron.list_jobs(include_disabled=True)
         connected_channels = sum(1 for item in channels if item["running"])
 
@@ -1697,7 +1673,7 @@ def create_app(runtime: CoreRuntime) -> FastAPI:
 
     @app.get("/api/skills")
     async def skills() -> dict[str, Any]:
-        items = _list_skills()
+        items = _list_skills(runtime.config.workspace_path)
         return {"items": items, "total": len(items)}
 
     @app.get("/api/channels")

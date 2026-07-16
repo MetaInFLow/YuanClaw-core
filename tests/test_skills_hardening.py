@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import sys
 from pathlib import Path
 
 from yuanclaw.agent.context import ContextBuilder
@@ -84,6 +85,42 @@ def test_skill_frontmatter_uses_yaml_multiline_and_nested_metadata(tmp_path: Pat
     assert metadata is not None
     assert metadata["description"] == "First line\nSecond line\n"
     assert loader.get_always_skills() == ["yaml-skill"]
+
+
+def test_skill_frontmatter_preserves_false_with_crlf(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    skill_file = _write_skill(workspace, "not-always", "Instructions.")
+    skill_file.write_text(
+        "---\r\nname: not-always\r\nalways: false\r\n---\r\nInstructions.",
+        encoding="utf-8",
+    )
+    loader = SkillsLoader(workspace, builtin_skills_dir=tmp_path / "none")
+
+    assert loader.get_skill_metadata("not-always") == {
+        "name": "not-always",
+        "always": False,
+    }
+    assert loader.get_always_skills() == []
+
+
+def test_skill_platform_requirement_controls_availability(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    unavailable_os = "linux" if sys.platform.startswith("win") else "windows"
+    _write_skill(
+        workspace,
+        "platform-specific",
+        "Instructions.",
+        frontmatter=(
+            "name: platform-specific\n"
+            f'metadata: \'{{"yuanclaw":{{"os":["{unavailable_os}"]}}}}\''
+        ),
+    )
+    loader = SkillsLoader(workspace, builtin_skills_dir=tmp_path / "none")
+
+    assert loader.list_skills(filter_unavailable=True) == []
+    summary = loader.build_skills_summary()
+    assert '<skill available="false">' in summary
+    assert f"OS: {unavailable_os}" in summary
 
 
 def test_skill_context_enforces_per_skill_and_total_budgets(tmp_path: Path) -> None:

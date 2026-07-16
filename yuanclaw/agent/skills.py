@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -187,6 +188,9 @@ class SkillsLoader:
     def _get_missing_requirements(self, skill_meta: dict) -> str:
         """Get a description of missing requirements."""
         missing = []
+        supported_os = self._supported_os(skill_meta)
+        if supported_os and not self._matches_current_os(supported_os):
+            missing.append(f"OS: {', '.join(supported_os)}")
         requires = skill_meta.get("requires", {})
         for b in requires.get("bins", []):
             if not shutil.which(b):
@@ -220,7 +224,10 @@ class SkillsLoader:
             return {}
 
     def _check_requirements(self, skill_meta: dict) -> bool:
-        """Check if skill requirements are met (bins, env vars)."""
+        """Check if skill requirements are met (platform, bins, env vars)."""
+        supported_os = self._supported_os(skill_meta)
+        if supported_os and not self._matches_current_os(supported_os):
+            return False
         requires = skill_meta.get("requires", {})
         for b in requires.get("bins", []):
             if not shutil.which(b):
@@ -229,6 +236,27 @@ class SkillsLoader:
             if not os.environ.get(env):
                 return False
         return True
+
+    @staticmethod
+    def _supported_os(skill_meta: dict) -> list[str]:
+        raw = skill_meta.get("os", [])
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list):
+            return []
+        return [item.strip().lower() for item in raw if isinstance(item, str) and item.strip()]
+
+    @staticmethod
+    def _matches_current_os(supported_os: list[str]) -> bool:
+        if sys.platform.startswith("win"):
+            aliases = {"win", "win32", "windows"}
+        elif sys.platform == "darwin":
+            aliases = {"darwin", "mac", "macos", "osx"}
+        elif sys.platform.startswith("linux"):
+            aliases = {"linux"}
+        else:
+            aliases = {sys.platform.lower()}
+        return bool(aliases.intersection(supported_os))
 
     def _get_skill_meta(self, name: str) -> dict:
         """Get yuanclaw metadata for a skill (cached in frontmatter)."""
