@@ -265,6 +265,10 @@ class ChannelsConfig(Base):
 
     send_progress: bool = True  # stream agent's text progress to the channel
     send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
+    outbound_send_timeout_s: float = Field(default=30.0, gt=0, le=600)
+    outbound_retry_attempts: int = Field(default=2, ge=0, le=10)
+    outbound_retry_delay_s: float = Field(default=1.0, ge=0, le=60)
+    outbound_queue_size: int = Field(default=256, ge=1, le=10_000)
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)

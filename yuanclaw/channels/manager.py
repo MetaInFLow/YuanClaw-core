@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
+from dataclasses import dataclass
 from typing import Any
 
 from loguru import logger
@@ -11,6 +13,16 @@ from yuanclaw.bus.queue import MessageBus
 from yuanclaw.channels.base import BaseChannel
 from yuanclaw.channels.registry import discover_all
 from yuanclaw.config.schema import Config
+
+
+@dataclass(frozen=True)
+class OutboundFailure:
+    """A bounded diagnostic record for an outbound message that was not delivered."""
+
+    channel: str
+    chat_id: str
+    error_type: str
+    attempts: int
 
 
 class ChannelManager:
@@ -28,6 +40,9 @@ class ChannelManager:
         self.bus = bus
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
+        self._channel_queues: dict[str, asyncio.Queue] = {}
+        self._send_tasks: dict[str, asyncio.Task] = {}
+        self._dead_letters: deque[OutboundFailure] = deque(maxlen=100)
 
         self._init_channels()
 
@@ -117,18 +132,24 @@ class ChannelManager:
         # Stop dispatcher
         if self._dispatch_task:
             self._dispatch_task.cancel()
-            try:
-                await self._dispatch_task
-            except asyncio.CancelledError:
-                pass
+            await asyncio.gather(self._dispatch_task, return_exceptions=True)
+            self._dispatch_task = None
+        await self._stop_send_workers()
 
         # Stop all channels
-        for name, channel in self.channels.items():
+        async def stop_channel(name: str, channel: BaseChannel) -> None:
             try:
-                await channel.stop()
+                async with asyncio.timeout(self.config.channels.outbound_send_timeout_s):
+                    await channel.stop()
                 logger.info("Stopped {} channel", name)
-            except Exception as e:
-                logger.error("Error stopping {}: {}", name, e)
+            except TimeoutError:
+                logger.error("Timed out stopping {} channel", name)
+            except Exception as exc:
+                logger.error("Error stopping {} ({})", name, type(exc).__name__)
+
+        await asyncio.gather(
+            *(stop_channel(name, channel) for name, channel in self.channels.items())
+        )
 
     async def _dispatch_outbound(self) -> None:
         """Dispatch outbound messages to the appropriate channel."""
@@ -147,24 +168,97 @@ class ChannelManager:
                     ):
                         continue
 
-                channel = self.channels.get(msg.channel)
-                if channel:
-                    try:
-                        if msg.metadata.get("_stream_delta"):
-                            await channel.send_delta(msg.chat_id, msg.content, msg.metadata)
-                        elif msg.metadata.get("_stream_end"):
-                            await channel.send_delta(msg.chat_id, msg.content, msg.metadata)
-                        elif msg.metadata.get("_streamed"):
-                            continue
-                        else:
-                            await channel.send(msg)
-                    except Exception as e:
-                        logger.error("Error sending to {}: {}", msg.channel, e)
-                else:
+                if msg.metadata.get("_streamed"):
+                    continue
+                if msg.channel not in self.channels:
                     logger.warning("Unknown channel: {}", msg.channel)
+                    self._record_failure(msg, "UnknownChannel", attempts=0)
+                    continue
+
+                queue = self._ensure_send_worker(msg.channel)
+                try:
+                    queue.put_nowait(msg)
+                except asyncio.QueueFull:
+                    logger.error("Outbound queue for {} is full", msg.channel)
+                    self._record_failure(msg, "QueueFull", attempts=0)
 
             except asyncio.CancelledError:
                 break
+        await self._stop_send_workers()
+
+    def _ensure_send_worker(self, channel_name: str) -> asyncio.Queue:
+        queue = self._channel_queues.get(channel_name)
+        if queue is None:
+            queue = asyncio.Queue(maxsize=self.config.channels.outbound_queue_size)
+            self._channel_queues[channel_name] = queue
+        task = self._send_tasks.get(channel_name)
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._send_worker(channel_name, queue),
+                name=f"yuanclaw-outbound-{channel_name}",
+            )
+            self._send_tasks[channel_name] = task
+        return queue
+
+    async def _send_worker(self, channel_name: str, queue: asyncio.Queue) -> None:
+        channel = self.channels[channel_name]
+        while True:
+            msg = await queue.get()
+            try:
+                await self._deliver_with_retry(channel, msg)
+            finally:
+                queue.task_done()
+
+    async def _deliver_with_retry(self, channel: BaseChannel, msg) -> None:
+        is_stream_marker = bool(
+            msg.metadata.get("_stream_delta") or msg.metadata.get("_stream_end")
+        )
+        max_attempts = 1 if is_stream_marker else 1 + self.config.channels.outbound_retry_attempts
+        last_error_type = "DeliveryError"
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with asyncio.timeout(self.config.channels.outbound_send_timeout_s):
+                    if is_stream_marker:
+                        await channel.send_delta(msg.chat_id, msg.content, msg.metadata)
+                    else:
+                        await channel.send(msg)
+                return
+            except asyncio.CancelledError:
+                raise
+            except TimeoutError:
+                last_error_type = "TimeoutError"
+            except Exception as exc:
+                last_error_type = type(exc).__name__
+
+            if attempt < max_attempts:
+                await asyncio.sleep(self.config.channels.outbound_retry_delay_s)
+
+        logger.error(
+            "Outbound delivery to {} failed after {} attempt(s) ({})",
+            msg.channel,
+            max_attempts,
+            last_error_type,
+        )
+        self._record_failure(msg, last_error_type, attempts=max_attempts)
+
+    def _record_failure(self, msg, error_type: str, *, attempts: int) -> None:
+        self._dead_letters.append(
+            OutboundFailure(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                error_type=error_type,
+                attempts=attempts,
+            )
+        )
+
+    async def _stop_send_workers(self) -> None:
+        tasks = [task for task in self._send_tasks.values() if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._send_tasks.clear()
+        self._channel_queues.clear()
 
     def get_channel(self, name: str) -> BaseChannel | None:
         """Get a channel by name."""
@@ -173,9 +267,19 @@ class ChannelManager:
     def get_status(self) -> dict[str, Any]:
         """Get status of all channels."""
         return {
-            name: {"enabled": True, "running": channel.is_running}
+            name: {
+                "enabled": True,
+                "running": channel.is_running,
+                "pending_outbound": self._channel_queues.get(name).qsize()
+                if name in self._channel_queues
+                else 0,
+            }
             for name, channel in self.channels.items()
         }
+
+    @property
+    def dead_letters(self) -> tuple[OutboundFailure, ...]:
+        return tuple(self._dead_letters)
 
     @property
     def enabled_channels(self) -> list[str]:

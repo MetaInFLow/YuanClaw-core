@@ -250,6 +250,7 @@ class FeishuChannel(BaseChannel):
         self._client: Any = None
         self._ws_client: Any = None
         self._ws_thread: threading.Thread | None = None
+        self._ws_stop_event = threading.Event()
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -271,6 +272,7 @@ class FeishuChannel(BaseChannel):
 
         import lark_oapi as lark
         self._running = True
+        self._ws_stop_event.clear()
         self._loop = asyncio.get_running_loop()
 
         # Create Lark client for sending messages
@@ -312,8 +314,6 @@ class FeishuChannel(BaseChannel):
         # instead of the already-running main asyncio loop, which would cause
         # "This event loop is already running" errors.
         def run_ws():
-            import time
-
             import lark_oapi.ws.client as _lark_ws_client
             ws_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(ws_loop)
@@ -325,8 +325,8 @@ class FeishuChannel(BaseChannel):
                         self._ws_client.start()
                     except Exception as e:
                         logger.warning("Feishu WebSocket error: {}", e)
-                    if self._running:
-                        time.sleep(5)
+                    if self._running and self._ws_stop_event.wait(5):
+                        break
             finally:
                 ws_loop.close()
 
@@ -349,6 +349,15 @@ class FeishuChannel(BaseChannel):
         Reference: https://github.com/larksuite/oapi-sdk-python/blob/v2_main/lark_oapi/ws/client.py#L86
         """
         self._running = False
+        self._ws_stop_event.set()
+        thread = self._ws_thread
+        if thread is not None and thread.is_alive():
+            await asyncio.to_thread(thread.join, 2.0)
+            if thread.is_alive():
+                logger.warning("Feishu WebSocket thread did not stop within 2 seconds")
+            else:
+                self._ws_thread = None
+        self._loop = None
         logger.info("Feishu bot stopped")
 
     def _add_reaction_sync(self, message_id: str, emoji_type: str) -> None:

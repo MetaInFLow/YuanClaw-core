@@ -43,12 +43,15 @@ export class WhatsAppClient {
   private sock: any = null;
   private options: WhatsAppClientOptions;
   private reconnecting = false;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private stopped = false;
 
   constructor(options: WhatsAppClientOptions) {
     this.options = options;
   }
 
   async connect(): Promise<void> {
+    if (this.stopped) return;
     const logger = pino({ level: 'silent' });
     const { state, saveCreds } = await useMultiFileAuthState(this.options.authDir);
     const { version } = await fetchLatestBaileysVersion();
@@ -94,15 +97,13 @@ export class WhatsAppClient {
         console.log(`Connection closed. Status: ${statusCode}, Will reconnect: ${shouldReconnect}`);
         this.options.onStatus('disconnected');
 
-        if (shouldReconnect && !this.reconnecting) {
-          this.reconnecting = true;
-          console.log('Reconnecting in 5 seconds...');
-          setTimeout(() => {
-            this.reconnecting = false;
-            this.connect();
-          }, 5000);
-        }
+        if (shouldReconnect) this.scheduleReconnect();
       } else if (connection === 'open') {
+        this.reconnecting = false;
+        if (this.reconnectTimer) {
+          clearTimeout(this.reconnectTimer);
+          this.reconnectTimer = null;
+        }
         console.log('✅ Connected to WhatsApp');
         this.options.onStatus('connected');
       }
@@ -157,6 +158,23 @@ export class WhatsAppClient {
         });
       }
     });
+  }
+
+  private scheduleReconnect(): void {
+    if (this.stopped || this.reconnecting || this.reconnectTimer) return;
+    this.reconnecting = true;
+    console.log('Reconnecting in 5 seconds...');
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      this.reconnecting = false;
+      if (this.stopped) return;
+      try {
+        await this.connect();
+      } catch (error) {
+        console.error('WhatsApp reconnect failed:', error);
+        this.scheduleReconnect();
+      }
+    }, 5000);
   }
 
   private async downloadMedia(msg: any, mimetype?: string, fileName?: string): Promise<string | null> {
@@ -231,6 +249,12 @@ export class WhatsAppClient {
   }
 
   async disconnect(): Promise<void> {
+    this.stopped = true;
+    this.reconnecting = false;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.sock) {
       this.sock.end(undefined);
       this.sock = null;
